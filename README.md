@@ -5,7 +5,7 @@ PINNs solution showing the time evolution of the sounds wave in molecular gas
 
 <img src="/images/output/video1.gif" width="250" height="250"/>
 
-![3Dinstability_1 0]("https://user-images.githubusercontent.com/46558389/230695945-d5585088-3b1f-484a-baf2-89a18da3d9e6.gif" width="250" height="250"/)
+![3Dinstability_1 0](https://user-images.githubusercontent.com/46558389/230695945-d5585088-3b1f-484a-baf2-89a18da3d9e6.gif)
 
 PINNs solution showing gowth of the gas density due to Jeans Instability
 
