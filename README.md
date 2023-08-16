@@ -1,6 +1,6 @@
-# GRINN (Gravity Informed Neural Network): An astrophysics code using Physics Informed Neural Network to study the evolution of the cosmos.
+# GRINN (Gravity Informed Neural Network): An astrophysics code using Physics Informed Neural Networks to study hydrodynamical systems.
 
-We solve hydrodynamical equations including self-gravitating using Physics Informed Neural Networks. We study Jeans instability in self-gravitating gas in star-forming molecular clouds
+We solve hydrodynamical equations including self-gravitating using Physics Informed Neural Networks. We study Jeans instability in self-gravitating gas in star-forming molecular clouds.
 
 PINNs solution showing the time evolution of the sound wave in molecular gas
 
