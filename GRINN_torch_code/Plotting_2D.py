@@ -46,10 +46,10 @@ def plot_function(net,time_array,initial_params,velocity = False, isplot =False,
         rho_max_PN = np.max(rho_pred0)
         
         ## Theoretical Values
-        rho_theory = np.max(rho_o + rho_1*np.exp(alpha * t)*np.cos(2*np.pi*X[:, 0:1]/lam))
-        rho_theory0 = np.max(rho_o + rho_1*np.exp(alpha * 0)*np.cos(2*np.pi*X[:, 0:1]/lam)) ## at t =0 
+        #rho_theory = np.max(rho_o + rho_1*np.exp(alpha * t)*np.cos(2*np.pi*X[:, 0:1]/lam))
+        #rho_theory0 = np.max(rho_o + rho_1*np.exp(alpha * 0)*np.cos(2*np.pi*X[:, 0:1]/lam)) ## at t =0 
         
-        diff=abs(rho_max_PN-rho_theory)/abs(rho_max_PN+rho_theory) * 2  ## since the den is rhomax+rhotheory
+        #diff=abs(rho_max_PN-rho_theory)/abs(rho_max_PN+rho_theory) * 2  ## since the den is rhomax+rhotheory
 
         
 #         ### Difference between peaks for the PINNs solution
@@ -64,7 +64,7 @@ def plot_function(net,time_array,initial_params,velocity = False, isplot =False,
 
         #g_pred0=phi_x = dde.grad.jacobian(phi_pred0, X, i=0, j=0)
         if isplot:              
-            print("rho_theory_max={} at time {} in x".format(rho_theory,t))
+            #print("rho_theory_max={} at time {} in x".format(rho_theory,t))
             plt.figure(1)
             plt.plot(X,rho_pred0,label="t={}".format(round(t,2)))
             plt.ylabel(r"$\rho$")
@@ -75,7 +75,7 @@ def plot_function(net,time_array,initial_params,velocity = False, isplot =False,
             plt.title(r"Pinns Solution for $\lambda$ = {} $\lambda_J$ in x direction".format(round(lam/(2*np.pi),2)))
             plt.savefig(output_folder+'/PINNS_density'+str(lam)+'_'+str(num_of_waves_x)+'_'+str(tmax)+'_X'+'.png', dpi=300)
 
-            print("rho_theory_max={} at time {} in y".format(rho_theory,t))
+            #print("rho_theory_max={} at time {} in y".format(rho_theory,t))
             plt.figure(2)
             plt.plot(X,rho_pred0,label="t={}".format(round(t,2)))
             plt.ylabel(r"$\rho$")
