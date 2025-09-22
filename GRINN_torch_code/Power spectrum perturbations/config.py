@@ -14,7 +14,12 @@ iteration_adam_1D = 200
 iteration_lbgfs_1D = 100
 
 iteration_adam_2D = 1000
-iteration_lbgfs_2D = 400
+iteration_lbgfs_2D = 200
 
 iteration_adam_3D = 1000
 iteration_lbgfs_3D = 400
+
+# Power spectrum parameters
+N_GRID = 500  # Grid resolution for power spectrum generation
+POWER_EXPONENT = -1.0  # Power spectrum exponent
+FILTER_SCALE = 0.5  # Filter scale (Rf)

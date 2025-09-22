@@ -60,9 +60,9 @@ class col_gen(object):
         if self.dimension == 1: 
             if option == "Domain":
                 coor = []
-                x_coor = torch.cuda.FloatTensor(self.N_r,1).uniform_(self.rmin[0], self.rmax[0]).requires_grad_()
+                x_coor = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[0], self.rmax[0]).requires_grad_()
                 coor.append(x_coor)
-                t_coor = t_collocation=torch.cuda.FloatTensor(self.N_r,1).uniform_(self.rmin[1], self.rmax[1]).requires_grad_()
+                t_coor = t_collocation=torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[1], self.rmax[1]).requires_grad_()
                 coor.append(t_coor)
 
                 return coor
@@ -70,10 +70,10 @@ class col_gen(object):
             if option == "IC": ## Intial conditions collocation points
 
                 coor = []
-                x_0 = torch.cuda.FloatTensor(self.N_0,1).uniform_(self.rmin[0], self.rmax[0]).requires_grad_()
+                x_0 = torch.empty(self.N_0,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[0], self.rmax[0]).requires_grad_()
                 coor.append(x_0)
 
-                t_0 = torch.cuda.FloatTensor(self.N_0,1).fill_(0).requires_grad_()
+                t_0 = torch.empty(self.N_0,1, device='cuda', dtype=torch.float32).fill_(0).requires_grad_()
                 coor.append(t_0)
 
                 return coor
@@ -81,9 +81,9 @@ class col_gen(object):
             if option == "BC":
                 coor_l = []
                 coor_r = []
-                x_bc_l = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmin[coordinate-1]).requires_grad_()
-                x_bc_r = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmax[coordinate-1]).requires_grad_()
-                t_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
+                x_bc_l = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmin[coordinate-1]).requires_grad_()
+                x_bc_r = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmax[coordinate-1]).requires_grad_()
+                t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
 
                 coor_l.append(x_bc_l)
                 coor_l.append(t_bc)
@@ -98,7 +98,7 @@ class col_gen(object):
                 
                 coor = []
                 for d in range(self.dimension+1): ## +1 for the time dimension
-                    temp_coor = torch.cuda.FloatTensor(self.N_r,1).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
+                    temp_coor = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
                     coor.append(temp_coor)
 
                 return coor
@@ -106,23 +106,23 @@ class col_gen(object):
             if option == "IC": ## Intial conditions collocation points
                 coor = []
                 for d in range(self.dimension): ## time is zero as it is the initial condition
-                    temp_coor = torch.cuda.FloatTensor(self.N_0,1).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
+                    temp_coor = torch.empty(self.N_0,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
                     coor.append(temp_coor)
 
-                t_0 = torch.cuda.FloatTensor(self.N_0,1).fill_(0).requires_grad_()
+                t_0 = torch.empty(self.N_0,1, device='cuda', dtype=torch.float32).fill_(0).requires_grad_()
                 coor.append(t_0)
 
                 return coor
             
             if option == "BC":
-                t_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
+                t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
                 t_bc.requires_grad_()
         
                 if coordinate == 1: 
                     
-                    x_bc_l = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmin[coordinate-1]).requires_grad_()
-                    x_bc_r = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmax[coordinate-1]).requires_grad_()                   
-                    y_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate], self.rmax[coordinate]).requires_grad_()
+                    x_bc_l = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmin[coordinate-1]).requires_grad_()
+                    x_bc_r = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmax[coordinate-1]).requires_grad_()                   
+                    y_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate], self.rmax[coordinate]).requires_grad_()
                     
                     coor_l = []
                     coor_r = []
@@ -139,9 +139,9 @@ class col_gen(object):
                    
                  
                 if coordinate == 2:
-                    y_bc_l = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmin[coordinate-1]).requires_grad_()
-                    y_bc_r = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmax[coordinate-1]).requires_grad_()
-                    x_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate-2], self.rmax[coordinate-2]).requires_grad_()            
+                    y_bc_l = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmin[coordinate-1]).requires_grad_()
+                    y_bc_r = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmax[coordinate-1]).requires_grad_()
+                    x_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate-2], self.rmax[coordinate-2]).requires_grad_()            
                     
                     coor_l = []
                     coor_r = []
@@ -162,7 +162,7 @@ class col_gen(object):
                 
                 coor = []
                 for d in range(self.dimension+1): ## +1 for the time dimension
-                    temp_coor = torch.cuda.FloatTensor(self.N_r,1).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
+                    temp_coor = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
                     coor.append(temp_coor)
                 
                 return coor
@@ -170,25 +170,25 @@ class col_gen(object):
             if option == "IC": ## Intial conditions collocation points
                 coor = []
                 for d in range(self.dimension): ## time is zero as it is the initial condition                  
-                    temp_coor = torch.cuda.FloatTensor(self.N_0,1).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
+                    temp_coor = torch.empty(self.N_0,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
                     coor.append(temp_coor)
                 
-                t_0 = torch.cuda.FloatTensor(self.N_0,1).fill_(0).requires_grad_()
+                t_0 = torch.empty(self.N_0,1, device='cuda', dtype=torch.float32).fill_(0).requires_grad_()
                 coor.append(t_0)
                 
                 return coor
              
 
             if option == "BC":                
-                t_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
+                t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
                 t_bc.requires_grad_()
         
                 if coordinate == 1: 
                     
-                    x_bc_l = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmin[coordinate-1]).requires_grad_()
-                    x_bc_r = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmax[coordinate-1]).requires_grad_()                   
-                    y_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate], self.rmax[coordinate]).requires_grad_()
-                    z_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate+1], self.rmax[coordinate+1]).requires_grad_()
+                    x_bc_l = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmin[coordinate-1]).requires_grad_()
+                    x_bc_r = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmax[coordinate-1]).requires_grad_()                   
+                    y_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate], self.rmax[coordinate]).requires_grad_()
+                    z_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate+1], self.rmax[coordinate+1]).requires_grad_()
                     
                     coor_l = []
                     coor_r = []
@@ -207,10 +207,10 @@ class col_gen(object):
                    
                  
                 if coordinate == 2:
-                    y_bc_l = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmin[coordinate-1]).requires_grad_()
-                    y_bc_r = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmax[coordinate-1]).requires_grad_()
-                    x_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate-2], self.rmax[coordinate-2]).requires_grad_()            
-                    z_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate], self.rmax[coordinate]).requires_grad_()
+                    y_bc_l = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmin[coordinate-1]).requires_grad_()
+                    y_bc_r = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmax[coordinate-1]).requires_grad_()
+                    x_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate-2], self.rmax[coordinate-2]).requires_grad_()            
+                    z_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate], self.rmax[coordinate]).requires_grad_()
                 
                     coor_l = []
                     coor_r = []
@@ -230,10 +230,10 @@ class col_gen(object):
                    
                 if coordinate == 3:
                     
-                    z_bc_l = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmin[coordinate-1]).requires_grad_()
-                    z_bc_r = torch.cuda.FloatTensor(self.N_b,1).fill_(self.rmax[coordinate-1]).requires_grad_()
-                    x_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate-3], self.rmax[coordinate-3]).requires_grad_()
-                    y_bc   = torch.cuda.FloatTensor(self.N_b,1).uniform_(self.rmin[coordinate-2], self.rmax[coordinate-2]).requires_grad_()
+                    z_bc_l = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmin[coordinate-1]).requires_grad_()
+                    z_bc_r = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmax[coordinate-1]).requires_grad_()
+                    x_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate-3], self.rmax[coordinate-3]).requires_grad_()
+                    y_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[coordinate-2], self.rmax[coordinate-2]).requires_grad_()
                     
                     coor_l = []
                     coor_r = []

@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 from losses import ASTPN, pde_residue
 from model_architecture import PINN
-from config import cs, const, G, rho_o
+from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE
 
 def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     lam = float(lam)  # Wavelength
@@ -31,18 +31,72 @@ def req_consts_calc(lam, rho_1):
 
 def fun_rho_0(rho_1, lam, x):
     ''' Define initial condition for density Returning Eq (11a)'''
-    # print('wavelength',lam)
-    rho_0 = rho_o + rho_1 * torch.cos(2*np.pi*x[0]/lam)    
-    return rho_0
 
-def fun_v_0(lam, jeans, v_1, x):
-    '''initial condition for velocity -- Returning Eq 11b'''
-    
-    if lam > jeans:
-        v_0 = - v_1 * torch.sin(2*np.pi*x[0]/lam)## This is for sound wave ## refer to the paper for details
+    #rho_0 = rho_o + rho_1 * torch.cos(2*np.pi*x[0]/lam)
+    rho_0 = torch.full_like(x[0], rho_o)
+    # Ensure correct shape [N, 1]
+    if rho_0.dim() == 1:
+        return rho_0.unsqueeze(-1)
     else:
-        v_0 = v_1 * torch.cos(2*np.pi*x[0]/lam)  ## This is for the gravity wave
-    return v_0
+        return rho_0
+
+def generate_power_spectrum_field(lam, v_1, x, seed=1234):
+    '''Generate 2D Gaussian random field with power spectrum'''
+    
+    Lx = lam * 2  # Domain size
+    dx = Lx / N_GRID
+    
+    # Create coordinate grids
+    x_coords = torch.linspace(0, Lx, N_GRID, device=x[0].device)
+    y_coords = torch.linspace(0, Lx, N_GRID, device=x[0].device)
+    
+    # Calculate wave numbers
+    kx = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
+    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
+    KX, KY = torch.meshgrid(kx, ky, indexing='ij')
+    
+    # Calculate magnitude of wave number
+    K = torch.sqrt(KX**2 + KY**2)
+    
+    # Power spectrum: P(k) ~ k^expon * exp((-k*Rf)^2)
+    K_safe = torch.where(K == 0, torch.tensor(1e-10, device=x[0].device), K)
+    power_spectrum = K_safe**POWER_EXPONENT * torch.exp(-(K_safe * FILTER_SCALE)**2)
+    
+    # Safety check: limit extreme values
+    power_spectrum = torch.clamp(power_spectrum, 0, 1e6)
+    
+    # Generate random phases
+    torch.manual_seed(seed)
+    random_phases = torch.randn(N_GRID, N_GRID, device=x[0].device) + 1j * torch.randn(N_GRID, N_GRID, device=x[0].device)
+    
+    # Create complex field in Fourier space and transform to real space
+    field_fourier = torch.sqrt(power_spectrum) * random_phases
+    field_real = torch.real(torch.fft.ifft2(field_fourier))
+    
+    # Normalize the field
+    field_real = field_real / torch.std(field_real) * v_1
+    
+    # Interpolate to the actual collocation points
+    x_norm = torch.clamp((x[0] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
+    y_norm = torch.clamp((x[1] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
+    
+    x_idx = torch.round(x_norm).long()
+    y_idx = torch.round(y_norm).long()
+    
+    # Ensure correct tensor shape [N, 1]
+    result = field_real[x_idx, y_idx]
+    if result.dim() == 1:
+        return result.unsqueeze(-1)
+    else:
+        return result
+
+def fun_vx_0(lam, jeans, v_1, x):
+    '''initial condition for x-velocity -- Power spectrum Gaussian random field'''
+    return generate_power_spectrum_field(lam, v_1, x, seed=1234)
+
+def fun_vy_0(lam, jeans, v_1, x):
+    '''initial condition for y-velocity -- Power spectrum Gaussian random field'''
+    return generate_power_spectrum_field(lam, v_1, x, seed=5678)
 
 def func(x):
     return x[0]*0
@@ -55,13 +109,13 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
 
     ############## Loss based on initial conditions ###############
     rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
-    vx_0  = fun_v_0(lam, jeans, v_1, collocation_IC)
+    vx_0  = fun_vx_0(lam, jeans, v_1, collocation_IC)
 
     if model.dimension == 2:
-        vy_0  = func(collocation_IC)
+        vy_0  = fun_vy_0(lam, jeans, v_1, collocation_IC)
 
     elif model.dimension == 3:
-        vy_0  = func(collocation_IC)
+        vy_0  = fun_vy_0(lam, jeans, v_1, collocation_IC)
         vz_0  = func(collocation_IC)
     
     net_ic_out = net(collocation_IC)
@@ -177,8 +231,8 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
 
         with torch.autograd.no_grad():
             
-            if i % 250 == 0:
-                print(f"Training Loss at {i} for Adam in 1D system = {loss.item():.2e}", flush=True)
+            if i % 100 == 0:
+                print(f"Training Loss at {i} for Adam in 2D system = {loss.item():.2e}", flush=True)
 
     for i in range(iterationL):
         
@@ -188,5 +242,5 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
 
         with torch.autograd.no_grad():
             
-            if i % 250 == 0:
-                print(f"Training Loss at {i} for LBGFS in 1D system = {loss.item():.2e}", flush=True)
+            if i % 50 == 0:
+                print(f"Training Loss at {i} for LBGFS in 2D system = {loss.item():.2e}", flush=True)
