@@ -17,6 +17,38 @@ from scipy import signal
 np.random.seed(1234)
 #tf.random.set_seed(1234)
 
+def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amplitude=0.02, random_seed=None):
+    """
+    Generate 2D velocity components (vx, vy) with an isotropic power-law spectrum P(k) ~ k^{power_index}.
+    The fields are created by filtering white noise in Fourier space and normalized to the requested RMS amplitude.
+    """
+    if random_seed is not None:
+        rng = np.random.default_rng(random_seed)
+    else:
+        rng = np.random.default_rng()
+
+    def synthesize_component():
+        field = rng.standard_normal((nx, ny))
+        F = fft2(field)
+        kx = 2 * np.pi * np.fft.fftfreq(nx, d=Lx / nx)
+        ky = 2 * np.pi * np.fft.fftfreq(ny, d=Ly / ny)
+        kxg, kyg = np.meshgrid(kx, ky, indexing='ij')
+        kk = np.sqrt(kxg**2 + kyg**2)
+        kk[0, 0] = 1.0
+        filt = (kk) ** (power_index / 2.0)
+        filt[kk == 0] = 0.0
+        F_filtered = F * filt
+        comp = np.real(ifft2(F_filtered))
+        comp -= np.mean(comp)
+        std = np.std(comp)
+        if std > 0:
+            comp = comp * (amplitude / std)
+        return comp
+
+    vx0 = synthesize_component()
+    vy0 = synthesize_component()
+    return vx0, vy0
+
 def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
     
     '''
@@ -63,7 +95,8 @@ def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
 #     return phi,dphidx, dphidy 
     return phi
 
-def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None):
+def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None,
+                 use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None):
     '''
     This function solves the hydrodynamic Eqns in 1D with/without self gravity using LAX methods 
     described above 
@@ -144,10 +177,14 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
 
     ######################## Initial Conditions ###########################
     
-    rho0 = rho_o + rho_1* np.cos(2*np.pi*xx/lam) # defing the density at t = 0 EQ 11
-    
-    
-    if gravity == False:
+    if use_velocity_ps:
+        # Uniform density; initialize velocities from power spectrum
+        rho0 = rho_o * np.ones((Nx, Ny))
+        vx0, vy0 = generate_velocity_field_power_spectrum(Nx, Ny, Lx, Ly, power_index=ps_index, amplitude=vel_rms, random_seed=random_seed)
+    else:
+        rho0 = rho_o + rho_1* np.cos(2*np.pi*xx/lam) # defing the density at t = 0 EQ 11
+
+    if gravity == False and not use_velocity_ps:
         print("Propagation of Sound wave") 
         v_1 = (c_s*rho_1)/rho_o # velocity perturbation
         vx0 = v_1 * np.cos(2*np.pi*xx/lam) # the velocity at t =0
@@ -161,7 +198,10 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
           
     
     else:    ######## When self-gravity is True and see EQN 12
-        if lam >= jeans:  
+        if use_velocity_ps:
+            # Already initialized vx0, vy0; keep density uniform
+            pass
+        elif lam >= jeans:  
             print("There is gravitational instabilty  lam = {} > l_jean ={}".format(lam,jeans))
             alpha = np.sqrt(const*G*rho_o-c_s**2*(2*np.pi/lam)**2)
             v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam)) ## With gravity     
@@ -331,7 +371,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
             if comparison:
                 return x,rho1,vx1,phi1,n,rho_LT,rho_LT_max,rho_max,vx_LT
             else:
-                return x,rho1,vx1,phi1,n,rho_max
+                return x,rho1,vx1,vy1,phi1,n,rho_max
         else:
             if comparison:
                 return rho1,vx1,rho_LT,rho_LT_max,rho_max,vx_LT
