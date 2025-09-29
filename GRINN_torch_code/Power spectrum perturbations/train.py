@@ -37,6 +37,9 @@ optimizerL = torch.optim.LBFGS(net.parameters(),line_search_fn='strong_wolfe')
 
 model_2D = ASTPN(rmin=[xmin, ymin, tmin],rmax=[xmax, ymax, tmax], N_0= N_0,N_b=N_b,N_r= N_r,dimension=2)
 
+# Set domain on the network so periodic embeddings enforce hard BCs
+net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=2)
+
 collocation_domain_2D = model_2D.geo_time_coord(option= "Domain") 
 collocation_IC_2D = model_2D.geo_time_coord(option= "IC")
 

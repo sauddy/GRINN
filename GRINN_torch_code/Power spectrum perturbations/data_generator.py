@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+from config import STARTUP_DT
 
 def diff(u,var,order=1): #The derivative of a variable with respect to another.
     
@@ -62,7 +63,8 @@ class col_gen(object):
                 coor = []
                 x_coor = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[0], self.rmax[0]).requires_grad_()
                 coor.append(x_coor)
-                t_coor = t_collocation=torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[1], self.rmax[1]).requires_grad_()
+                # Shift PDE enforcement to start at t = STARTUP_DT
+                t_coor = t_collocation=torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(max(self.rmin[1], STARTUP_DT), self.rmax[1]).requires_grad_()
                 coor.append(t_coor)
 
                 return coor
@@ -97,9 +99,13 @@ class col_gen(object):
             if option == "Domain":
                 
                 coor = []
-                for d in range(self.dimension+1): ## +1 for the time dimension
-                    temp_coor = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
-                    coor.append(temp_coor)
+                # x, y sampled as before; t starts from STARTUP_DT
+                x_dom = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[0], self.rmax[0]).requires_grad_()
+                y_dom = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[1], self.rmax[1]).requires_grad_()
+                t_dom = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(max(self.rmin[2], STARTUP_DT), self.rmax[2]).requires_grad_()
+                coor.append(x_dom)
+                coor.append(y_dom)
+                coor.append(t_dom)
 
                 return coor
             
@@ -115,7 +121,8 @@ class col_gen(object):
                 return coor
             
             if option == "BC":
-                t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
+                # BC evaluated for t >= STARTUP_DT
+                t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(max(self.rmin[self.dimension], STARTUP_DT), self.rmax[self.dimension])
                 t_bc.requires_grad_()
         
                 if coordinate == 1: 
@@ -161,9 +168,14 @@ class col_gen(object):
             if option == "Domain":
                 
                 coor = []
-                for d in range(self.dimension+1): ## +1 for the time dimension
-                    temp_coor = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[d], self.rmax[d]).requires_grad_()
-                    coor.append(temp_coor)
+                x_dom = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[0], self.rmax[0]).requires_grad_()
+                y_dom = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[1], self.rmax[1]).requires_grad_()
+                z_dom = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[2], self.rmax[2]).requires_grad_()
+                t_dom = torch.empty(self.N_r,1, device='cuda', dtype=torch.float32).uniform_(max(self.rmin[3], STARTUP_DT), self.rmax[3]).requires_grad_()
+                coor.append(x_dom)
+                coor.append(y_dom)
+                coor.append(z_dom)
+                coor.append(t_dom)
                 
                 return coor
 
@@ -180,7 +192,7 @@ class col_gen(object):
              
 
             if option == "BC":                
-                t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(self.rmin[self.dimension], self.rmax[self.dimension])
+                t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(max(self.rmin[self.dimension], STARTUP_DT), self.rmax[self.dimension])
                 t_bc.requires_grad_()
         
                 if coordinate == 1: 

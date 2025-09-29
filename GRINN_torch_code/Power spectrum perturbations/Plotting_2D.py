@@ -179,7 +179,7 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     return pc
 
 
-def create_2d_animation(net, initial_params, time_points=None, which="density", fps=10, save_path=None):
+def create_2d_animation(net, initial_params, time_points=None, which="density", fps=10, save_path=None, fixed_colorbar=True):
     """
     Create an animated 2D surface plot showing evolution over time
 
@@ -224,9 +224,45 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     U_first = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
     V_first = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
     
+    # Optionally precompute fixed color limits using first and last frames
+    fixed_vmin = None
+    fixed_vmax = None
+    if which == "density" and fixed_colorbar:
+        Q = 100
+        xs = np.linspace(xmin, xmax, Q)
+        ys = np.linspace(ymin, ymax, Q)
+        tau, phi = np.meshgrid(xs, ys)
+        Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
+        # First frame
+        t_first = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)
+        pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_t = Variable(torch.from_numpy(t_first).float(), requires_grad=True).to(device)
+        rho_first = net([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q)
+        # Last frame
+        t_last = time_points[-1] * np.ones(Q**2).reshape(Q**2, 1)
+        pt_t_last = Variable(torch.from_numpy(t_last).float(), requires_grad=True).to(device)
+        rho_last = net([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q)
+        fixed_vmin = min(np.min(rho_first), np.min(rho_last))
+        fixed_vmax = max(np.max(rho_first), np.max(rho_last))
+        if fixed_vmin == fixed_vmax:
+            eps = 1e-6 if fixed_vmin == 0 else 1e-6 * abs(fixed_vmin)
+            fixed_vmin, fixed_vmax = fixed_vmin - eps, fixed_vmax + eps
+
     # Set up initial plot
     if which == "density":
-        pc = ax.pcolormesh(tau, phi, rho_first, shading='auto', cmap='YlOrBr')
+        # Handle flat initial frame by expanding color limits slightly
+        if fixed_colorbar and fixed_vmin is not None:
+            vmin_use, vmax_use = fixed_vmin, fixed_vmax
+        else:
+            rmin, rmax = np.min(rho_first), np.max(rho_first)
+            if not np.isfinite(rmin) or not np.isfinite(rmax):
+                rmin, rmax = 0.0, 1.0
+            if rmin == rmax:
+                eps = 1e-6 if rmin == 0 else 1e-6 * abs(rmin)
+                rmin, rmax = rmin - eps, rmax + eps
+            vmin_use, vmax_use = rmin, rmax
+        pc = ax.pcolormesh(tau, phi, rho_first, shading='auto', cmap='YlOrBr', vmin=vmin_use, vmax=vmax_use)
         ax.set_title(f"Density Evolution, t={time_points[0]:.2f}")
         cbar = plt.colorbar(pc, shrink=0.6, location='right')
         cbar.formatter.set_powerlimits((0, 0))
@@ -271,6 +307,13 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         # Update plot data
         if which == "density":
             pc.set_array(rho.ravel())
+            # Update color limits only if not fixed
+            if not fixed_colorbar:
+                rmin, rmax = np.min(rho), np.max(rho)
+                if rmin == rmax:
+                    eps = 1e-6 if rmin == 0 else 1e-6 * abs(rmin)
+                    rmin, rmax = rmin - eps, rmax + eps
+                pc.set_clim(vmin=rmin, vmax=rmax)
             ax.set_title(f"Density Evolution, t={t:.2f}")
         else:  # velocity magnitude surface plot
             Vmag = np.sqrt(U**2 + V**2)
@@ -289,11 +332,22 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     anim = animation.FuncAnimation(fig, animate, frames=len(time_points), 
                                  interval=1000/fps, blit=False, repeat=True)
     
-    # Save animation for Kaggle display
-    animation_path = os.path.join(output_dir, f"{which}_animation.mp4")
-    print(f"Saving animation to {animation_path}...")
-    anim.save(animation_path, writer='ffmpeg', fps=fps)
-    print("Animation saved successfully!")
+    # Save animation with appropriate writer/extension
+    try:
+        if animation.writers.is_available('ffmpeg'):
+            animation_path = os.path.join(output_dir, f"{which}_animation.mp4")
+            print(f"Saving animation to {animation_path} with ffmpeg...")
+            anim.save(animation_path, writer='ffmpeg', fps=fps)
+            saved_format = 'mp4'
+        else:
+            animation_path = os.path.join(output_dir, f"{which}_animation.gif")
+            print(f"ffmpeg not available. Saving animation to {animation_path} with Pillow...")
+            anim.save(animation_path, writer='pillow', fps=fps)
+            saved_format = 'gif'
+        print("Animation saved successfully!")
+    except Exception as e:
+        print(f"Animation save failed: {e}")
+        raise
     
     # For Kaggle, also create static snapshots at key time points
     key_times = [0.0, 0.5, 1.0, 1.5, 2.0]
@@ -338,26 +392,34 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         plt.close(fig_static)
         print(f"Saved static snapshot to {static_save_path}")
     
-    # Display animation in Kaggle notebook
-    from IPython.display import HTML, display
-    import base64
-    
-    # Read the saved video file and encode it
-    with open(animation_path, 'rb') as f:
-        video_data = f.read()
-    
-    video_base64 = base64.b64encode(video_data).decode('utf-8')
-    video_html = f'''
+    # Display animation inline if in a notebook
+    try:
+        from IPython.display import HTML, display
+        import base64
+        with open(animation_path, 'rb') as f:
+            data = f.read()
+        data_base64 = base64.b64encode(data).decode('utf-8')
+        if saved_format == 'mp4':
+            video_html = f'''
     <div style="text-align: center;">
         <h3>{which.title()} Evolution Animation</h3>
         <video width="600" height="600" controls autoplay loop>
-            <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
+            <source src="data:video/mp4;base64,{data_base64}" type="video/mp4">
             Your browser does not support the video tag.
         </video>
     </div>
     '''
-    
-    display(HTML(video_html))
+            display(HTML(video_html))
+        else:
+            img_html = f'''
+    <div style="text-align: center;">
+        <h3>{which.title()} Evolution Animation</h3>
+        <img src="data:image/gif;base64,{data_base64}" width="600" height="600" />
+    </div>
+    '''
+            display(HTML(img_html))
+    except Exception as _:
+        pass
     
     plt.tight_layout()
     plt.show()

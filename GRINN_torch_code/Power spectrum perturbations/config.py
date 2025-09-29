@@ -8,7 +8,13 @@ cs = 1.0
 rho_o = 1
 const = 1
 G = 1
-a = 0.03
+a = 0.1
+
+# Time offset after which PDE is enforced (ICs remain at t=0)
+STARTUP_DT = 0.01
+
+# Weight for enforcing continuity at t=0: rho_t(0) = -rho0 * div v0
+CONTINUITY_IC_WEIGHT = 0.01
 
 iteration_adam_1D = 200
 iteration_lbgfs_1D = 100

@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from losses import ASTPN, pde_residue
+from data_generator import diff
 from model_architecture import PINN
-from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE
+from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT
 
 def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     lam = float(lam)  # Wavelength
@@ -139,40 +140,60 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
         mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
         mse_vz_ic  =  mse_cost_function(vz_ic_out, vz_0)
 
-    ############# Loss based on boundary conditions #################
+    ############# Boundary conditions enforced by construction #############
+    # With periodic input embeddings, outputs and derivatives match at boundaries,
+    # so no explicit BC loss terms are needed.
 
-    
-    rhox_b     = model.periodic_BC(net,coordinate=1,derivative_order=0,component=0)
-    
-    vx_xb      = model.periodic_BC(net,coordinate=1,derivative_order=0,component=1)
-       
-    phi_xb     = model.periodic_BC(net,coordinate=1,derivative_order=0,component=2)
-    phi_xx_b   = model.periodic_BC(net,coordinate=1,derivative_order=1,component=2)
 
-    if model.dimension == 2 or model.dimension == 3:
-        rhoy_b     = model.periodic_BC(net,coordinate=2,derivative_order=0,component=0)
+    ############## Continuity at t=0 to seed early-time evolution ###############
+    # Enforce rho_t(0) = -rho0 * div v0 at IC points
+    x_ic = collocation_IC[0]
+    if model.dimension == 1:
+        t_ic = collocation_IC[1]
+    elif model.dimension == 2:
+        y_ic = collocation_IC[1]
+        t_ic = collocation_IC[2]
+    elif model.dimension == 3:
+        y_ic = collocation_IC[1]
+        z_ic = collocation_IC[2]
+        t_ic = collocation_IC[3]
 
-        vx_yb      = model.periodic_BC(net,coordinate=2,derivative_order=0,component=1)
-        vy_xb      = model.periodic_BC(net,coordinate=1,derivative_order=0,component=2)
-        vy_yb      = model.periodic_BC(net,coordinate=2,derivative_order=0,component=2)
-
-        phi_yb     = model.periodic_BC(net,coordinate=2,derivative_order=0,component=3)
-        phi_yy_b   = model.periodic_BC(net,coordinate=2,derivative_order=1,component=3)
-
-        if model.dimension == 3:
-            rhoz_b     = model.periodic_BC(net,coordinate=3,derivative_order=0,component=0)
-
-            vx_zb      = model.periodic_BC(net,coordinate=3,derivative_order=0,component=1)
-            vy_yb      = model.periodic_BC(net,coordinate=2,derivative_order=0,component=2)
-            vy_zb      = model.periodic_BC(net,coordinate=3,derivative_order=0,component=2)
-    
-            vz_xb      = model.periodic_BC(net,coordinate=1,derivative_order=0,component=3)
-            vz_yb      = model.periodic_BC(net,coordinate=2,derivative_order=0,component=3)
-            vz_zb      = model.periodic_BC(net,coordinate=3,derivative_order=0,component=3)
-
-            phi_zb     = model.periodic_BC(net,coordinate=3,derivative_order=0,component=4)
-            phi_zz_b   = model.periodic_BC(net,coordinate=3,derivative_order=1,component=4)
-
+    # Temporarily enable gradients for t to differentiate rho wrt t at t=0
+    t_ic = t_ic.clone().detach().requires_grad_(True)
+    ic_inputs = [x_ic]
+    if model.dimension >= 2:
+        ic_inputs.append(y_ic)
+    if model.dimension == 3:
+        ic_inputs.append(z_ic)
+    ic_inputs.append(t_ic)
+    ic_outputs = net(ic_inputs)
+    rho_ic = ic_outputs[:,0:1]
+    if model.dimension == 1:
+        vx_ic = ic_outputs[:,1:2]
+        rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
+        # Use prescribed initial velocity field divergence for target
+        vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
+        div_v0 = diff(vx0, x_ic, order=1)
+        continuity_ic_loss = mse_cost_function(rho_t_ic, -rho_o * div_v0)
+    elif model.dimension == 2:
+        rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
+        # Use prescribed initial velocity field divergence for target
+        vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
+        vy0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
+        dvx_dx = diff(vx0, x_ic, order=1)
+        dvy_dy = diff(vy0, y_ic, order=1)
+        div_v0 = dvx_dx + dvy_dy
+        continuity_ic_loss = mse_cost_function(rho_t_ic, -rho_o * div_v0)
+    else: # dimension == 3
+        rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
+        vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
+        vy0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
+        vz0 = func(collocation_IC)
+        dvx_dx = diff(vx0, x_ic, order=1)
+        dvy_dy = diff(vy0, y_ic, order=1)
+        dvz_dz = diff(vz0, z_ic, order=1)
+        div_v0 = dvx_dx + dvy_dy + dvz_dz
+        continuity_ic_loss = mse_cost_function(rho_t_ic, -rho_o * div_v0)
 
     ############## Loss based on PDE ###################################
     
@@ -200,16 +221,13 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
 
     ################### Combining the loss functions ####################
     if model.dimension == 1:
-        loss = mse_rho_ic + mse_vx_ic + mse_rho + mse_velx + mse_phi + rhox_b + vx_xb + phi_xb + phi_xx_b
+        loss = mse_rho_ic + mse_vx_ic + CONTINUITY_IC_WEIGHT * continuity_ic_loss + mse_rho + mse_velx + mse_phi
 
     elif model.dimension == 2:
-        loss = mse_rho_ic + mse_vx_ic + mse_vy_ic + mse_rho + mse_velx + mse_vely + mse_phi + rhox_b + rhoy_b + \
-        vx_xb + vx_yb + vy_xb + vy_yb + phi_xb + phi_yb + phi_xx_b  + phi_yy_b
+        loss = mse_rho_ic + mse_vx_ic + mse_vy_ic + CONTINUITY_IC_WEIGHT * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_phi
 
     elif model.dimension == 3:
-        loss = mse_rho_ic + mse_vx_ic + mse_vy_ic + mse_vz_ic + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi + \
-        rhox_b + rhoy_b + rhoz_b + vx_xb + vx_yb + vx_zb + vy_xb + vy_yb + vy_zb + vz_xb + vz_yb + vz_zb + \
-        phi_xb + phi_yb + phi_zb + phi_xx_b  + phi_yy_b  + phi_zz_b
+        loss = mse_rho_ic + mse_vx_ic + mse_vy_ic + mse_vz_ic + CONTINUITY_IC_WEIGHT * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
 
     
         #loss = mse_rho_ic + mse_vx_ic + mse_vy_ic + mse_vz_ic + \
