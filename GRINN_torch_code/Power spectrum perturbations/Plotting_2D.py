@@ -1,6 +1,7 @@
 from scipy import signal
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 from torch.autograd import Variable
 import torch
 import scipy
@@ -176,6 +177,192 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     ax.set_ylim(ymin, ymax)
     
     return pc
+
+
+def create_2d_animation(net, initial_params, time_points=None, which="density", fps=10, save_path=None):
+    """
+    Create an animated 2D surface plot showing evolution over time
+
+    Args:
+        net: Trained neural network
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: Array of time points for animation (default: 50 points from 0 to 2.0)
+        which: "density" or "velocity"
+        fps: Frames per second for animation
+        save_path: Optional path to save the animation (e.g., 'animation.mp4')
+    """
+    if time_points is None:
+        time_points = np.linspace(0.0, 2.0, 50)
+    
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    print(f"Creating 2D animation with {len(time_points)} frames...")
+    
+    # Create output directory for saving plots
+    output_dir = "/kaggle/working/" if output_folder == "temp" else output_folder
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create figure and axis
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Get data for first frame to set up colorbar limits
+    Q = 100
+    xs = np.linspace(xmin, xmax, Q)
+    ys = np.linspace(ymin, ymax, Q)
+    tau, phi = np.meshgrid(xs, ys) 
+    Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
+    t_00 = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)
+    
+    # Convert to tensors for first frame
+    pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+    pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+    pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+    
+    # Get first frame data to set colorbar limits
+    output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+    rho_first = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+    U_first = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+    V_first = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+    
+    # Set up initial plot
+    if which == "density":
+        pc = ax.pcolormesh(tau, phi, rho_first, shading='auto', cmap='YlOrBr')
+        ax.set_title(f"Density Evolution, t={time_points[0]:.2f}")
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.formatter.set_powerlimits((0, 0))
+        cbar.ax.set_title(r"$\rho$", fontsize=14)
+    else:  # velocity magnitude surface plot
+        Vmag_first = np.sqrt(U_first**2 + V_first**2)
+        pc = ax.pcolormesh(tau, phi, Vmag_first, shading='auto', cmap='viridis')
+        ax.set_title(f"Velocity Evolution, t={time_points[0]:.2f}")
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.ax.set_title(r" $|v|$", fontsize=14)
+    
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    
+    # Save initial frame
+    plt.tight_layout()
+    initial_save_path = os.path.join(output_dir, f"{which}_t_{time_points[0]:.2f}.png")
+    plt.savefig(initial_save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved initial frame to {initial_save_path}")
+    
+    def animate(frame):
+        t = time_points[frame]
+        print(f"Animating frame {frame+1}/{len(time_points)} at t={t:.2f}")
+        
+        # Get data for current time
+        t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+        
+        # Convert to tensors
+        pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+        
+        # PINN model expects a list of tensors [x, y, t]
+        output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+        
+        rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+        U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+        V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+        
+        # Update plot data
+        if which == "density":
+            pc.set_array(rho.ravel())
+            ax.set_title(f"Density Evolution, t={t:.2f}")
+        else:  # velocity magnitude surface plot
+            Vmag = np.sqrt(U**2 + V**2)
+            pc.set_array(Vmag.ravel())
+            ax.set_title(f"Velocity Evolution, t={t:.2f}")
+        
+        # Save every 10th frame for static snapshots
+        if frame % 10 == 0:
+            save_path_frame = os.path.join(output_dir, f"{which}_t_{t:.2f}.png")
+            plt.savefig(save_path_frame, dpi=300, bbox_inches='tight')
+            print(f"Saved frame to {save_path_frame}")
+        
+        return pc
+    
+    # Create animation
+    anim = animation.FuncAnimation(fig, animate, frames=len(time_points), 
+                                 interval=1000/fps, blit=False, repeat=True)
+    
+    # Save animation for Kaggle display
+    animation_path = os.path.join(output_dir, f"{which}_animation.mp4")
+    print(f"Saving animation to {animation_path}...")
+    anim.save(animation_path, writer='ffmpeg', fps=fps)
+    print("Animation saved successfully!")
+    
+    # For Kaggle, also create static snapshots at key time points
+    key_times = [0.0, 0.5, 1.0, 1.5, 2.0]
+    print(f"Creating static snapshots for Kaggle display at times: {key_times}")
+    
+    for t in key_times:
+        # Get data for this time
+        t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+        pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+        
+        output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+        rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+        U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+        V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+        
+        # Create new figure for static snapshot
+        fig_static, ax_static = plt.subplots(figsize=(8, 8))
+        
+        if which == "density":
+            pc_static = ax_static.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr')
+            ax_static.set_title(f"Density Evolution, t={t:.2f}")
+            cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+            cbar_static.formatter.set_powerlimits((0, 0))
+            cbar_static.ax.set_title(r"$\rho$", fontsize=14)
+        else:  # velocity magnitude surface plot
+            Vmag = np.sqrt(U**2 + V**2)
+            pc_static = ax_static.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis')
+            ax_static.set_title(f"Velocity Evolution, t={t:.2f}")
+            cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+            cbar_static.ax.set_title(r" $|v|$", fontsize=14)
+        
+        ax_static.set_xlim(xmin, xmax)
+        ax_static.set_ylim(ymin, ymax)
+        ax_static.set_xlabel("x")
+        ax_static.set_ylabel("y")
+        
+        plt.tight_layout()
+        static_save_path = os.path.join(output_dir, f"{which}_static_t_{t:.2f}.png")
+        plt.savefig(static_save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig_static)
+        print(f"Saved static snapshot to {static_save_path}")
+    
+    # Display animation in Kaggle notebook
+    from IPython.display import HTML, display
+    import base64
+    
+    # Read the saved video file and encode it
+    with open(animation_path, 'rb') as f:
+        video_data = f.read()
+    
+    video_base64 = base64.b64encode(video_data).decode('utf-8')
+    video_html = f'''
+    <div style="text-align: center;">
+        <h3>{which.title()} Evolution Animation</h3>
+        <video width="600" height="600" controls autoplay loop>
+            <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
+            Your browser does not support the video tag.
+        </video>
+    </div>
+    '''
+    
+    display(HTML(video_html))
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return anim
 
 
 def create_2d_surface_plots(net, initial_params, time_points=None, which="density"):

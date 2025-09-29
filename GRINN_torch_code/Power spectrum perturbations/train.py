@@ -3,10 +3,10 @@ import time
 import torch
 import torch.nn as nn
 from solver import input_taker, req_consts_calc, closure, train
-from config import xmin, ymin, tmin, iteration_adam_2D, iteration_lbgfs_2D, rho_o
+from config import a, cs, xmin, ymin, tmin, iteration_adam_2D, iteration_lbgfs_2D, rho_o
 from losses import ASTPN
 from model_architecture import PINN
-from Plotting_2D import create_all_plots
+from Plotting_2D import create_2d_animation
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -20,10 +20,11 @@ if device.startswith('cuda'):
 else:
     print(f"Using device: {device}")
 
-lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(7.0, 0.03, 2, 1.5, 10000, 10000, 100000)
+lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(7.0, 0.03, 2, 2.0, 10000, 10000, 100000)
 
 jeans, alpha = req_consts_calc(lam, rho_1)
-v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+#v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+v_1 = a*cs
 
 xmax = xmin+lam*num_of_waves
 ymax= ymin+lam*num_of_waves
@@ -71,6 +72,11 @@ if device.startswith('cuda'):
 #os.makedirs(output_folder, exist_ok=True)
 #print(f"Created output folder: {output_folder}")
 
-# Create all visualization plots
+# Create animated visualization plots
 initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)
-create_all_plots(net, initial_params, include_growth=False)  # Skip slow growth plot for now
+
+print("Creating density animation...")
+anim_density = create_2d_animation(net, initial_params, which="density", fps=10)
+
+print("Creating velocity animation...")
+anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=10)
