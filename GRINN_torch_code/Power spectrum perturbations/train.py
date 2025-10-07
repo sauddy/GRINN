@@ -2,7 +2,8 @@ import numpy as np
 import time
 import torch
 import torch.nn as nn
-from solver import input_taker, req_consts_calc, closure, train
+from solver import input_taker, req_consts_calc, train
+from config import BATCH_SIZE, NUM_BATCHES
 from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o
 from losses import ASTPN
 from model_architecture import PINN
@@ -19,7 +20,7 @@ if device.startswith('cuda'):
 else:
     pass
 
-lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(wave, a, 2, TMAX_CFG, 7000, 7000, 55000)
+lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(wave, a, 2, TMAX_CFG, 10000, 10000, 100000)
 
 jeans, alpha = req_consts_calc(lam, rho_1)
 # Set initial velocity amplitude per perturbation type
@@ -54,7 +55,7 @@ train(
     collocation_IC=collocation_IC_2D,
     optimizer=optimizer,
     optimizerL=optimizerL,
-    closure=closure,
+    closure=None,
     mse_cost_function=mse_cost_function,
     iteration_adam=iteration_adam_2D,
     iterationL=iteration_lbgfs_2D,
@@ -72,11 +73,6 @@ print(f"Training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} 
 if device.startswith('cuda'):
     torch.cuda.empty_cache()
     print("GPU memory cleared after training")
-
-# Create output folder for plots
-#output_folder = f"PowerSpectrum_2D_fig_{lam}_{tmax}_{num_of_waves}_{rho_1}"
-#os.makedirs(output_folder, exist_ok=True)
-#print(f"Created output folder: {output_folder}")
 
 # Create animated visualization plots
 initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)

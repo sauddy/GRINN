@@ -8,7 +8,7 @@ import scipy
 import os
 from LAX_2D import lax_solution
 from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
-from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a
+from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -494,9 +494,9 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
     for i, time in enumerate(time_array_1d):
         print(f"Creating 1D comparison plots at t = {time}")
         
-        # Get LAX solution (Finite Difference) with reduced grid for speed
+        # Get LAX solution (Finite Difference)
         x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = lax_solution(
-            time, 1000, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+            time, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
         )
         
         # Get PINN solution
@@ -517,7 +517,9 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         
         # Density comparison plots
         axes[i*3].plot(X, rho_pred0, color='c', linewidth=3, label="PINN")
-        axes[i*3].plot(X, rho_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
+        # Only plot Linear Theory when KY == 0 and amplitude is small
+        if (np.isclose(KY, 0.0)) and (a < 0.1):
+            axes[i*3].plot(X, rho_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
         axes[i*3].plot(X, rho_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
         axes[i*3].set_xlim(xmin, xmax)
         axes[i*3].set_title(f"Density at t={time:.1f}")
@@ -528,7 +530,9 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         
         # Velocity comparison plots
         axes[i*3+1].plot(X, v_pred_x0, color='c', linewidth=3, label="PINN")
-        axes[i*3+1].plot(X, v_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
+        # Only plot Linear Theory when KY == 0 and amplitude is small
+        if (np.isclose(KY, 0.0)) and (a < 0.1):
+            axes[i*3+1].plot(X, v_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
         axes[i*3+1].plot(X, v_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
         axes[i*3+1].set_xlim(xmin, xmax)
         axes[i*3+1].set_title(f"Velocity at t={time:.1f}")
@@ -574,9 +578,9 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
 
     for i, time in enumerate(time_array_growth):
         print(f"Processing growth point {i+1}/{len(time_array_growth)} at t={time:.2f}")
-        # Get LAX solution with reduced grid resolution for speed
+        # Get LAX solution with configured grid resolution
         x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = lax_solution(
-            time, 1000, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+            time, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
         )
         
         # Get PINN solution
@@ -594,7 +598,9 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
 
     # Plot growth comparison
     plt.figure(figsize=(8, 6))
-    plt.plot(time_array_growth, np.log(Growth_LT_list), marker='o', color='b', linewidth=2, label="Linear Theory")
+    # Only plot Linear Theory when KY == 0 and amplitude is small
+    if (np.isclose(KY, 0.0)) and (a < 0.1):
+        plt.plot(time_array_growth, np.log(Growth_LT_list), marker='o', color='b', linewidth=2, label="Linear Theory")
     plt.plot(time_array_growth, np.log(Growth_FD_list), '--', marker='*', color='k', linewidth=3, label="Finite Difference")
     plt.plot(time_array_growth, np.log(Growth_PN_list), marker='^', markersize=8, linewidth=2, color='r', label="PINN")
     plt.xlabel("t", fontsize=14)
@@ -676,7 +682,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
     # Use baseline density 1.0 for Linear Theory reference
     rho_base = 1.0
     jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_base))
-    k = 2*np.pi/lam
+    k = np.sqrt(KX**2 + KY**2)
     v1_lt = (rho_1 / rho_base) * (alpha / k)
 
     # Build x grid for PINN slice
@@ -699,31 +705,43 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         vx_pinn = out[:, 1:2].data.cpu().numpy().reshape(-1)
         # potential not used in cross-section plots
 
-        # Linear Theory (self-gravitating sinusoid)
-        if lam >= jeans:
-            rho_lt = rho_base + rho_1*np.exp(alpha * t)*np.cos(k*X[:, 0])
-            vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(k*X[:, 0])
-        else:
-            # Oscillatory regime
-            omega = np.sqrt(cs**2 * k**2 - const*G*rho_base)
-            rho_lt = rho_base + rho_1*np.cos(omega * t - k*X[:, 0])
-            vx_lt = v1_lt*np.cos(omega * t - k*X[:, 0])
+        # 2D Linear Theory (only meaningful for KY == 0 in current comparison policy)
+        if np.isclose(KY, 0.0):
+            if lam >= jeans:
+                # Gravitational instability case
+                rho_lt = rho_base + rho_1*np.exp(alpha * t)*np.cos(KX * X[:, 0] + KY * y_fixed)
+                vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(KX * X[:, 0] + KY * y_fixed) * (KX / np.sqrt(KX**2 + KY**2))
+            else:
+                # Oscillatory regime
+                omega = np.sqrt(cs**2 * (KX**2 + KY**2) - const*G*rho_base)
+                rho_lt = rho_base + rho_1*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed)
+                vx_lt = v1_lt*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed) * (KX / np.sqrt(KX**2 + KY**2))
 
-        # 1D LAX sinusoidal solver
-        x_fd, rho_fd, v_fd, _phi_fd, _n, _rho_lt_fd, _rho_lt_max, _rho_max, _v_lt_fd = lax_solution1D_sin(
-            t, N_fd, nu_fd, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+        # 2D LAX solver - get full 2D solution then extract slice
+        x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, _phi_fd_2d, _n, _rho_max = lax_solution(
+            t, FD_N_2D, nu_fd, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True
         )
+        
+        # Extract 1D slice from 2D solution at y = y_fixed
+        y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1])
+        y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
+        
+        # Extract the slice
+        rho_fd = rho_fd_2d[:, y_idx]
+        v_fd = vx_fd_2d[:, y_idx]  # Use x-component of velocity
         # Interpolate FD results to PINN X grid for comparison
         from scipy.interpolate import interp1d
-        rho_fd_interp = interp1d(x_fd, rho_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
-        v_fd_interp = interp1d(x_fd, v_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        rho_fd_interp = interp1d(x_fd_2d, rho_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        v_fd_interp = interp1d(x_fd_2d, v_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
 
         # Column index
         c = row_idx
         # Top row: density
         ax_rho = fig.add_subplot(grid[0, c])
         ax_rho.plot(X[:, 0], rho_pinn, label="GRINN", color='c', linewidth=2)
-        ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        # Only plot Linear Theory when KY == 0 and amplitude is small
+        if np.isclose(KY, 0.0) and (a < 0.1):
+            ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_rho.plot(X[:, 0], rho_fd_interp, label="FD", color='k', linewidth=1)
         ax_rho.set_title(f"t={t:.1f}")
         ax_rho.set_ylabel(r"$\rho$")
@@ -741,10 +759,12 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Second row: epsilon for density using symmetric percent with absolute numerator
         # ε = 200 * |G - R| / (G + R)
         eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-12)
-        eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-12)
         ax_eps_rho = fig.add_subplot(grid[1, c])
         ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
-        ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        # Only plot Linear Theory epsilon when KY == 0 and amplitude is small
+        if np.isclose(KY, 0.0) and (a < 0.1):
+            eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-12)
+            ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_rho.set_ylabel(r"$\varepsilon$")
         ax_eps_rho.grid(True)
         if c == 0:
@@ -753,7 +773,9 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Third row: velocity
         ax_v = fig.add_subplot(grid[2, c])
         ax_v.plot(X[:, 0], vx_pinn, label="GRINN", color='c', linewidth=2)
-        ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        # Only plot Linear Theory when KY == 0 and amplitude is small
+        if np.isclose(KY, 0.0) and (a < 0.1):
+            ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_v.plot(X[:, 0], v_fd_interp, label="FD", color='k', linewidth=1)
         ax_v.set_ylabel(r"$v$")
         ax_v.grid(True)
@@ -772,10 +794,12 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         v_ref = v_fd_interp
         v_pred = vx_pinn
         eps_v = 200.0 * np.abs(v_pred - v_ref) / (v_pred + v_ref + 2.0)
-        eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
         ax_eps_v = fig.add_subplot(grid[3, c])
         ax_eps_v.plot(X[:, 0], eps_v, color='k', linewidth=1, label='FD')
-        ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        # Only plot Linear Theory epsilon when KY == 0 and amplitude is small
+        if np.isclose(KY, 0.0) and (a < 0.1):
+            eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
+            ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_v.set_xlabel("x")
         ax_eps_v.set_ylabel(r"$\varepsilon$")
         ax_eps_v.grid(True)
@@ -816,7 +840,7 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="
     # Returns (gravity=True, comparison=False, animation=True):
     #   x (Nx,), rho (Nx,Ny), vx (Nx,Ny), vy (Nx,Ny), phi (Nx,Ny), n, rho_max
     x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-        time, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+        time, FD_N_2D if N is None else N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
         use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
     )
 

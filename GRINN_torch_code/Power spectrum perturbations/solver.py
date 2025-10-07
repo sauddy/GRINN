@@ -6,7 +6,7 @@ from torch.autograd import Variable
 from losses import ASTPN, pde_residue
 from data_generator import diff
 from model_architecture import PINN
-from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE
+from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES
 
 def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     lam = float(lam)  # Wavelength
@@ -38,21 +38,6 @@ def req_consts_calc(lam, rho_1):
             alpha = np.sqrt(cs**2*(2*np.pi/lam)**2 - const*G*(rho_o + 1))
 
     return jeans, alpha
-
-def fun_rho_0(rho_1, lam, x):
-    ''' Define initial condition for density Returning Eq (11a)'''
-    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        coord = x[0]
-        u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
-        rho_0 = rho_o + rho_1 * torch.cos(2*np.pi*u/lam)
-        return rho_0
-    else:
-        rho_0 = torch.full_like(x[0], rho_o)
-        # Ensure correct shape [N, 1]
-        if rho_0.dim() == 1:
-            return rho_0.unsqueeze(-1)
-        else:
-            return rho_0
 
 def generate_power_spectrum_field(lam, v_1, x, seed=1234):
     '''Generate 2D Gaussian random field with power spectrum'''
@@ -108,27 +93,93 @@ def generate_power_spectrum_field(lam, v_1, x, seed=1234):
     else:
         return result
 
-def _sinusoidal_component(coord, lam, jeans, v_1):
+def _sinusoidal_component(coord, lam, jeans, v_1, k_component=None):
     # coord: tensor [N,1] or [N]
     u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
-    if lam > jeans:
-        return - v_1 * torch.sin(2*np.pi*u/lam)
+    if k_component is not None:
+        # Use specific k component for 2D case
+        wave_phase = k_component * u
     else:
-        return v_1 * torch.cos(2*np.pi*u/lam)
+        # Fallback to original behavior for 1D case
+        wave_phase = 2*np.pi*u/lam
+    
+    if lam > jeans:
+        return - v_1 * torch.sin(wave_phase)
+    else:
+        return v_1 * torch.cos(wave_phase)
+
+def _coupled_2d_velocity_components(x, lam, jeans, v_1):
+    '''Generate coupled 2D velocity components from the same wave pattern'''
+    if len(x) < 2:
+        # Fallback to 1D case
+        return _sinusoidal_component(x[0], lam, jeans, v_1)
+    
+    x_coord = x[0] if x[0].dim() > 1 else x[0].unsqueeze(-1)
+    y_coord = x[1] if x[1].dim() > 1 else x[1].unsqueeze(-1)
+    
+    # Calculate wave vector magnitude (convert to tensor)
+    k_magnitude = torch.sqrt(torch.tensor(KX**2 + KY**2, device=x_coord.device, dtype=x_coord.dtype))
+    
+    # Generate the coupled wave pattern
+    wave_phase = KX * x_coord + KY * y_coord
+    
+    if lam > jeans:
+        # Gravitational instability case
+        wave_field = -v_1 * torch.sin(wave_phase)
+    else:
+        # Oscillatory case
+        wave_field = v_1 * torch.cos(wave_phase)
+    
+    # Coupled velocity components
+    if k_magnitude > 0:
+        vx = wave_field * (KX / k_magnitude)
+        vy = wave_field * (KY / k_magnitude)
+    else:
+        vx = wave_field
+        vy = torch.zeros_like(wave_field)
+    
+    return vx, vy
+
+def fun_rho_0(rho_1, lam, x):
+    ''' Define initial condition for density Returning Eq (11a)'''
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        # Use separate kx and ky components for 2D wave vector
+        if len(x) >= 2:  # 2D case
+            x_coord = x[0] if x[0].dim() > 1 else x[0].unsqueeze(-1)
+            y_coord = x[1] if x[1].dim() > 1 else x[1].unsqueeze(-1)
+            rho_0 = rho_o + rho_1 * torch.cos(KX * x_coord + KY * y_coord)
+        else:  # 1D case - fallback to original behavior
+            coord = x[0]
+            u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
+            rho_0 = rho_o + rho_1 * torch.cos(2*np.pi*u/lam)
+        return rho_0
+    else:
+        rho_0 = torch.full_like(x[0], rho_o)
+        # Ensure correct shape [N, 1]
+        if rho_0.dim() == 1:
+            return rho_0.unsqueeze(-1)
+        else:
+            return rho_0
 
 def fun_vx_0(lam, jeans, v_1, x):
     '''initial condition for x-velocity -- branch by PERTURBATION_TYPE'''
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        return _sinusoidal_component(x[0], lam, jeans, v_1)
+        # Use coupled 2D velocity components for proper 2D wave physics
+        if len(x) >= 2:  # 2D case
+            vx, _ = _coupled_2d_velocity_components(x, lam, jeans, v_1)
+            return vx
+        else:  # 1D case
+            return _sinusoidal_component(x[0], lam, jeans, v_1)
     else:
         return generate_power_spectrum_field(lam, v_1, x, seed=1234)
 
 def fun_vy_0(lam, jeans, v_1, x):
     '''initial condition for y-velocity -- branch by PERTURBATION_TYPE'''
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        # use y coordinate for vy sinusoid
-        if len(x) >= 2:
-            return _sinusoidal_component(x[1], lam, jeans, v_1)
+        # Use coupled 2D velocity components for proper 2D wave physics
+        if len(x) >= 2:  # 2D case
+            _, vy = _coupled_2d_velocity_components(x, lam, jeans, v_1)
+            return vy
         else:
             # fallback to x if y is unavailable (1D)
             return _sinusoidal_component(x[0], lam, jeans, v_1)
@@ -137,9 +188,6 @@ def fun_vy_0(lam, jeans, v_1, x):
 
 def func(x):
     return x[0]*0
-
-### (3) Training / Fitting
-from tqdm import tqdm
 
 #start = time.time()
 def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt):
@@ -170,7 +218,11 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     is_sin = str(PERTURBATION_TYPE).lower() == "sinusoidal"
     if is_sin:
         x_ic_for_ic = collocation_IC[0]
-        rho_ic_target = rho_o + rho_1 * torch.cos(2*np.pi*x_ic_for_ic/lam)
+        if len(collocation_IC) >= 2:  # 2D case
+            y_ic_for_ic = collocation_IC[1]
+            rho_ic_target = rho_o + rho_1 * torch.cos(KX * x_ic_for_ic + KY * y_ic_for_ic)
+        else:  # 1D case
+            rho_ic_target = rho_o + rho_1 * torch.cos(2*np.pi*x_ic_for_ic/lam)
         mse_rho_ic = mse_cost_function(rho_ic_out, rho_ic_target)
     else:
         mse_rho_ic = 0.0 * torch.mean(rho_ic_out*0)
@@ -183,11 +235,6 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     elif model.dimension == 3:
         mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
         mse_vz_ic  =  mse_cost_function(vz_ic_out, vz_0)
-
-    ############# Boundary conditions enforced by construction #############
-    # With periodic input embeddings, outputs and derivatives match at boundaries,
-    # so no explicit BC loss terms are needed.
-
 
     ############## Continuity at t=0 to seed early-time evolution ###############
     # Enforce rho_t(0) = -rho0 * div v0 at IC points
@@ -312,8 +359,7 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     return loss
 
 def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device):
-
-    # Cosine schedules for continuity weight and startup dt
+    # Batched training is the default
     total_steps = iteration_adam + iterationL
     total_for_decay = max(1, int(total_steps * DECAY_PORTION))
 
@@ -324,32 +370,199 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         cos_term = (1 + np.cos(np.pi * s / (total_for_decay - 1))) / 2.0
         return end_value + (start_value - end_value) * cos_term
 
+    bs = int(BATCH_SIZE)
+    nb = int(NUM_BATCHES)
+
     for i in range(iteration_adam):
-
-        optimizer.zero_grad() # to make the gradients zero
-
+        optimizer.zero_grad()
         global_step = i
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss = optimizer.step(lambda: closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt))
+        loss = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb))
 
         with torch.autograd.no_grad():
-            
             if i % 100 == 0:
-                print(f"Training Loss at {i} for Adam in 2D system = {loss.item():.2e}", flush=True)
+                print(f"Training Loss at {i} for Adam (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
 
     for i in range(iterationL):
-        
-        optimizer.zero_grad() # to make the gradients zero
-
+        optimizer.zero_grad()
         global_step = iteration_adam + i
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss = optimizerL.step(lambda: closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt))
+        loss = optimizerL.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb))
 
         with torch.autograd.no_grad():
-            
             if i % 50 == 0:
-                print(f"Training Loss at {i} for LBGFS in 2D system = {loss.item():.2e}", flush=True)
+                print(f"Training Loss at {i} for LBGFS (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
+
+
+def _random_batch_indices(total_count, batch_size, device):
+    actual = int(min(batch_size, total_count))
+    return torch.randperm(total_count, device=device)[:actual]
+
+
+def _make_batch_tensors(tensors_list, indices):
+    return [t[indices].clone() for t in tensors_list]
+
+
+def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
+                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches):
+
+    # Aggregate losses across mini-batches
+    total_loss = 0.0
+    num_effective_batches = 0
+
+    # Determine counts and devices
+    dom_n = collocation_domain[0].size(0)
+    ic_n = collocation_IC[0].size(0)
+    device = collocation_domain[0].device
+
+    for _ in range(int(max(1, num_batches))):
+        dom_idx = _random_batch_indices(dom_n, batch_size, device)
+        ic_idx = _random_batch_indices(ic_n, batch_size, device)
+
+        batch_dom = _make_batch_tensors(collocation_domain, dom_idx)
+        batch_ic = _make_batch_tensors(collocation_IC, ic_idx)
+
+        # IC loss terms
+        rho_0 = fun_rho_0(rho_1, lam, batch_ic)
+        vx_0  = fun_vx_0(lam, jeans, v_1, batch_ic)
+
+        net_ic_out = net(batch_ic)
+        rho_ic_out = net_ic_out[:,0:1]
+        vx_ic_out  = net_ic_out[:,1:2]
+
+        if model.dimension == 2:
+            vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic)
+            vy_ic_out = net_ic_out[:,2:3]
+        elif model.dimension == 3:
+            vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic)
+            vz_0 = func(batch_ic)
+            vy_ic_out = net_ic_out[:,2:3]
+            vz_ic_out = net_ic_out[:,3:4]
+
+        is_sin = str(PERTURBATION_TYPE).lower() == "sinusoidal"
+        if is_sin:
+            x_ic_for_ic = batch_ic[0]
+            if len(batch_ic) >= 2:
+                y_ic_for_ic = batch_ic[1]
+                rho_ic_target = rho_o + rho_1 * torch.cos(KX * x_ic_for_ic + KY * y_ic_for_ic)
+            else:
+                rho_ic_target = rho_o + rho_1 * torch.cos(2*np.pi*x_ic_for_ic/lam)
+            mse_rho_ic = mse_cost_function(rho_ic_out, rho_ic_target)
+        else:
+            mse_rho_ic = 0.0 * torch.mean(rho_ic_out*0)
+
+        mse_vx_ic  = mse_cost_function(vx_ic_out, vx_0)
+        if model.dimension == 2:
+            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
+        elif model.dimension == 3:
+            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
+            mse_vz_ic = mse_cost_function(vz_ic_out, vz_0)
+
+        # Continuity seeding at t=0 on IC points
+        x_ic = batch_ic[0]
+        if model.dimension == 1:
+            t_ic = batch_ic[1]
+        elif model.dimension == 2:
+            y_ic = batch_ic[1]
+            t_ic = batch_ic[2]
+        elif model.dimension == 3:
+            y_ic = batch_ic[1]
+            z_ic = batch_ic[2]
+            t_ic = batch_ic[3]
+
+        t_ic = t_ic.clone().detach().requires_grad_(not is_sin)
+        ic_inputs = [x_ic]
+        if model.dimension >= 2:
+            ic_inputs.append(y_ic)
+        if model.dimension == 3:
+            ic_inputs.append(z_ic)
+        ic_inputs.append(t_ic)
+        ic_outputs = net(ic_inputs)
+        rho_ic = ic_outputs[:,0:1]
+        if model.dimension == 1:
+            if is_sin:
+                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
+            else:
+                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
+                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
+                div_v0 = diff(vx0, x_ic, order=1)
+                rho0_field = rho_o * torch.ones_like(div_v0)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+        elif model.dimension == 2:
+            if is_sin:
+                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
+            else:
+                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
+                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
+                vy0 = fun_vy_0(lam, jeans, v_1, batch_ic)
+                dvx_dx = diff(vx0, x_ic, order=1)
+                dvy_dy = diff(vy0, y_ic, order=1)
+                div_v0 = dvx_dx + dvy_dy
+                rho0_field = rho_o * torch.ones_like(div_v0)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+        else:
+            if is_sin:
+                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
+            else:
+                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
+                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
+                vy0 = fun_vy_0(lam, jeans, v_1, batch_ic)
+                vz0 = func(batch_ic)
+                dvx_dx = diff(vx0, x_ic, order=1)
+                dvy_dy = diff(vy0, y_ic, order=1)
+                dvz_dz = diff(vz0, z_ic, order=1)
+                div_v0 = dvx_dx + dvy_dy + dvz_dz
+                rho0_field = rho_o * torch.ones_like(div_v0)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+
+        # PDE residuals on batched domain with startup shift
+        if isinstance(batch_dom, (list, tuple)):
+            colloc_shifted = list(batch_dom)
+        else:
+            colloc_shifted = batch_dom
+        if model.dimension == 1:
+            if not is_sin:
+                colloc_shifted[1] = colloc_shifted[1] + startup_dt
+            rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
+        elif model.dimension == 2:
+            if not is_sin:
+                colloc_shifted[2] = colloc_shifted[2] + startup_dt
+            rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
+        else:
+            if not is_sin:
+                colloc_shifted[3] = colloc_shifted[3] + startup_dt
+            rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
+
+        mse_rho  = torch.mean(rho_r ** 2)
+        mse_velx = torch.mean(vx_r  ** 2)
+        if model.dimension == 2:
+            mse_vely = torch.mean(vy_r  ** 2)
+        elif model.dimension == 3:
+            mse_vely = torch.mean(vy_r  ** 2)
+            mse_velz = torch.mean(vz_r  ** 2)
+        mse_phi  = torch.mean(phi_r ** 2)
+
+        if model.dimension == 1:
+            base = mse_vx_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_phi
+            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
+        elif model.dimension == 2:
+            base = mse_vx_ic + mse_vy_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_phi
+            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
+        else:
+            base = mse_vx_ic + mse_vy_ic + mse_vz_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
+            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
+
+        total_loss = total_loss + loss
+        num_effective_batches += 1
+
+    optimizer.zero_grad()
+    avg_loss = total_loss / max(1, num_effective_batches)
+    avg_loss.backward(retain_graph=True)
+    return avg_loss
+
+
+    return net

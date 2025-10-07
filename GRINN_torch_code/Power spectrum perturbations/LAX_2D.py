@@ -14,6 +14,14 @@ import scipy
 from numpy.fft import fft, ifft,fft2, ifft2
 from scipy import signal
 
+# Import wave vector components for 2D sinusoidal perturbations
+try:
+    from config import KX, KY
+except ImportError:
+    # Fallback if config not available
+    KX = 2*np.pi/5.0  # Default wavelength
+    KY = 0.0
+
 np.random.seed(1234)
 #tf.random.set_seed(1234)
 
@@ -182,12 +190,20 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
         rho0 = rho_o * np.ones((Nx, Ny))
         vx0, vy0 = generate_velocity_field_power_spectrum(Nx, Ny, Lx, Ly, power_index=ps_index, amplitude=vel_rms, random_seed=random_seed)
     else:
-        rho0 = rho_o + rho_1* np.cos(2*np.pi*xx/lam) # defing the density at t = 0 EQ 11
+        # Use 2D wave pattern: cos(KX*x + KY*y) instead of cos(2π*x/λ)
+        rho0 = rho_o + rho_1 * np.cos(KX * xx + KY * yy)
 
     if gravity == False and not use_velocity_ps:
         print("Propagation of Sound wave") 
         v_1 = (c_s*rho_1)/rho_o # velocity perturbation
-        vx0 = v_1 * np.cos(2*np.pi*xx/lam) # the velocity at t =0
+        # Use coupled 2D velocity components derived from the same wave pattern
+        k_magnitude = np.sqrt(KX**2 + KY**2)
+        if k_magnitude > 0:
+            vx0 = v_1 * np.cos(KX * xx + KY * yy) * (KX / k_magnitude)
+            vy0 = v_1 * np.cos(KX * xx + KY * yy) * (KY / k_magnitude)
+        else:
+            vx0 = v_1 * np.cos(KX * xx + KY * yy)
+            vy0 = np.zeros_like(xx)
 
         ## Linear Theory
         if comparison:
@@ -205,7 +221,14 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
             print("There is gravitational instabilty  lam = {} > l_jean ={}".format(lam,jeans))
             alpha = np.sqrt(const*G*rho_o-c_s**2*(2*np.pi/lam)**2)
             v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam)) ## With gravity     
-            vx0 = - v_1 * np.sin(2*np.pi*xx/lam) # the velocity at t =0
+            # Use coupled 2D velocity components derived from the same wave pattern
+            k_magnitude = np.sqrt(KX**2 + KY**2)
+            if k_magnitude > 0:
+                vx0 = -v_1 * np.sin(KX * xx + KY * yy) * (KX / k_magnitude)
+                vy0 = -v_1 * np.sin(KX * xx + KY * yy) * (KY / k_magnitude)
+            else:
+                vx0 = -v_1 * np.sin(KX * xx + KY * yy)
+                vy0 = np.zeros_like(xx)
             # print("initial vy",vy[n-1,1,:])
             ##### Density values from Linear Theory at t 
             if comparison:
@@ -218,7 +241,14 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
             print("There is no gravitational instabilty as lam = {} < l_jean ={}".format(lam,jeans))
             alpha = np.sqrt(c_s**2*(2*np.pi/lam)**2 - const*G*rho_o)
             v_1 = (rho_1/rho_o) * (alpha/(2*np.pi/lam)) # velocity perturbation
-            vx0 = v_1 * np.cos(2*np.pi*xx/lam) # the velocity at t =0
+            # Use coupled 2D velocity components derived from the same wave pattern
+            k_magnitude = np.sqrt(KX**2 + KY**2)
+            if k_magnitude > 0:
+                vx0 = v_1 * np.cos(KX * xx + KY * yy) * (KX / k_magnitude)
+                vy0 = v_1 * np.cos(KX * xx + KY * yy) * (KY / k_magnitude)
+            else:
+                vx0 = v_1 * np.cos(KX * xx + KY * yy)
+                vy0 = np.zeros_like(xx)
             if comparison:
                 rho_LT = rho_o + rho_1*np.cos(alpha * time - 2*np.pi*x/lam)
                 rho_LT_max = np.max(rho_o + rho_1*np.cos(alpha * time - 2*np.pi*xx/lam))
