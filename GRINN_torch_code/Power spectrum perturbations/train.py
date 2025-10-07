@@ -3,10 +3,11 @@ import time
 import torch
 import torch.nn as nn
 from solver import input_taker, req_consts_calc, closure, train
-from config import a, cs, xmin, ymin, tmin, iteration_adam_2D, iteration_lbgfs_2D, rho_o
+from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o
 from losses import ASTPN
 from model_architecture import PINN
 from Plotting_2D import create_2d_animation
+from Plotting_2D import create_1d_cross_sections_sinusoidal
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -15,21 +16,23 @@ device = "mps" if torch.backends.mps.is_built() else "cuda:0" if torch.cuda.is_a
 # Clear GPU memory if using CUDA
 if device.startswith('cuda'):
     torch.cuda.empty_cache()
-    print(f"Using GPU: {torch.cuda.get_device_name()}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 else:
-    print(f"Using device: {device}")
+    pass
 
-lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(7.0, 0.03, 2, 2.0, 10000, 10000, 100000)
+lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(wave, a, 2, TMAX_CFG, 7000, 7000, 55000)
 
 jeans, alpha = req_consts_calc(lam, rho_1)
-#v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
-v_1 = a*cs
+# Set initial velocity amplitude per perturbation type
+if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+    k = 2*np.pi/lam
+    v_1 = (rho_1 / (rho_o if rho_o != 0 else 1.0)) * (alpha / k)
+else:
+    v_1 = a * cs
 
-xmax = xmin+lam*num_of_waves
-ymax= ymin+lam*num_of_waves
+xmax = xmin + lam * num_of_waves
+ymax = ymin + lam * num_of_waves
 
-net = PINN()
+net = PINN(n_harmonics=harmonics)
 net = net.to(device)
 mse_cost_function = torch.nn.MSELoss() # Mean squared error
 optimizer = torch.optim.Adam(net.parameters(),lr=0.001,)
@@ -78,8 +81,22 @@ if device.startswith('cuda'):
 # Create animated visualization plots
 initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)
 
-print("Creating density animation...")
-anim_density = create_2d_animation(net, initial_params, which="density", fps=10)
+anim_density = create_2d_animation(net, initial_params, which="density", fps=10, verbose=False)
+anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=10, verbose=False)
 
-print("Creating velocity animation...")
-anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=10)
+# If using sinusoidal perturbations, also plot 1D cross-sections at fixed y
+if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+    # Use config.TIMES_1D when time_points is None
+    create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
+
+# Always save the trained model to SNAPSHOT_DIR/GRINN
+try:
+    import os
+    from config import SNAPSHOT_DIR
+    model_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "model.pth")
+    torch.save(net.state_dict(), model_path)
+    print(f"Saved model to {model_path}")
+except Exception as e:
+    print(f"Warning: failed to save model: {e}")

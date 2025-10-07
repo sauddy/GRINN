@@ -7,6 +7,8 @@ import torch
 import scipy
 import os
 from LAX_2D import lax_solution
+from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
+from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -179,7 +181,7 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     return pc
 
 
-def create_2d_animation(net, initial_params, time_points=None, which="density", fps=10, save_path=None, fixed_colorbar=True):
+def create_2d_animation(net, initial_params, time_points=None, which="density", fps=2, save_path=None, fixed_colorbar=True, verbose=False):
     """
     Create an animated 2D surface plot showing evolution over time
 
@@ -192,18 +194,21 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         save_path: Optional path to save the animation (e.g., 'animation.mp4')
     """
     if time_points is None:
-        time_points = np.linspace(0.0, 2.0, 50)
+        # Use the provided training tmax from initial_params to bound animation time
+        _xmin, _xmax, _ymin, _ymax, _rho_1, _alpha, _lam, _output_folder, tmax = initial_params
+        time_points = np.linspace(0.0, float(tmax), 80)
     
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
     
-    print(f"Creating 2D animation with {len(time_points)} frames...")
+    if verbose:
+        print(f"Creating 2D animation with {len(time_points)} frames...")
     
-    # Create output directory for saving plots
-    output_dir = "/kaggle/working/" if output_folder == "temp" else output_folder
+    # Create output directory for saving plots: always use config.SNAPSHOT_DIR/GRINN
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
     os.makedirs(output_dir, exist_ok=True)
     
     # Create figure and axis
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
     
     # Get data for first frame to set up colorbar limits
     Q = 100
@@ -223,6 +228,8 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     rho_first = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
     U_first = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
     V_first = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+    
+    # (removed temporary quick-check print of mean(U), mean(V))
     
     # Optionally precompute fixed color limits using first and last frames
     fixed_vmin = None
@@ -263,14 +270,16 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
                 rmin, rmax = rmin - eps, rmax + eps
             vmin_use, vmax_use = rmin, rmax
         pc = ax.pcolormesh(tau, phi, rho_first, shading='auto', cmap='YlOrBr', vmin=vmin_use, vmax=vmax_use)
-        ax.set_title(f"Density Evolution, t={time_points[0]:.2f}")
+        pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+        ax.set_title(f"{pert_str} Density, t={time_points[0]:.2f}")
         cbar = plt.colorbar(pc, shrink=0.6, location='right')
         cbar.formatter.set_powerlimits((0, 0))
         cbar.ax.set_title(r"$\rho$", fontsize=14)
     else:  # velocity magnitude surface plot
         Vmag_first = np.sqrt(U_first**2 + V_first**2)
         pc = ax.pcolormesh(tau, phi, Vmag_first, shading='auto', cmap='viridis')
-        ax.set_title(f"Velocity Evolution, t={time_points[0]:.2f}")
+        pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+        ax.set_title(f"{pert_str} Velocity, t={time_points[0]:.2f}")
         cbar = plt.colorbar(pc, shrink=0.6, location='right')
         cbar.ax.set_title(r" $|v|$", fontsize=14)
     
@@ -279,15 +288,12 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     
-    # Save initial frame
-    plt.tight_layout()
-    initial_save_path = os.path.join(output_dir, f"{which}_t_{time_points[0]:.2f}.png")
-    plt.savefig(initial_save_path, dpi=300, bbox_inches='tight')
-    print(f"Saved initial frame to {initial_save_path}")
+    # Do not save the initial frame by default; animation frames and optional snapshots cover needs
     
     def animate(frame):
         t = time_points[frame]
-        print(f"Animating frame {frame+1}/{len(time_points)} at t={t:.2f}")
+        if verbose:
+            print(f"Animating frame {frame+1}/{len(time_points)} at t={t:.2f}")
         
         # Get data for current time
         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
@@ -314,17 +320,20 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
                     eps = 1e-6 if rmin == 0 else 1e-6 * abs(rmin)
                     rmin, rmax = rmin - eps, rmax + eps
                 pc.set_clim(vmin=rmin, vmax=rmax)
-            ax.set_title(f"Density Evolution, t={t:.2f}")
+            pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+            ax.set_title(f"{pert_str} Density, t={t:.2f}")
         else:  # velocity magnitude surface plot
             Vmag = np.sqrt(U**2 + V**2)
             pc.set_array(Vmag.ravel())
-            ax.set_title(f"Velocity Evolution, t={t:.2f}")
+            pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+            ax.set_title(f"{pert_str} Velocity, t={t:.2f}")
         
         # Save every 10th frame for static snapshots
         if frame % 10 == 0:
             save_path_frame = os.path.join(output_dir, f"{which}_t_{t:.2f}.png")
             plt.savefig(save_path_frame, dpi=300, bbox_inches='tight')
-            print(f"Saved frame to {save_path_frame}")
+            if verbose:
+                print(f"Saved frame to {save_path_frame}")
         
         return pc
     
@@ -336,61 +345,62 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     try:
         if animation.writers.is_available('ffmpeg'):
             animation_path = os.path.join(output_dir, f"{which}_animation.mp4")
-            print(f"Saving animation to {animation_path} with ffmpeg...")
+            if verbose:
+                print(f"Saving animation to {animation_path} with ffmpeg...")
             anim.save(animation_path, writer='ffmpeg', fps=fps)
             saved_format = 'mp4'
         else:
             animation_path = os.path.join(output_dir, f"{which}_animation.gif")
-            print(f"ffmpeg not available. Saving animation to {animation_path} with Pillow...")
+            if verbose:
+                print(f"ffmpeg not available. Saving animation to {animation_path} with Pillow...")
             anim.save(animation_path, writer='pillow', fps=fps)
             saved_format = 'gif'
-        print("Animation saved successfully!")
+        if verbose:
+            print("Animation saved successfully!")
     except Exception as e:
         print(f"Animation save failed: {e}")
         raise
     
-    # For Kaggle, also create static snapshots at key time points
-    key_times = [0.0, 0.5, 1.0, 1.5, 2.0]
-    print(f"Creating static snapshots for Kaggle display at times: {key_times}")
-    
-    for t in key_times:
-        # Get data for this time
-        t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
-        pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
-        pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
-        
-        output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
-        rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
-        U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-        V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
-        
-        # Create new figure for static snapshot
-        fig_static, ax_static = plt.subplots(figsize=(8, 8))
-        
-        if which == "density":
-            pc_static = ax_static.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr')
-            ax_static.set_title(f"Density Evolution, t={t:.2f}")
-            cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
-            cbar_static.formatter.set_powerlimits((0, 0))
-            cbar_static.ax.set_title(r"$\rho$", fontsize=14)
-        else:  # velocity magnitude surface plot
-            Vmag = np.sqrt(U**2 + V**2)
-            pc_static = ax_static.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis')
-            ax_static.set_title(f"Velocity Evolution, t={t:.2f}")
-            cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
-            cbar_static.ax.set_title(r" $|v|$", fontsize=14)
-        
-        ax_static.set_xlim(xmin, xmax)
-        ax_static.set_ylim(ymin, ymax)
-        ax_static.set_xlabel("x")
-        ax_static.set_ylabel("y")
-        
-        plt.tight_layout()
-        static_save_path = os.path.join(output_dir, f"{which}_static_t_{t:.2f}.png")
-        plt.savefig(static_save_path, dpi=300, bbox_inches='tight')
-        plt.close(fig_static)
-        print(f"Saved static snapshot to {static_save_path}")
+    # Optional static snapshots uniformly over [0, tmax]
+    if SAVE_STATIC_SNAPSHOTS:
+        snapshot_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+        os.makedirs(snapshot_dir, exist_ok=True)
+        # Determine tmax from initial_params
+        _xmin, _xmax, _ymin, _ymax, _rho_1, _alpha, _lam, _output_folder, tmax_val = initial_params
+        times_static = np.linspace(0.0, float(tmax_val), 5)
+        if verbose:
+            print(f"Saving {len(times_static)} static snapshots to {snapshot_dir} over [0, {tmax_val}]...")
+        for t in times_static:
+            t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+            pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+            pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+            pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+            output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+            rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+
+            fig_static, ax_static = plt.subplots(figsize=(8, 8))
+            if which == "density":
+                pc_static = ax_static.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr')
+                cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+                cbar_static.formatter.set_powerlimits((0, 0))
+                cbar_static.ax.set_title(r"$\rho$", fontsize=14)
+            else:
+                Vmag = np.sqrt(U**2 + V**2)
+                pc_static = ax_static.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis')
+                cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+                cbar_static.ax.set_title(r" $|v|$", fontsize=14)
+            ax_static.set_xlim(xmin, xmax)
+            ax_static.set_ylim(ymin, ymax)
+            ax_static.set_xlabel("x")
+            ax_static.set_ylabel("y")
+            plt.tight_layout()
+            static_save_path = os.path.join(snapshot_dir, f"{which}_static_t_{t:.2f}.png")
+            plt.savefig(static_save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_static)
+            if verbose:
+                print(f"Saved static snapshot to {static_save_path}")
     
     # Display animation inline if in a notebook
     try:
@@ -421,8 +431,8 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     except Exception as _:
         pass
     
-    plt.tight_layout()
-    plt.show()
+    # Avoid displaying the figure in non-notebook runs
+    plt.close(fig)
     
     return anim
 
@@ -642,6 +652,143 @@ def create_all_plots(net, initial_params, include_growth=False,
         "fd_density": (fig_fd_den, axes_fd_den),
         "fd_velocity": (fig_fd_vel, axes_fd_vel),
     }
+
+
+def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=1000, nu_fd=0.5):
+    """
+    Create 1D cross-section plots at fixed y for sinusoidal perturbations, comparing
+    PINN vs Linear Theory vs 1D LAX (sinusoidal).
+
+    Args:
+        net: trained network
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: list of times to plot
+        y_fixed: y value for the 1D slice through the 2D domain
+        N_fd: grid size for 1D LAX solver
+        nu_fd: Courant number for 1D LAX solver
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, _output_folder, _tmax = initial_params
+    num_of_waves = (xmax - xmin) / lam
+
+    if time_points is None:
+        time_points = TIMES_1D if isinstance(TIMES_1D, (list, tuple)) and len(TIMES_1D) > 0 else [0.5, 1.0, 1.5]
+
+    # Use baseline density 1.0 for Linear Theory reference
+    rho_base = 1.0
+    jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_base))
+    k = 2*np.pi/lam
+    v1_lt = (rho_1 / rho_base) * (alpha / k)
+
+    # Build x grid for PINN slice
+    X = np.linspace(xmin, xmax, 1000).reshape(1000, 1)
+    Y = y_fixed * np.ones_like(X)
+
+    # Create 2 rows x T columns panel layout matching target style
+    T = len(time_points)
+    fig = plt.figure(figsize=(6*T, 8), constrained_layout=False)
+    grid = plt.GridSpec(4, T, figure=fig, hspace=0.12, wspace=0.18)
+
+    for row_idx, t in enumerate(time_points):
+        # PINN predictions at fixed y
+        t_arr = t * np.ones_like(X)
+        pt_x = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
+        pt_t = Variable(torch.from_numpy(t_arr).float(), requires_grad=True).to(device)
+        out = net([pt_x, pt_y, pt_t])
+        rho_pinn = out[:, 0:1].data.cpu().numpy().reshape(-1)
+        vx_pinn = out[:, 1:2].data.cpu().numpy().reshape(-1)
+        # potential not used in cross-section plots
+
+        # Linear Theory (self-gravitating sinusoid)
+        if lam >= jeans:
+            rho_lt = rho_base + rho_1*np.exp(alpha * t)*np.cos(k*X[:, 0])
+            vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(k*X[:, 0])
+        else:
+            # Oscillatory regime
+            omega = np.sqrt(cs**2 * k**2 - const*G*rho_base)
+            rho_lt = rho_base + rho_1*np.cos(omega * t - k*X[:, 0])
+            vx_lt = v1_lt*np.cos(omega * t - k*X[:, 0])
+
+        # 1D LAX sinusoidal solver
+        x_fd, rho_fd, v_fd, _phi_fd, _n, _rho_lt_fd, _rho_lt_max, _rho_max, _v_lt_fd = lax_solution1D_sin(
+            t, N_fd, nu_fd, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+        )
+        # Interpolate FD results to PINN X grid for comparison
+        from scipy.interpolate import interp1d
+        rho_fd_interp = interp1d(x_fd, rho_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        v_fd_interp = interp1d(x_fd, v_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+
+        # Column index
+        c = row_idx
+        # Top row: density
+        ax_rho = fig.add_subplot(grid[0, c])
+        ax_rho.plot(X[:, 0], rho_pinn, label="GRINN", color='c', linewidth=2)
+        ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        ax_rho.plot(X[:, 0], rho_fd_interp, label="FD", color='k', linewidth=1)
+        ax_rho.set_title(f"t={t:.1f}")
+        ax_rho.set_ylabel(r"$\rho$")
+        ax_rho.grid(True)
+        if a < 0.1:
+            limu = 1.2*rho_o
+            liml = .8*rho_o
+        else:
+            limu = 3.0*rho_o
+            liml = -1.0*rho_o
+        ax_rho.set_ylim(liml,limu)
+        if c == 0:
+            ax_rho.legend(loc='upper right', fontsize=8)
+
+        # Second row: epsilon for density using symmetric percent with absolute numerator
+        # ε = 200 * |G - R| / (G + R)
+        eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-12)
+        eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-12)
+        ax_eps_rho = fig.add_subplot(grid[1, c])
+        ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
+        ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        ax_eps_rho.set_ylabel(r"$\varepsilon$")
+        ax_eps_rho.grid(True)
+        if c == 0:
+            ax_eps_rho.legend(loc='upper right', fontsize=8)
+
+        # Third row: velocity
+        ax_v = fig.add_subplot(grid[2, c])
+        ax_v.plot(X[:, 0], vx_pinn, label="GRINN", color='c', linewidth=2)
+        ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        ax_v.plot(X[:, 0], v_fd_interp, label="FD", color='k', linewidth=1)
+        ax_v.set_ylabel(r"$v$")
+        ax_v.grid(True)
+        if a < 0.1:
+            limu = 0.055
+            liml = -0.055
+        else:
+            limu = 0.6
+            liml = -0.6
+        ax_v.set_ylim(liml,limu)
+        if c == 0:
+            ax_v.legend(loc='upper right', fontsize=8)
+
+        # Fourth row: epsilon for velocity using notebook-style +1 offset (symmetric percent with shift)
+        # ε = 200 * |(v_pred+1) - (v_ref+1)| / ((v_pred+1) + (v_ref+1)) = 200 * |v_pred - v_ref| / (v_pred + v_ref + 2)
+        v_ref = v_fd_interp
+        v_pred = vx_pinn
+        eps_v = 200.0 * np.abs(v_pred - v_ref) / (v_pred + v_ref + 2.0)
+        eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
+        ax_eps_v = fig.add_subplot(grid[3, c])
+        ax_eps_v.plot(X[:, 0], eps_v, color='k', linewidth=1, label='FD')
+        ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        ax_eps_v.set_xlabel("x")
+        ax_eps_v.set_ylabel(r"$\varepsilon$")
+        ax_eps_v.grid(True)
+        if c == 0:
+            ax_eps_v.legend(loc='upper right', fontsize=8)
+
+        # No potential subplot per request
+
+    # Reduce outer margins similar to notebook style
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.92, bottom=0.10, wspace=0.18, hspace=0.12)
+    plt.show()
+
+    return fig
 
 
 def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="density",

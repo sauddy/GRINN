@@ -3,17 +3,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from torch.autograd import Variable
-from config import rho_o
+from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE
 
 class Sin(nn.Module):
     def forward(self, input):
         return torch.sin(input)
 
 class PINN(nn.Module):
-    def __init__(self, num_neurons=48, n_harmonics=1):
+    def __init__(self, num_neurons=num_neurons, n_harmonics=1):
         super(PINN, self).__init__()
         self.num_neurons = num_neurons
         self.n_harmonics = n_harmonics
+        self.num_layers = max(2, int(num_layers))  # total Linear layers including output
         
         # Domain extents for periodic embeddings (set via set_domain)
         self.xmin = None
@@ -23,36 +24,34 @@ class PINN(nn.Module):
         self.zmin = None
         self.zmax = None
     
+    # Helper to build a branch with dynamic depth
+        def _make_branch(in_dim, out_dim):
+            layers = []
+            # First layer
+            layers.append(nn.Linear(in_dim, self.num_neurons))
+            # Hidden layers: total linear layers = self.num_layers; we already added 1; 
+            # add (self.num_layers - 2) hidden Linear blocks with Sin activations after each
+            for _ in range(self.num_layers - 2):
+                layers.append(Sin())
+                layers.append(nn.Linear(self.num_neurons, self.num_neurons))
+            # Activation before output if there is at least one hidden block
+            if self.num_layers > 2:
+                layers.append(Sin())
+            # Output layer
+            layers.append(nn.Linear(self.num_neurons, out_dim))
+            return nn.Sequential(*layers)
+
     # 1D branch (periodic x features + t)
         in_dim_1d = 2*self.n_harmonics + 1
-        self.branch_1d = nn.Sequential(
-            nn.Linear(in_dim_1d, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, 3))
+        self.branch_1d = _make_branch(in_dim_1d, 3)
         
     # 2D branch (periodic x,y features + t)
         in_dim_2d = 4*self.n_harmonics + 1
-        self.branch_2d = nn.Sequential(
-            nn.Linear(in_dim_2d, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, 4))
+        self.branch_2d = _make_branch(in_dim_2d, 4)
         
     # 3D branch (periodic x,y,z features + t)
         in_dim_3d = 6*self.n_harmonics + 1
-        self.branch_3d = nn.Sequential(
-            nn.Linear(in_dim_3d, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, num_neurons),
-            Sin(),
-            nn.Linear(num_neurons, 5))
+        self.branch_3d = _make_branch(in_dim_3d, 5)
         
         # Output layers per branch
         #self.output_layer_1d = nn.Linear(3, 1)
@@ -91,11 +90,15 @@ class PINN(nn.Module):
             inputs = torch.cat([x_feat, t], dim=1)
             outputs = self.branch_1d(inputs)
             # Hard-enforce uniform density at t=0 without in-place ops
-            rho_hat = outputs[:,0:1]
-            other = outputs[:,1:]
-            rho = rho_o + t * rho_hat
-            outputs_mod = torch.cat([rho, other], dim=1)
-            return outputs_mod
+            if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+                # For sinusoidal experiments, do not hard-constrain rho at t=0.
+                return outputs
+            else:
+                rho_hat = outputs[:,0:1]
+                other = outputs[:,1:]
+                rho = rho_o + t * rho_hat
+                outputs_mod = torch.cat([rho, other], dim=1)
+                return outputs_mod
         
         elif len(X) == 3:
             if self.xmin is None or self.xmax is None or self.ymin is None or self.ymax is None:
@@ -106,11 +109,14 @@ class PINN(nn.Module):
             y_feat = self._periodic_features(y, self.ymin, self.ymax)
             inputs = torch.cat([x_feat, y_feat, t], dim=1)
             outputs = self.branch_2d(inputs)
-            rho_hat = outputs[:,0:1]
-            other = outputs[:,1:]
-            rho = rho_o + t * rho_hat
-            outputs_mod = torch.cat([rho, other], dim=1)
-            return outputs_mod
+            if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+                return outputs
+            else:
+                rho_hat = outputs[:,0:1]
+                other = outputs[:,1:]
+                rho = rho_o + t * rho_hat
+                outputs_mod = torch.cat([rho, other], dim=1)
+                return outputs_mod
         
         elif len(X) == 4:
             if (self.xmin is None or self.xmax is None or
@@ -126,11 +132,14 @@ class PINN(nn.Module):
             z_feat = self._periodic_features(z, self.zmin, self.zmax)
             inputs = torch.cat([x_feat, y_feat, z_feat, t], dim=1)
             outputs = self.branch_3d(inputs)
-            rho_hat = outputs[:,0:1]
-            other = outputs[:,1:]
-            rho = rho_o + t * rho_hat
-            outputs_mod = torch.cat([rho, other], dim=1)
-            return outputs_mod
+            if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+                return outputs
+            else:
+                rho_hat = outputs[:,0:1]
+                other = outputs[:,1:]
+                rho = rho_o + t * rho_hat
+                outputs_mod = torch.cat([rho, other], dim=1)
+                return outputs_mod
         
         else:
             raise ValueError(f"Expected len(X) in [2, 3, 4] but got {len(X)}")

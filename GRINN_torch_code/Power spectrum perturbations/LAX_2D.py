@@ -377,3 +377,120 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
                 return rho1,vx1,rho_LT,rho_LT_max,rho_max,vx_LT
             else:
                 return rho1,vx1,rho_max
+
+
+def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None):
+    '''
+    1D LAX solver for sinusoidal initial conditions with optional self-gravity and linear theory outputs.
+    Returns density, velocity, potential (if gravity), and optional linear theory references.
+    '''
+    lam = lam
+    L = lam * num_of_waves
+
+    c_s = 1.0
+    rho0_base = 1.0
+    nu = nu
+    const = 1
+    G = 1.0
+
+    nx = int(N)
+    dx = float(L / nx)
+    dt = nu * dx / c_s
+    mu = dt / (2 * dx)
+    n = int(time / dt)
+
+    x = np.linspace(0, L, nx)
+
+    rho0 = np.zeros(nx)
+    phi0 = np.zeros(nx)
+    v0 = np.zeros(nx)
+    P0 = np.zeros(nx)
+
+    rho1 = np.zeros(nx)
+    phi1 = np.zeros(nx)
+    v1 = np.zeros(nx)
+    P1 = np.zeros(nx)
+
+    if gravity:
+        jeans = np.sqrt(4*np.pi**2*c_s**2/(const*G*rho0_base))
+
+    # Initial conditions
+    rho0 = rho0_base + rho_1 * np.cos(2*np.pi*x/lam)
+
+    if not gravity:
+        v_1 = (c_s * rho_1) / rho0_base
+        v0 = v_1 * np.cos(2*np.pi*x/lam)
+        if comparison:
+            rho_LT = rho0_base + rho_1 * np.cos(2*np.pi * x/lam - 2*np.pi/lam * time)
+            rho_LT_max = np.max(rho_LT)
+            v_LT = v_1 * np.cos(2*np.pi * x/lam - 2*np.pi/lam * time)
+    else:
+        if lam >= jeans:
+            alpha = np.sqrt(const*G*rho0_base - c_s**2 * (2*np.pi/lam)**2)
+            v_1 = (rho_1 / rho0_base) * (alpha / (2*np.pi/lam))
+            v0 = - v_1 * np.sin(2*np.pi*x/lam)
+            if comparison:
+                rho_LT = rho0_base + rho_1*np.exp(alpha * time)*np.cos(2*np.pi*x/lam)
+                rho_LT_max = np.max(rho_LT)
+                v_LT = -v_1*np.exp(alpha * time)*np.sin(2*np.pi*x/lam)
+        else:
+            alpha = np.sqrt(c_s**2*(2*np.pi/lam)**2 - const*G*rho0_base)
+            v_1 = (rho_1 / rho0_base) * (alpha / (2*np.pi/lam))
+            v0 = v_1 * np.cos(2*np.pi*x/lam)
+            if comparison:
+                rho_LT = rho0_base + rho_1*np.cos(alpha * time - 2*np.pi*x/lam)
+                rho_LT_max = np.max(rho_LT)
+                v_LT = v_1*np.cos(alpha * time - 2*np.pi*x/lam)
+
+        # 1D Poisson (periodic) via FFT: phi_k = rho_k / (-k^2), k=0 set to 0
+        k = 2*np.pi*np.fft.fftfreq(nx, d=dx)
+        rhohat = np.fft.fft(const*(rho0 - rho0_base))
+        denom = -(k**2)
+        denom[0] = 1.0
+        phihat = rhohat / denom
+        phihat[0] = 0.0
+        phi0 = np.real(np.fft.ifft(phihat))
+
+    P0 = rho0 * v0
+
+    for _ in range(1, n):
+        rho1 = 0.5*(np.roll(rho0,-1)+ np.roll(rho0,1)) - mu*(np.roll(rho0,-1)*np.roll(v0,-1) - np.roll(rho0,1)*np.roll(v0,1))
+
+        if not gravity:
+            P1 = 0.5*(np.roll(P0,-1)+ np.roll(P0,1)) - mu*(np.roll(P0,-1)*np.roll(v0,-1) - np.roll(P0,1)*np.roll(v0,1)) - (c_s**2)*mu*(np.roll(rho0,-1) - np.roll(rho0,1))
+        else:
+            P1 = 0.5*(np.roll(P0,-1)+ np.roll(P0,1)) - mu*(np.roll(P0,-1)*np.roll(v0,-1) - np.roll(P0,1)*np.roll(v0,1)) - (c_s**2)*mu*(np.roll(rho0,-1) - np.roll(rho0,1)) - mu*rho0*(np.roll(phi0,-1) - np.roll(phi0,1))
+            k = 2*np.pi*np.fft.fftfreq(nx, d=dx)
+            rhohat = np.fft.fft(const*(rho1 - rho0_base))
+            denom = -(k**2)
+            denom[0] = 1.0
+            phihat = rhohat / denom
+            phihat[0] = 0.0
+            phi1 = np.real(np.fft.ifft(phihat))
+
+        v1 = P1 / rho1
+
+        rho0, v0, P0, phi0 = rho1, v1, P1, phi1
+
+        vmax = np.max(np.abs(v1))
+        dt1 = nu*dx/(vmax if vmax != 0 else c_s)
+        dt2 = nu*dx/c_s
+        dt = min(dt1, dt2)
+        mu = dt/(2*dx)
+        n = int(time/dt)
+
+    rho_max = np.max(rho1)
+
+    if isplot:
+        return
+    else:
+        if gravity:
+            if comparison:
+                return x, rho1, v1, phi1, n, rho_LT, rho_LT_max, rho_max, v_LT
+            else:
+                return x, rho1, v1, phi1, n, rho_max
+        else:
+            if comparison:
+                return rho1, v1, rho_LT, rho_LT_max, rho_max, v_LT
+            else:
+                return rho1, v1, rho_max
