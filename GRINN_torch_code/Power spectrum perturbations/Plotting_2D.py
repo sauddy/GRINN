@@ -8,7 +8,7 @@ import scipy
 import os
 from LAX_2D import lax_solution
 from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
-from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D
+from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -29,7 +29,7 @@ def plot_function(net, time_array, initial_params, velocity=False, isplot=False,
         animation: Whether this is for animation
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params  
-    rho_o = 1.0          # zeroth order density
+    # rho_o imported from config.py
     num_of_waves_x = (xmax-xmin)/lam
     num_of_waves_y = (ymax-ymin)/lam
     if animation:
@@ -328,12 +328,12 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
             pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
             ax.set_title(f"{pert_str} Velocity, t={t:.2f}")
         
-        # Save every 10th frame for static snapshots
-        if frame % 10 == 0:
-            save_path_frame = os.path.join(output_dir, f"{which}_t_{t:.2f}.png")
-            plt.savefig(save_path_frame, dpi=300, bbox_inches='tight')
-            if verbose:
-                print(f"Saved frame to {save_path_frame}")
+        # Save every 10th frame for static snapshots (disabled to avoid extra plots)
+        # if frame % 10 == 0:
+        #     save_path_frame = os.path.join(output_dir, f"{which}_t_{t:.2f}.png")
+        #     plt.savefig(save_path_frame, dpi=300, bbox_inches='tight')
+        #     if verbose:
+        #         print(f"Saved frame to {save_path_frame}")
         
         return pc
     
@@ -362,45 +362,61 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         raise
     
     # Optional static snapshots uniformly over [0, tmax]
-    if SAVE_STATIC_SNAPSHOTS:
-        snapshot_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
-        os.makedirs(snapshot_dir, exist_ok=True)
-        # Determine tmax from initial_params
-        _xmin, _xmax, _ymin, _ymax, _rho_1, _alpha, _lam, _output_folder, tmax_val = initial_params
-        times_static = np.linspace(0.0, float(tmax_val), 5)
-        if verbose:
-            print(f"Saving {len(times_static)} static snapshots to {snapshot_dir} over [0, {tmax_val}]...")
-        for t in times_static:
-            t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
-            pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-            pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
-            pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
-            output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
-            rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
-            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
-
-            fig_static, ax_static = plt.subplots(figsize=(8, 8))
-            if which == "density":
-                pc_static = ax_static.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr')
-                cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
-                cbar_static.formatter.set_powerlimits((0, 0))
-                cbar_static.ax.set_title(r"$\rho$", fontsize=14)
-            else:
-                Vmag = np.sqrt(U**2 + V**2)
-                pc_static = ax_static.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis')
-                cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
-                cbar_static.ax.set_title(r" $|v|$", fontsize=14)
-            ax_static.set_xlim(xmin, xmax)
-            ax_static.set_ylim(ymin, ymax)
-            ax_static.set_xlabel("x")
-            ax_static.set_ylabel("y")
-            plt.tight_layout()
-            static_save_path = os.path.join(snapshot_dir, f"{which}_static_t_{t:.2f}.png")
-            plt.savefig(static_save_path, dpi=300, bbox_inches='tight')
-            plt.close(fig_static)
-            if verbose:
-                print(f"Saved static snapshot to {static_save_path}")
+    # Static snapshots disabled to prevent extra plots
+    # if SAVE_STATIC_SNAPSHOTS:
+    #     snapshot_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    #     os.makedirs(snapshot_dir, exist_ok=True)
+    #     # Determine tmax from initial_params
+    #     _xmin, _xmax, _ymin, _ymax, _rho_1, _alpha, _lam, _output_folder, tmax_val = initial_params
+    #     times_static = np.linspace(0.0, float(tmax_val), 5)
+    #     if verbose:
+    #         print(f"Saving {len(times_static)} static snapshots to {snapshot_dir} over [0, {tmax_val}]...")
+    #     for t in times_static:
+    #         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+    #         pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+    #         pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+    #         pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+    #         output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+    #         rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+    #         U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+    #         V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+    #
+    #         fig_static, ax_static = plt.subplots(figsize=(8, 8))
+    #         if which == "density":
+    #             pc_static = ax_static.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr')
+    #             cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+    #             cbar_static.formatter.set_powerlimits((0, 0))
+    #             cbar_static.ax.set_title(r"$\rho$", fontsize=14)
+    #         else:
+    #             Vmag = np.sqrt(U**2 + V**2)
+    #             pc_static = ax_static.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis')
+    #             cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+    #             cbar_static.ax.set_title(r" $|v|$", fontsize=14)
+    #         ax_static.set_xlim(xmin, xmax)
+    #         ax_static.set_ylim(ymin, ymax)
+    #         ax_static.set_xlabel("x")
+    #         ax_static.set_ylabel("y")
+    #         plt.tight_layout()
+    #         static_save_path = os.path.join(snapshot_dir, f"{which}_static_t_{t:.2f}.png")
+    #         plt.savefig(static_save_path, dpi=300, bbox_inches='tight')
+    #         plt.close(fig_static)
+    #         if verbose:
+    #             print(f"Saved static snapshot to {static_save_path}")
+    
+    # Generate 5x3 comparison tables for both density and velocity (only once per animation call)
+    if verbose:
+        print("Generating 5x3 comparison tables...")
+    
+    # Only generate comparison tables if this is the density animation call
+    # This prevents duplicate generation when both density and velocity animations are created
+    if which == "density":
+        print("Generating density comparison table...")
+        # Create comparison table for density - use N_GRID to match PINN's power spectrum resolution
+        create_5x3_comparison_table(net, initial_params, which="density", N=N_GRID, nu=0.5)
+        
+        print("Generating velocity comparison table...")
+        # Create comparison table for velocity - use N_GRID to match PINN's power spectrum resolution
+        create_5x3_comparison_table(net, initial_params, which="velocity", N=N_GRID, nu=0.5)
     
     # Display animation inline if in a notebook
     try:
@@ -466,6 +482,14 @@ def create_2d_surface_plots(net, initial_params, time_points=None, which="densit
         fig.delaxes(axes[-1])
 
     plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"2d_surface_plots_{which}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 2D surface plots ({which}) to {save_path}")
+    
     return fig, axes
 
 
@@ -482,7 +506,7 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         time_array_1d = [0.5, 1.0, 1.5]
     
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
-    rho_o = 1.0
+    # rho_o imported from config.py
     num_of_waves = (xmax - xmin) / lam
     
     print("Creating 1D cross section comparison plots...")
@@ -551,6 +575,14 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         axes[i*3+2].legend()
 
     plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "1d_comparison_plots.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 1D comparison plots to {save_path}")
+    
     plt.show()
 
 
@@ -564,7 +596,7 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
         time_array_growth: Array of time points for growth analysis (default: 10 points from 0.1 to tmax)
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
-    rho_o = 1.0
+    # rho_o imported from config.py
     num_of_waves = (xmax - xmin) / lam
     
     if time_array_growth is None:
@@ -609,6 +641,14 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
     plt.legend(fontsize=12)
     plt.title("Growth Comparison: PINN vs Linear Theory vs Finite Difference")
     plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "growth_comparison_plot.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved growth comparison plot to {save_path}")
+    
     plt.show()
 
 
@@ -810,6 +850,14 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
 
     # Reduce outer margins similar to notebook style
     fig.subplots_adjust(left=0.06, right=0.99, top=0.92, bottom=0.10, wspace=0.18, hspace=0.12)
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "1d_cross_sections_sinusoidal.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 1D cross sections plot to {save_path}")
+    
     plt.show()
 
     return fig
@@ -910,4 +958,189 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
         fig.delaxes(axes[-1])
 
     plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"2d_surface_plots_FD_{which}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 2D FD surface plots ({which}) to {save_path}")
+    
+    return fig, axes
+
+
+def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=0.5,
+                                use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None):
+    """
+    Create 5x3 comparison table showing PINN, FD, and percentage difference at 5 time snapshots
+    
+    Args:
+        net: Trained neural network
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        which: "density" or "velocity"
+        N: Grid resolution for LAX solver
+        nu: Courant number for LAX solver
+        use_velocity_ps: Whether to use velocity power spectrum for FD
+        ps_index: Power spectrum index for FD
+        vel_rms: Velocity RMS for FD
+        random_seed: Random seed for FD
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Generate 5 time points uniformly distributed over [0, tmax]
+    time_points = np.linspace(0.0, float(tmax), 5)
+    
+    print(f"Creating 5x3 comparison table for {which}...")
+    
+    # Create 5x3 subplot grid
+    fig, axes = plt.subplots(5, 3, figsize=(15, 20))
+    
+    # Store data for consistent color limits
+    pinn_data = []
+    fd_data = []
+    
+    # First pass: collect data to determine consistent color limits
+    for i, t in enumerate(time_points):
+        # print(f"Collecting data for t = {t:.2f}")  # Commented out to reduce output noise
+        
+        # Get PINN data - use same resolution as animation for consistency
+        Q = 100  # Same resolution as animation
+        xs = np.linspace(xmin, xmax, Q)
+        ys = np.linspace(ymin, ymax, Q)
+        tau, phi = np.meshgrid(xs, ys) 
+        Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
+        t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+        
+        pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+        
+        output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+        
+        if which == "density":
+            pinn_field = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+        else:  # velocity magnitude
+            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+            pinn_field = np.sqrt(U**2 + V**2)
+        
+        # Debug output (commented out to reduce noise)
+        # print(f"  PINN {which} range: [{np.min(pinn_field):.6f}, {np.max(pinn_field):.6f}], std: {np.std(pinn_field):.6f}")
+        
+        # Get FD data - use same parameters as PINN for power spectrum
+        num_of_waves = (xmax - xmin) / lam
+        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+            # For power spectrum, use the same parameters as PINN
+            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
+            )
+            # Debug: Check FD density range (commented out to reduce output noise)
+            # print(f"  FD {which} range: [{np.min(rho_fd):.6f}, {np.max(rho_fd):.6f}], std: {np.std(rho_fd):.6f}")
+        else:
+            # For sinusoidal, use original parameters
+            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+            )
+        
+        # Build y-array consistent with solver setup
+        Lx = lam * num_of_waves
+        Nx = x_fd.shape[0]
+        Ny = rho_fd.shape[1]
+        y_fd = np.linspace(0.0, Lx, Ny)
+        
+        # Create meshgrid for FD data
+        X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+        
+        if which == "density":
+            fd_field = rho_fd
+        else:  # velocity magnitude
+            fd_field = np.sqrt(vx_fd**2 + vy_fd**2)
+        
+        # Interpolate FD data to PINN grid for comparison using cubic interpolation for smoother results
+        from scipy.interpolate import griddata
+        points_fd = np.column_stack([X_fd.ravel(), Y_fd.ravel()])
+        points_pinn = np.column_stack([tau.ravel(), phi.ravel()])
+        # Use cubic interpolation for smoother results, fallback to linear if needed
+        try:
+            fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
+        except:
+            fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='linear', fill_value=0.0)
+        fd_field_interp = fd_field_interp.reshape(Q, Q)
+        
+        # Debug output (commented out to reduce noise)
+        # print(f"  FD {which} range: [{np.min(fd_field_interp):.6f}, {np.max(fd_field_interp):.6f}], std: {np.std(fd_field_interp):.6f}")
+        
+        pinn_data.append(pinn_field)
+        fd_data.append(fd_field_interp)
+    
+    # Use individual color limits for each plot (like animation) to show dynamic range
+    # This allows collapse features to be visible, rather than using global limits
+    
+    # Second pass: create plots
+    for i, t in enumerate(time_points):
+        pinn_field = pinn_data[i]
+        fd_field = fd_data[i]
+        
+        # Calculate percentage difference
+        eps = 1e-12
+        pct_diff = 200.0 * np.abs(pinn_field - fd_field) / (pinn_field + fd_field + eps)
+        
+        # Column 1: PINN - use individual color limits like animation
+        ax_pinn = axes[i, 0]
+        if which == "density":
+            pc_pinn = ax_pinn.pcolormesh(tau, phi, pinn_field, shading='auto', cmap='YlOrBr', 
+                                       vmin=np.min(pinn_field), vmax=np.max(pinn_field))
+        else:
+            pc_pinn = ax_pinn.pcolormesh(tau, phi, pinn_field, shading='auto', cmap='viridis', 
+                                       vmin=np.min(pinn_field), vmax=np.max(pinn_field))
+        ax_pinn.set_title(f"PINN {which.title()}, t={t:.2f}")
+        ax_pinn.set_xlim(xmin, xmax)
+        ax_pinn.set_ylim(ymin, ymax)
+        cbar_pinn = plt.colorbar(pc_pinn, ax=ax_pinn, shrink=0.6)
+        cbar_pinn.ax.set_title(r"$\rho$" if which == "density" else r"$|v|$", fontsize=14)
+        
+        # Column 2: FD - use individual color limits
+        ax_fd = axes[i, 1]
+        if which == "density":
+            pc_fd = ax_fd.pcolormesh(tau, phi, fd_field, shading='auto', cmap='YlOrBr', 
+                                    vmin=np.min(fd_field), vmax=np.max(fd_field))
+        else:
+            pc_fd = ax_fd.pcolormesh(tau, phi, fd_field, shading='auto', cmap='viridis', 
+                                    vmin=np.min(fd_field), vmax=np.max(fd_field))
+        ax_fd.set_title(f"FD {which.title()}, t={t:.2f}")
+        ax_fd.set_xlim(xmin, xmax)
+        ax_fd.set_ylim(ymin, ymax)
+        cbar_fd = plt.colorbar(pc_fd, ax=ax_fd, shrink=0.6)
+        cbar_fd.ax.set_title(r"$\rho$" if which == "density" else r"$|v|$", fontsize=14)
+        
+        # Column 3: Percentage Difference
+        ax_diff = axes[i, 2]
+        pc_diff = ax_diff.pcolormesh(tau, phi, pct_diff, shading='auto', cmap='coolwarm')
+        ax_diff.set_title(f"Difference (%), t={t:.2f}")
+        ax_diff.set_xlim(xmin, xmax)
+        ax_diff.set_ylim(ymin, ymax)
+        cbar_diff = plt.colorbar(pc_diff, ax=ax_diff, shrink=0.6)
+        cbar_diff.ax.set_title("%", fontsize=14)
+        
+        # Add x-axis labels only on bottom row
+        if i == 4:
+            ax_pinn.set_xlabel("x")
+            ax_fd.set_xlabel("x")
+            ax_diff.set_xlabel("x")
+        
+        # Add y-axis labels only on leftmost column
+        ax_pinn.set_ylabel("y")
+    
+    plt.tight_layout()
+    
+    # Save the figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"{which}_comparison_5x3.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 5x3 comparison table to {save_path}")
+    
+    plt.show()
     return fig, axes

@@ -14,13 +14,17 @@ import scipy
 from numpy.fft import fft, ifft,fft2, ifft2
 from scipy import signal
 
-# Import wave vector components for 2D sinusoidal perturbations
+# Import wave vector components and physical constants for 2D sinusoidal perturbations
 try:
-    from config import KX, KY
+    from config import KX, KY, cs, rho_o, const, G
 except ImportError:
     # Fallback if config not available
     KX = 2*np.pi/5.0  # Default wavelength
     KY = 0.0
+    cs = 1.0
+    rho_o = 1.0
+    const = 4*np.pi
+    G = 1.0/(4*np.pi)
 
 np.random.seed(1234)
 #tf.random.set_seed(1234)
@@ -132,15 +136,15 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     num_of_waves  = num_of_waves  
     Lx = lam * num_of_waves            # Maximum length (two wavelength)
     Ly = lam * num_of_waves 
-    print("at time= ",time)
+    # print("at time= ",time)  # Commented out to reduce output noise
     ### Declaring the Constants
 
-    c_s = 1.0            # % Sound Speed  
-    rho_o = 1.0          # zeroth order density
+    c_s = cs             # Sound Speed (from config)
+    rho_o = rho_o        # zeroth order density (from config)
     nu = nu              # courant number (\nu = 2 in 2d)
     rho_1 = rho_1        # for linear/nonlinear wave propagation
-    const =  1           # The actual value is 4*pi
-    G = 1.0              # Gravitational Constant
+    const = const        # 4π for Poisson equation ∇²φ = 4πGρ (from config)
+    G = G                # Gravitational Constant (from config)
 
     ### Grid X-T 
     Nx = N                # The grid resolution values2d:N =(10,50,100,500)
@@ -155,7 +159,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     mux = dt/(2*dx)      # is the coefficient in the central differencing Eqs above 
     muy = dt/(2*dy)      # is the coefficient in the central differencing Eqs above
     n = int(time/dt)     # grid points in time
-    print("For dx = {} and dt = {} and time gridpoints n = {} ".format(dx,dt,n))
+    # print("For dx = {} and dt = {} and time gridpoints n = {} ".format(dx,dt,n))  # Commented out to reduce output noise
     
     ########### Initializing the ARRAY #######################
     x = np.linspace(0, Lx, Nx)
@@ -176,12 +180,12 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     ## gravitational potential
     phi0 = np.zeros((Nx,Ny))
     phi1 = np.zeros((Nx,Ny))
-    print("shape of Phi",phi1.shape)
+    # print("shape of Phi",phi1.shape)  # Commented out to reduce output noise
         
    ## Calculating the jeans length is gravity is Turned on
     if gravity:
         jeans = np.sqrt(4*np.pi**2*c_s**2/(const*G*rho_o))
-        print("Jean's Length",jeans)
+        # print("Jean's Length",jeans)  # Commented out to reduce output noise
 
     ######################## Initial Conditions ###########################
     
@@ -192,6 +196,13 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     else:
         # Use 2D wave pattern: cos(KX*x + KY*y) instead of cos(2π*x/λ)
         rho0 = rho_o + rho_1 * np.cos(KX * xx + KY * yy)
+    
+    # Copy initial conditions to rho1 for t=0 case
+    rho1 = rho0.copy()
+    
+    # Copy initial velocity conditions to vx1, vy1 for t=0 case
+    vx1 = vx0.copy()
+    vy1 = vy0.copy()
 
     if gravity == False and not use_velocity_ps:
         print("Propagation of Sound wave") 
@@ -258,7 +269,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
         # Calculating the potential and the field using FFT    
 #         phi[0,:,:],dphidx,dphidy = fft_solver(const*(rho[0,:,:]-rho_o),Lx,Nx,Ly,Ny,dim = 2)
         phi0 = fft_solver(const*(rho0-rho_o),Lx,Nx,Ly,Ny,dim = 2)
-        print("shape of Phi",phi0.shape)
+        # print("shape of Phi",phi0.shape)  # Commented out to reduce output noise
 #         fft_solver(rho,Lx,nx,Ly,ny,dim = 2)
 
     
@@ -417,11 +428,11 @@ def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isp
     lam = lam
     L = lam * num_of_waves
 
-    c_s = 1.0
-    rho0_base = 1.0
+    c_s = cs             # Sound Speed (from config)
+    rho0_base = rho_o    # Background density (from config)
     nu = nu
-    const = 1
-    G = 1.0
+    const = const        # 4π for Poisson equation ∇²φ = 4πGρ (from config)
+    G = G                # Gravitational Constant (from config)
 
     nx = int(N)
     dx = float(L / nx)
