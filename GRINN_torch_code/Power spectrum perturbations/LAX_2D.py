@@ -140,11 +140,8 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     ### Declaring the Constants
 
     c_s = cs             # Sound Speed (from config)
-    rho_o = rho_o        # zeroth order density (from config)
-    nu = nu              # courant number (\nu = 2 in 2d)
+    # rho_o, nu, const, G are already imported from config, no need to reassign
     rho_1 = rho_1        # for linear/nonlinear wave propagation
-    const = const        # 4π for Poisson equation ∇²φ = 4πGρ (from config)
-    G = G                # Gravitational Constant (from config)
 
     ### Grid X-T 
     Nx = N                # The grid resolution values2d:N =(10,50,100,500)
@@ -430,9 +427,7 @@ def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isp
 
     c_s = cs             # Sound Speed (from config)
     rho0_base = rho_o    # Background density (from config)
-    nu = nu
-    const = const        # 4π for Poisson equation ∇²φ = 4πGρ (from config)
-    G = G                # Gravitational Constant (from config)
+    # nu, const, G are already imported from config, no need to reassign
 
     nx = int(N)
     dx = float(L / nx)

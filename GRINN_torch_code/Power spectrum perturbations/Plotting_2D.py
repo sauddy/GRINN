@@ -1058,19 +1058,30 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         else:  # velocity magnitude
             fd_field = np.sqrt(vx_fd**2 + vy_fd**2)
         
-        # Interpolate FD data to PINN grid for comparison using cubic interpolation for smoother results
+        # Interpolate FD data to PINN grid for comparison using robust interpolation
         from scipy.interpolate import griddata
         points_fd = np.column_stack([X_fd.ravel(), Y_fd.ravel()])
         points_pinn = np.column_stack([tau.ravel(), phi.ravel()])
-        # Use cubic interpolation for smoother results, fallback to linear if needed
-        try:
-            fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
-        except:
-            fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='linear', fill_value=0.0)
-        fd_field_interp = fd_field_interp.reshape(Q, Q)
         
-        # Debug output (commented out to reduce noise)
-        # print(f"  FD {which} range: [{np.min(fd_field_interp):.6f}, {np.max(fd_field_interp):.6f}], std: {np.std(fd_field_interp):.6f}")
+        # Use robust interpolation with proper fallback for Kaggle compatibility
+        try:
+            # Try cubic interpolation first
+            fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
+            # Check for NaN values that might indicate interpolation failure
+            if np.any(np.isnan(fd_field_interp)):
+                raise ValueError("Cubic interpolation produced NaN values")
+        except:
+            try:
+                # Fallback to linear interpolation with extrapolation
+                fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='linear', fill_value='extrapolate')
+                # Check for NaN values
+                if np.any(np.isnan(fd_field_interp)):
+                    raise ValueError("Linear interpolation produced NaN values")
+            except:
+                # Final fallback: use nearest neighbor interpolation
+                fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='nearest', fill_value=np.mean(fd_field))
+        
+        fd_field_interp = fd_field_interp.reshape(Q, Q)
         
         pinn_data.append(pinn_field)
         fd_data.append(fd_field_interp)
