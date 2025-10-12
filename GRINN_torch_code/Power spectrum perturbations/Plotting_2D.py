@@ -6,7 +6,7 @@ from torch.autograd import Variable
 import torch
 import scipy
 import os
-from LAX_2D import lax_solution, lax_solution_with_shared_velocity
+from LAX_2D import lax_solution
 from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
 
@@ -135,7 +135,7 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
     
-    Q = 200  # Use consistent resolution for fair comparison
+    Q = 100
     xs = np.linspace(xmin, xmax, Q)
     ys = np.linspace(ymin, ymax, Q)
     tau, phi = np.meshgrid(xs, ys) 
@@ -1003,8 +1003,8 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
     for i, t in enumerate(time_points):
         # print(f"Collecting data for t = {t:.2f}")  # Commented out to reduce output noise
         
-        # Get PINN data - use same resolution as FD for fair comparison
-        Q = N  # Use same resolution as FD
+        # Get PINN data - use same resolution as animation for consistency
+        Q = 100  # Same resolution as animation
         xs = np.linspace(xmin, xmax, Q)
         ys = np.linspace(ymin, ymax, Q)
         tau, phi = np.meshgrid(xs, ys) 
@@ -1030,37 +1030,11 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         # Get FD data - use same parameters as PINN for power spectrum
         num_of_waves = (xmax - xmin) / lam
         if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-            # For power spectrum, use the shared velocity field for consistent ICs
-            # Reuse the same velocity field that was used during training
-            from solver import _shared_vx_interp, _shared_vy_interp
-            
-            # Check if shared velocity field is available
-            if _shared_vx_interp is None or _shared_vy_interp is None:
-                print("Warning: Shared velocity field not initialized. Using regular FD solver.")
-                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                    t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
-                )
-            else:
-                # Generate velocity field using the same interpolator as PINN
-                domain_size = lam * num_of_waves
-                x_coords = np.linspace(0, domain_size, N)
-                y_coords = np.linspace(0, domain_size, N)
-                xx_fd, yy_fd = np.meshgrid(x_coords, y_coords, indexing='ij')
-                
-                # Interpolate to FD grid points
-                fd_coords = np.column_stack([xx_fd.flatten(), yy_fd.flatten()])
-                vx_fd_flat = _shared_vx_interp(fd_coords)
-                vy_fd_flat = _shared_vy_interp(fd_coords)
-                
-                # Reshape to FD grid
-                vx_np = vx_fd_flat.reshape(N, N)
-                vy_np = vy_fd_flat.reshape(N, N)
-                
-                # Use LAX solver with shared velocity field
-                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
-                    t, N, nu, lam, num_of_waves, rho_1, vx_np, vy_np, gravity=True, isplot=False, comparison=False, animation=True
-                )
+            # For power spectrum, use the same parameters as PINN
+            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
+            )
             # Debug: Check FD density range (commented out to reduce output noise)
             # print(f"  FD {which} range: [{np.min(rho_fd):.6f}, {np.max(rho_fd):.6f}], std: {np.std(rho_fd):.6f}")
         else:

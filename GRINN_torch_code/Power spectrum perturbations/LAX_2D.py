@@ -61,40 +61,6 @@ def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amp
     vy0 = synthesize_component()
     return vx0, vy0
 
-def generate_shared_velocity_field(nx, ny, Lx, Ly, power_index=-4.0, amplitude=0.01, random_seed=1234):
-    """
-    Generate shared velocity field for both PINN and FD to ensure identical initial conditions.
-    This function creates the velocity field once and returns both numpy arrays (for FD) 
-    and interpolation functions (for PINN).
-    """
-    # Generate the velocity field using the FD method
-    vx_np, vy_np = generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index, amplitude, random_seed)
-    
-    # Create interpolation functions for PINN
-    from scipy.interpolate import RegularGridInterpolator
-    
-    x_coords = np.linspace(0, Lx, nx)
-    y_coords = np.linspace(0, Ly, ny)
-    
-    vx_interp = RegularGridInterpolator((x_coords, y_coords), vx_np, method='linear', bounds_error=False, fill_value=0.0)
-    vy_interp = RegularGridInterpolator((x_coords, y_coords), vy_np, method='linear', bounds_error=False, fill_value=0.0)
-    
-    return vx_np, vy_np, vx_interp, vy_interp
-
-def lax_solution_with_shared_velocity(time, N, nu, lam, num_of_waves, rho_1, vx0_shared, vy0_shared, gravity=False, isplot=None, comparison=None, animation=None):
-    """
-    Modified LAX solver that uses pre-generated shared velocity fields for consistent initial conditions.
-    This ensures PINN and FD use identical velocity fields at t=0.
-    """
-    # Call the original lax_solution with shared velocity fields
-    x, rho, vx, vy, phi, n, rho_max = lax_solution(
-        time, N, nu, lam, num_of_waves, rho_1, gravity=gravity, isplot=isplot, 
-        comparison=comparison, animation=animation, use_velocity_ps=True,
-        vx0_shared=vx0_shared, vy0_shared=vy0_shared
-    )
-    
-    return x, rho, vx, vy, phi, n, rho_max
-
 def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
     
     '''
@@ -142,7 +108,7 @@ def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
     return phi
 
 def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None,
-                 use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None, vx0_shared=None, vy0_shared=None):
+                 use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None):
     '''
     This function solves the hydrodynamic Eqns in 1D with/without self gravity using LAX methods 
     described above 
@@ -223,13 +189,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     if use_velocity_ps:
         # Uniform density; initialize velocities from power spectrum
         rho0 = rho_o * np.ones((Nx, Ny))
-        if vx0_shared is not None and vy0_shared is not None:
-            # Use shared velocity fields for consistent ICs
-            vx0 = vx0_shared
-            vy0 = vy0_shared
-        else:
-            # Generate new velocity fields
-            vx0, vy0 = generate_velocity_field_power_spectrum(Nx, Ny, Lx, Ly, power_index=ps_index, amplitude=vel_rms, random_seed=random_seed)
+        vx0, vy0 = generate_velocity_field_power_spectrum(Nx, Ny, Lx, Ly, power_index=ps_index, amplitude=vel_rms, random_seed=random_seed)
     else:
         # Use 2D wave pattern: cos(KX*x + KY*y) instead of cos(2π*x/λ)
         rho0 = rho_o + rho_1 * np.cos(KX * xx + KY * yy)
