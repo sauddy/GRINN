@@ -6,7 +6,6 @@ from torch.autograd import Variable
 from losses import ASTPN, pde_residue
 from data_generator import diff
 from model_architecture import PINN
-from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES
 
 def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     lam = float(lam)  # Wavelength
@@ -39,59 +38,68 @@ def req_consts_calc(lam, rho_1):
 
     return jeans, alpha
 
+# Global variable to store shared velocity field interpolators
+_shared_vx_interp = None
+_shared_vy_interp = None
+
+def initialize_shared_velocity_field(lam, v_1, domain_size=None):
+    """Initialize shared velocity field for consistent PINN and FD initial conditions"""
+    global _shared_vx_interp, _shared_vy_interp
+    
+    if domain_size is None:
+        domain_size = lam * 2  # Default domain size
+    
+    # Import here to avoid circular imports
+    from LAX_2D import generate_shared_velocity_field
+    
+    # Generate shared velocity field with same parameters as PINN power spectrum
+    # Use N_GRID for power spectrum generation (not FD_N_2D which is for sinusoidal)
+    vx_np, vy_np, vx_interp, vy_interp = generate_shared_velocity_field(
+        nx=N_GRID, ny=N_GRID, Lx=domain_size, Ly=domain_size,
+        power_index=POWER_EXPONENT, amplitude=v_1, random_seed=1234
+    )
+    
+    _shared_vx_interp = vx_interp
+    _shared_vy_interp = vy_interp
+    
+    return vx_np, vy_np
+
 def generate_power_spectrum_field(lam, v_1, x, seed=1234):
-    '''Generate 2D Gaussian random field with power spectrum'''
+    '''Generate 2D velocity field using shared interpolator for consistent ICs'''
     
-    Lx = lam * 2  # Domain size
-    dx = Lx / N_GRID
+    global _shared_vx_interp, _shared_vy_interp
     
-    # Create coordinate grids
-    x_coords = torch.linspace(0, Lx, N_GRID, device=x[0].device)
-    y_coords = torch.linspace(0, Lx, N_GRID, device=x[0].device)
+    # Initialize shared field if not done yet
+    if _shared_vx_interp is None or _shared_vy_interp is None:
+        initialize_shared_velocity_field(lam, v_1)
     
-    # Calculate wave numbers
-    kx = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
-    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
-    KX, KY = torch.meshgrid(kx, ky, indexing='ij')
+    # Convert torch tensors to numpy for interpolation
+    x_np = x[0].detach().cpu().numpy()
+    y_np = x[1].detach().cpu().numpy()
     
-    # Calculate magnitude of wave number
-    K = torch.sqrt(KX**2 + KY**2)
+    # Create coordinate pairs for interpolation
+    coords = np.column_stack([x_np.flatten(), y_np.flatten()])
     
-    # Power spectrum: P(k) ~ k^expon * exp((-k*Rf)^2)
-    K_safe = torch.where(K == 0, torch.tensor(1e-10, device=x[0].device), K)
-    power_spectrum = K_safe**POWER_EXPONENT * torch.exp(-(K_safe * FILTER_SCALE)**2)
+    # Interpolate velocity field
+    vx_values = _shared_vx_interp(coords)
+    vy_values = _shared_vy_interp(coords)
     
-    # Remove DC (uniform) mode to avoid bulk drift
-    power_spectrum[K == 0] = 0.0
+    # Convert back to torch tensors with correct shape and device
+    vx_tensor = torch.tensor(vx_values, device=x[0].device, dtype=x[0].dtype)
+    vy_tensor = torch.tensor(vy_values, device=x[0].device, dtype=x[0].dtype)
     
-    # Safety check: limit extreme values
-    power_spectrum = torch.clamp(power_spectrum, 0, 1e6)
-    
-    # Generate random phases
-    torch.manual_seed(seed)
-    random_phases = torch.randn(N_GRID, N_GRID, device=x[0].device) + 1j * torch.randn(N_GRID, N_GRID, device=x[0].device)
-    
-    # Create complex field in Fourier space and transform to real space
-    field_fourier = torch.sqrt(power_spectrum) * random_phases
-    field_real = torch.real(torch.fft.ifft2(field_fourier))
-    
-    # Remove any residual mean (bulk flow) and normalize rms to v_1
-    field_real = field_real - torch.mean(field_real)
-    field_real = field_real / torch.std(field_real) * v_1
-    
-    # Interpolate to the actual collocation points
-    x_norm = torch.clamp((x[0] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
-    y_norm = torch.clamp((x[1] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
-    
-    x_idx = torch.round(x_norm).long()
-    y_idx = torch.round(y_norm).long()
+    # Reshape to match input shape
+    if x[0].dim() > 1:
+        vx_tensor = vx_tensor.reshape(x[0].shape)
+        vy_tensor = vy_tensor.reshape(x[0].shape)
     
     # Ensure correct tensor shape [N, 1]
-    result = field_real[x_idx, y_idx]
-    if result.dim() == 1:
-        return result.unsqueeze(-1)
-    else:
-        return result
+    if vx_tensor.dim() == 1:
+        vx_tensor = vx_tensor.unsqueeze(-1)
+    if vy_tensor.dim() == 1:
+        vy_tensor = vy_tensor.unsqueeze(-1)
+    
+    return vx_tensor
 
 def _sinusoidal_component(coord, lam, jeans, v_1, k_component=None):
     # coord: tensor [N,1] or [N]
@@ -173,6 +181,38 @@ def fun_vx_0(lam, jeans, v_1, x):
     else:
         return generate_power_spectrum_field(lam, v_1, x, seed=1234)
 
+def generate_vy_power_spectrum_field(lam, v_1, x, seed=1234):
+    '''Generate 2D y-velocity field using shared interpolator for consistent ICs'''
+    
+    global _shared_vx_interp, _shared_vy_interp
+    
+    # Initialize shared field if not done yet
+    if _shared_vx_interp is None or _shared_vy_interp is None:
+        initialize_shared_velocity_field(lam, v_1)
+    
+    # Convert torch tensors to numpy for interpolation
+    x_np = x[0].detach().cpu().numpy()
+    y_np = x[1].detach().cpu().numpy()
+    
+    # Create coordinate pairs for interpolation
+    coords = np.column_stack([x_np.flatten(), y_np.flatten()])
+    
+    # Interpolate velocity field
+    vy_values = _shared_vy_interp(coords)
+    
+    # Convert back to torch tensors with correct shape and device
+    vy_tensor = torch.tensor(vy_values, device=x[0].device, dtype=x[0].dtype)
+    
+    # Reshape to match input shape
+    if x[0].dim() > 1:
+        vy_tensor = vy_tensor.reshape(x[0].shape)
+    
+    # Ensure correct tensor shape [N, 1]
+    if vy_tensor.dim() == 1:
+        vy_tensor = vy_tensor.unsqueeze(-1)
+    
+    return vy_tensor
+
 def fun_vy_0(lam, jeans, v_1, x):
     '''initial condition for y-velocity -- branch by PERTURBATION_TYPE'''
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
@@ -184,7 +224,7 @@ def fun_vy_0(lam, jeans, v_1, x):
             # fallback to x if y is unavailable (1D)
             return _sinusoidal_component(x[0], lam, jeans, v_1)
     else:
-        return generate_power_spectrum_field(lam, v_1, x, seed=5678)
+        return generate_vy_power_spectrum_field(lam, v_1, x, seed=1234)
 
 def func(x):
     return x[0]*0
@@ -227,14 +267,10 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     else:
         mse_rho_ic = 0.0 * torch.mean(rho_ic_out*0)
 
-    mse_vx_ic  =  mse_cost_function(vx_ic_out, vx_0)
 
     if model.dimension == 2:
-        mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
 
     elif model.dimension == 3:
-        mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
-        mse_vz_ic  =  mse_cost_function(vz_ic_out, vz_0)
 
     ############## Continuity at t=0 to seed early-time evolution ###############
     # Enforce rho_t(0) = -rho0 * div v0 at IC points
@@ -455,12 +491,9 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         else:
             mse_rho_ic = 0.0 * torch.mean(rho_ic_out*0)
 
-        mse_vx_ic  = mse_cost_function(vx_ic_out, vx_0)
         if model.dimension == 2:
-            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
+            mse_vy_ic = VELOCITY_IC_WEIGHT * mse_cost_function(vy_ic_out, vy_0)
         elif model.dimension == 3:
-            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
-            mse_vz_ic = mse_cost_function(vz_ic_out, vz_0)
 
         # Continuity seeding at t=0 on IC points
         x_ic = batch_ic[0]

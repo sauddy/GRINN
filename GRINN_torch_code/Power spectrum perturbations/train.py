@@ -20,7 +20,7 @@ if device.startswith('cuda'):
 else:
     pass
 
-lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(wave, a, 2, TMAX_CFG, 10000, 10000, 100000)
+lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(wave, a, 2, TMAX_CFG, 50000, 10000, 100000)
 
 jeans, alpha = req_consts_calc(lam, rho_1)
 # Set initial velocity amplitude per perturbation type
@@ -29,6 +29,13 @@ if str(PERTURBATION_TYPE).lower() == "sinusoidal":
     v_1 = (rho_1 / (rho_o if rho_o != 0 else 1.0)) * (alpha / k)
 else:
     v_1 = a * cs
+
+# Initialize shared velocity field for consistent PINN and FD initial conditions
+from solver import initialize_shared_velocity_field
+domain_size = lam * num_of_waves
+vx_np, vy_np = initialize_shared_velocity_field(lam, v_1, domain_size)
+print(f"Initialized shared velocity field with domain size {domain_size}")
+print(f"Velocity field stats: vx range [{np.min(vx_np):.6f}, {np.max(vx_np):.6f}], vy range [{np.min(vy_np):.6f}, {np.max(vy_np):.6f}]")
 
 xmax = xmin + lam * num_of_waves
 ymax = ymin + lam * num_of_waves
