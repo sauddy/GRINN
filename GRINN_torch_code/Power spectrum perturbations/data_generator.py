@@ -81,6 +81,10 @@ class col_gen(object):
                 return coor
 
             if option == "BC":
+                # Skip BC generation if N_b is 0 (hard constraints used instead)
+                if self.N_b == 0:
+                    return [], []
+                    
                 coor_l = []
                 coor_r = []
                 x_bc_l = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).fill_(self.rmin[coordinate-1]).requires_grad_()
@@ -121,6 +125,10 @@ class col_gen(object):
                 return coor
             
             if option == "BC":
+                # Skip BC generation if N_b is 0 (hard constraints used instead)
+                if self.N_b == 0:
+                    return [], []
+                    
                 # BC evaluated for t >= STARTUP_DT
                 t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(max(self.rmin[self.dimension], STARTUP_DT), self.rmax[self.dimension])
                 t_bc.requires_grad_()
@@ -191,7 +199,11 @@ class col_gen(object):
                 return coor
              
 
-            if option == "BC":                
+            if option == "BC":
+                # Skip BC generation if N_b is 0 (hard constraints used instead)
+                if self.N_b == 0:
+                    return [], []
+                    
                 t_bc   = torch.empty(self.N_b,1, device='cuda', dtype=torch.float32).uniform_(max(self.rmin[self.dimension], STARTUP_DT), self.rmax[self.dimension])
                 t_bc.requires_grad_()
         

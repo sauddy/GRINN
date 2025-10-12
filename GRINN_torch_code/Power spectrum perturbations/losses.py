@@ -11,7 +11,7 @@ from config import cs, const, G, rho_o
 class ASTPN(col_gen):
     
     def __init__(self, rmin=[0,0,0,0], rmax=[1,1,1,1], N_0 = 1000, N_b=1000, N_r=3000, dimension=1):
-        super().__init__(rmin,rmax, N_0,N_b,N_r, dimension)
+        super().__init__(rmin,rmax, N_0,0,N_r, dimension)  # N_b set to 0 due to hard constraints
         
        
         self.coord_Lx, self.coord_Rx = self.geo_time_coord(option="BC",coordinate=1)

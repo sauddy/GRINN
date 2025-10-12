@@ -6,9 +6,19 @@ from torch.autograd import Variable
 import torch
 import scipy
 import os
-from LAX_2D import lax_solution
+from LAX_2D import lax_solution, lax_solution_with_shared_velocity
 from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
+
+# Global variable to store shared velocity fields for plotting
+_shared_vx_np = None
+_shared_vy_np = None
+
+def set_shared_velocity_fields(vx_np, vy_np):
+    """Set shared velocity fields for consistent FD plotting"""
+    global _shared_vx_np, _shared_vy_np
+    _shared_vx_np = vx_np
+    _shared_vy_np = vy_np
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -972,7 +982,7 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
 def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=0.5,
                                 use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None):
     """
-    Create 5x3 comparison table showing PINN, FD, and percentage difference at 5 time snapshots
+    Create 5x3 comparison table showing PINN, FD, and epsilon metric at 5 time snapshots
     
     Args:
         net: Trained neural network
@@ -998,6 +1008,8 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
     # Store data for consistent color limits
     pinn_data = []
     fd_data = []
+    pinn_velocity_data = []  # Store velocity components separately
+    fd_velocity_data = []    # Store velocity components separately
     
     # First pass: collect data to determine consistent color limits
     for i, t in enumerate(time_points):
@@ -1019,10 +1031,17 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         
         if which == "density":
             pinn_field = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+            # Extract velocity components for density plots too
+            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+            pinn_vx = U
+            pinn_vy = V
         else:  # velocity magnitude
             U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
             V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
             pinn_field = np.sqrt(U**2 + V**2)
+            pinn_vx = U
+            pinn_vy = V
         
         # Debug output (commented out to reduce noise)
         # print(f"  PINN {which} range: [{np.min(pinn_field):.6f}, {np.max(pinn_field):.6f}], std: {np.std(pinn_field):.6f}")
@@ -1030,11 +1049,18 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         # Get FD data - use same parameters as PINN for power spectrum
         num_of_waves = (xmax - xmin) / lam
         if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-            # For power spectrum, use the same parameters as PINN
-            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
-            )
+            # For power spectrum, use shared velocity fields if available
+            if _shared_vx_np is not None and _shared_vy_np is not None:
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
+                    t, N, nu, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                    gravity=True, isplot=False, comparison=False, animation=True
+                )
+            else:
+                # Fallback to original method
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                    t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
+                )
             # Debug: Check FD density range (commented out to reduce output noise)
             # print(f"  FD {which} range: [{np.min(rho_fd):.6f}, {np.max(rho_fd):.6f}], std: {np.std(rho_fd):.6f}")
         else:
@@ -1083,8 +1109,31 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         
         fd_field_interp = fd_field_interp.reshape(Q, Q)
         
+        # Interpolate FD velocity components for vector plots (both density and velocity plots)
+        try:
+            fd_vx_interp = griddata(points_fd, vx_fd.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
+            fd_vy_interp = griddata(points_fd, vy_fd.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
+            if np.any(np.isnan(fd_vx_interp)) or np.any(np.isnan(fd_vy_interp)):
+                raise ValueError("Cubic interpolation produced NaN values")
+        except:
+            try:
+                fd_vx_interp = griddata(points_fd, vx_fd.ravel(), points_pinn, method='linear', fill_value='extrapolate')
+                fd_vy_interp = griddata(points_fd, vy_fd.ravel(), points_pinn, method='linear', fill_value='extrapolate')
+                if np.any(np.isnan(fd_vx_interp)) or np.any(np.isnan(fd_vy_interp)):
+                    raise ValueError("Linear interpolation produced NaN values")
+            except:
+                fd_vx_interp = griddata(points_fd, vx_fd.ravel(), points_pinn, method='nearest', fill_value=np.mean(vx_fd))
+                fd_vy_interp = griddata(points_fd, vy_fd.ravel(), points_pinn, method='nearest', fill_value=np.mean(vy_fd))
+        
+        fd_vx_interp = fd_vx_interp.reshape(Q, Q)
+        fd_vy_interp = fd_vy_interp.reshape(Q, Q)
+        
         pinn_data.append(pinn_field)
         fd_data.append(fd_field_interp)
+        
+        # Store velocity components for vector plots (both density and velocity plots)
+        pinn_velocity_data.append((pinn_vx, pinn_vy))
+        fd_velocity_data.append((fd_vx_interp, fd_vy_interp))
     
     # Use individual color limits for each plot (like animation) to show dynamic range
     # This allows collapse features to be visible, rather than using global limits
@@ -1094,9 +1143,13 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         pinn_field = pinn_data[i]
         fd_field = fd_data[i]
         
-        # Calculate percentage difference
+        # Extract velocity components for vector plots
+        pinn_vx, pinn_vy = pinn_velocity_data[i]
+        fd_vx, fd_vy = fd_velocity_data[i]
+        
+        # Calculate epsilon metric: ε = 2 * |PINN - FD| / (PINN + FD) * 100
         eps = 1e-12
-        pct_diff = 200.0 * np.abs(pinn_field - fd_field) / (pinn_field + fd_field + eps)
+        epsilon_metric = 200.0 * np.abs(pinn_field - fd_field) / (pinn_field + fd_field + eps)
         
         # Column 1: PINN - use individual color limits like animation
         ax_pinn = axes[i, 0]
@@ -1106,6 +1159,16 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         else:
             pc_pinn = ax_pinn.pcolormesh(tau, phi, pinn_field, shading='auto', cmap='viridis', 
                                        vmin=np.min(pinn_field), vmax=np.max(pinn_field))
+        
+        # Add velocity vectors for both density and velocity plots
+        if pinn_vx is not None and pinn_vy is not None:
+            # Subsample vectors for clarity (similar to analyze_lax.py)
+            skip_x = max(1, Q // 20)
+            skip_y = max(1, Q // 20)
+            skip = (slice(None, None, skip_x), slice(None, None, skip_y))
+            ax_pinn.quiver(tau[skip], phi[skip], pinn_vx[skip], pinn_vy[skip], 
+                          color='k', headwidth=3.0, width=0.003, alpha=0.7)
+        
         ax_pinn.set_title(f"PINN {which.title()}, t={t:.2f}")
         ax_pinn.set_xlim(xmin, xmax)
         ax_pinn.set_ylim(ymin, ymax)
@@ -1120,20 +1183,30 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         else:
             pc_fd = ax_fd.pcolormesh(tau, phi, fd_field, shading='auto', cmap='viridis', 
                                     vmin=np.min(fd_field), vmax=np.max(fd_field))
+        
+        # Add velocity vectors for both density and velocity plots
+        if fd_vx is not None and fd_vy is not None:
+            # Subsample vectors for clarity (similar to analyze_lax.py)
+            skip_x = max(1, Q // 20)
+            skip_y = max(1, Q // 20)
+            skip = (slice(None, None, skip_x), slice(None, None, skip_y))
+            ax_fd.quiver(tau[skip], phi[skip], fd_vx[skip], fd_vy[skip], 
+                        color='k', headwidth=3.0, width=0.003, alpha=0.7)
+        
         ax_fd.set_title(f"FD {which.title()}, t={t:.2f}")
         ax_fd.set_xlim(xmin, xmax)
         ax_fd.set_ylim(ymin, ymax)
         cbar_fd = plt.colorbar(pc_fd, ax=ax_fd, shrink=0.6)
         cbar_fd.ax.set_title(r"$\rho$" if which == "density" else r"$|v|$", fontsize=14)
         
-        # Column 3: Percentage Difference
+        # Column 3: Epsilon Metric
         ax_diff = axes[i, 2]
-        pc_diff = ax_diff.pcolormesh(tau, phi, pct_diff, shading='auto', cmap='coolwarm')
-        ax_diff.set_title(f"Difference (%), t={t:.2f}")
+        pc_diff = ax_diff.pcolormesh(tau, phi, epsilon_metric, shading='auto', cmap='coolwarm')
+        ax_diff.set_title(f"ε (%), t={t:.2f}")
         ax_diff.set_xlim(xmin, xmax)
         ax_diff.set_ylim(ymin, ymax)
         cbar_diff = plt.colorbar(pc_diff, ax=ax_diff, shrink=0.6)
-        cbar_diff.ax.set_title("%", fontsize=14)
+        cbar_diff.ax.set_title("ε (%)", fontsize=14)
         
         # Add x-axis labels only on bottom row
         if i == 4:

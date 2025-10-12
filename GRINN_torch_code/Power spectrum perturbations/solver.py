@@ -14,7 +14,7 @@ def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     num_of_waves = int(num_of_waves)  # Number of waves
     tmax = float(tmax)  # Maximum time
     N_0 = int(N_0)  # Number of initial condition points
-    N_b = int(N_b)  # Number of boundary condition points
+    # N_b is no longer used due to hard constraints but kept for compatibility
     N_r = int(N_r)  # Number of collocation points
     
     return lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r
@@ -39,9 +39,65 @@ def req_consts_calc(lam, rho_1):
 
     return jeans, alpha
 
-def generate_power_spectrum_field(lam, v_1, x, seed=1234):
-    '''Generate 2D Gaussian random field with power spectrum'''
+# Global shared velocity fields for consistent initial conditions
+_shared_vx_interp = None
+_shared_vy_interp = None
+
+def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=1234):
+    """
+    Initialize shared velocity fields for consistent PINN/FD initial conditions.
+    This should be called once at the beginning of training.
+    """
+    global _shared_vx_interp, _shared_vy_interp
     
+    # Import LAX_2D functions
+    from LAX_2D import generate_shared_velocity_field
+    
+    # Calculate domain size to match FD solver
+    Lx = lam * num_of_waves
+    Ly = lam * num_of_waves
+    
+    # Generate shared velocity fields
+    vx_np, vy_np, vx_interp, vy_interp = generate_shared_velocity_field(
+        N_GRID, N_GRID, Lx, Ly, 
+        power_index=POWER_EXPONENT, 
+        amplitude=v_1, 
+        random_seed=seed
+    )
+    
+    # Store interpolation functions globally
+    _shared_vx_interp = vx_interp
+    _shared_vy_interp = vy_interp
+    
+    return vx_np, vy_np
+
+def generate_power_spectrum_field(lam, v_1, x, seed=1234):
+    '''Generate 2D Gaussian random field with power spectrum using shared fields if available'''
+    
+    # Use shared velocity fields if available
+    if _shared_vx_interp is not None and _shared_vy_interp is not None:
+        # Convert tensor coordinates to numpy for interpolation
+        x_np = x[0].detach().cpu().numpy()
+        y_np = x[1].detach().cpu().numpy()
+        
+        # Create coordinate pairs for interpolation
+        coords = np.stack([x_np.flatten(), y_np.flatten()], axis=1)
+        
+        # Interpolate shared velocity field
+        vx_interp = _shared_vx_interp(coords)
+        vy_interp = _shared_vy_interp(coords)
+        
+        # Convert back to tensor and reshape
+        vx_tensor = torch.from_numpy(vx_interp).float().to(x[0].device)
+        vy_tensor = torch.from_numpy(vy_interp).float().to(x[0].device)
+        
+        # Return vx component (vy will be handled separately)
+        if vx_tensor.dim() == 1:
+            return vx_tensor.unsqueeze(-1)
+        else:
+            return vx_tensor
+    
+    # Fallback to original method if shared fields not available
     Lx = lam * 2  # Domain size
     dx = Lx / N_GRID
     
@@ -161,6 +217,33 @@ def fun_rho_0(rho_1, lam, x):
         else:
             return rho_0
 
+def generate_power_spectrum_field_vy(lam, v_1, x, seed=5678):
+    '''Generate vy component using shared fields if available'''
+    
+    # Use shared velocity fields if available
+    if _shared_vx_interp is not None and _shared_vy_interp is not None:
+        # Convert tensor coordinates to numpy for interpolation
+        x_np = x[0].detach().cpu().numpy()
+        y_np = x[1].detach().cpu().numpy()
+        
+        # Create coordinate pairs for interpolation
+        coords = np.stack([x_np.flatten(), y_np.flatten()], axis=1)
+        
+        # Interpolate shared velocity field
+        vy_interp = _shared_vy_interp(coords)
+        
+        # Convert back to tensor and reshape
+        vy_tensor = torch.from_numpy(vy_interp).float().to(x[0].device)
+        
+        # Return vy component
+        if vy_tensor.dim() == 1:
+            return vy_tensor.unsqueeze(-1)
+        else:
+            return vy_tensor
+    
+    # Fallback to original method if shared fields not available
+    return generate_power_spectrum_field(lam, v_1, x, seed=seed)
+
 def fun_vx_0(lam, jeans, v_1, x):
     '''initial condition for x-velocity -- branch by PERTURBATION_TYPE'''
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
@@ -184,7 +267,7 @@ def fun_vy_0(lam, jeans, v_1, x):
             # fallback to x if y is unavailable (1D)
             return _sinusoidal_component(x[0], lam, jeans, v_1)
     else:
-        return generate_power_spectrum_field(lam, v_1, x, seed=5678)
+        return generate_power_spectrum_field_vy(lam, v_1, x, seed=5678)
 
 def func(x):
     return x[0]*0

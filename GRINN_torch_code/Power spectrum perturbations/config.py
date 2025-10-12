@@ -7,13 +7,18 @@ xmin = 0.
 ymin = 0.
 cs = 1.0
 rho_o = 1.0
-const = 4*np.pi      # 4π for Poisson equation ∇²φ = 4πGρ
-G = 1.0/(4*np.pi)    # Gravitational Constant (paper's unit system: 4πG = 1)
+const = 1.0
+G = 1.0
 
-a = 0.01
+# Collocation point parameters
+N_0 = 10000  # Number of initial condition points
+N_r = 100000  # Number of residual/collocation points
+DIMENSION = 2  # Spatial dimension
+
+a = 0.001
 
 tmin = 0.
-tmax = 2.0
+tmax = 5.0
 
 num_neurons = 64
 harmonics = 3
@@ -30,13 +35,13 @@ FD_N_2D = 1000  # Grid points per dimension for 2D LAX
 
 # Power spectrum parameters
 N_GRID = 500  # Grid resolution for power spectrum generation
-POWER_EXPONENT = -4  # Power spectrum exponent (more interesting than 0)
+POWER_EXPONENT = -4  # Power spectrum exponent
 FILTER_SCALE = 0  # Filter scale (Rf) - small but non-zero
 STARTUP_DT = 0.01 # Time offset after which PDE is enforced (ICs remain at t=0)
 CONTINUITY_IC_WEIGHT = 1.0 # Weight for enforcing continuity at t=0: rho_t(0) = -rho0 * div v0
 DECAY_PORTION = 0.5 # Fraction of total training steps over which to fully decay
 
-iteration_adam_2D = 800
+iteration_adam_2D = 1000
 iteration_lbgfs_2D = 200
 
 # Output/snapshot controls

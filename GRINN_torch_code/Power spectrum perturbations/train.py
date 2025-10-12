@@ -2,8 +2,8 @@ import numpy as np
 import time
 import torch
 import torch.nn as nn
-from solver import input_taker, req_consts_calc, train
-from config import BATCH_SIZE, NUM_BATCHES
+from solver import input_taker, req_consts_calc, train, initialize_shared_velocity_fields
+from config import BATCH_SIZE, NUM_BATCHES, N_0, N_r, DIMENSION
 from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o
 from losses import ASTPN
 from model_architecture import PINN
@@ -20,7 +20,7 @@ if device.startswith('cuda'):
 else:
     pass
 
-lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(wave, a, 2, TMAX_CFG, 10000, 10000, 100000)
+lam, rho_1, num_of_waves, tmax, _, _, _ = input_taker(wave, a, 2, TMAX_CFG, N_0, 0, N_r)
 
 jeans, alpha = req_consts_calc(lam, rho_1)
 # Set initial velocity amplitude per perturbation type
@@ -39,10 +39,19 @@ mse_cost_function = torch.nn.MSELoss() # Mean squared error
 optimizer = torch.optim.Adam(net.parameters(),lr=0.001,)
 optimizerL = torch.optim.LBFGS(net.parameters(),line_search_fn='strong_wolfe')
 
-model_2D = ASTPN(rmin=[xmin, ymin, tmin],rmax=[xmax, ymax, tmax], N_0= N_0,N_b=N_b,N_r= N_r,dimension=2)
+# Initialize shared velocity fields for consistent PINN/FD initial conditions
+if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+
+    vx_np, vy_np = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=1234)
+    
+    # Set shared velocity fields for plotting
+    from Plotting_2D import set_shared_velocity_fields
+    set_shared_velocity_fields(vx_np, vy_np)
+
+model_2D = ASTPN(rmin=[xmin, ymin, tmin],rmax=[xmax, ymax, tmax], N_0=N_0, N_b=0, N_r=N_r, dimension=DIMENSION)
 
 # Set domain on the network so periodic embeddings enforce hard BCs
-net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=2)
+net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
 
 collocation_domain_2D = model_2D.geo_time_coord(option= "Domain") 
 collocation_IC_2D = model_2D.geo_time_coord(option= "IC")
