@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 LAX Analysis Script for Power Spectrum Perturbations
 
@@ -33,7 +32,7 @@ cs = 1.0                   # Sound speed
 rho_o = 1.0                # Background density
 G = 1.0                    # Gravitational constant
 const = 1.0                # Constant multiplier
-a = 0.1                   # Amplitude parameter (same as in config.py)
+a = 0.01                   # Amplitude parameter (same as in config.py)
 
 # Power Spectrum Parameters
 power_index = -4         # Power spectrum exponent (e.g., -3.0, -4.0)
@@ -59,7 +58,7 @@ collapse_dt = 0.1          # Time step for collapse search (not used in fast alg
 
 # Validation Settings
 run_validation = True      # Whether to run validation test (set to False for faster execution)
-validation_times = [1.0, 2.0, 3.0, 4.0, 5.0]  # Times to test for validation
+validation_times = [1.0, 2.0, 3.0, 4.0]  # Times to test for validation
 
 # =============================================================================
 # END CONFIGURATION SECTION
