@@ -642,4 +642,225 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     return avg_loss
 
 
-    return net
+def distribute_collocation_points(n_total, num_subdomains):
+    """
+    Distribute collocation points across subdomains.
+    
+    Args:
+        n_total: Total number of collocation points
+        num_subdomains: Number of subdomains
+    
+    Returns:
+        List of point counts per subdomain
+    """
+    from config import N_r_PER_SUBDOMAIN, N_0_PER_SUBDOMAIN
+    
+    # If per-subdomain count is specified, use it
+    if n_total == N_r_PER_SUBDOMAIN and N_r_PER_SUBDOMAIN is not None:
+        return [N_r_PER_SUBDOMAIN] * num_subdomains
+    elif n_total == N_0_PER_SUBDOMAIN and N_0_PER_SUBDOMAIN is not None:
+        return [N_0_PER_SUBDOMAIN] * num_subdomains
+    
+    # Otherwise, auto-distribute evenly
+    base_count = n_total // num_subdomains
+    remainder = n_total % num_subdomains
+    
+    counts = [base_count] * num_subdomains
+    # Distribute remainder to first few subdomains
+    for i in range(remainder):
+        counts[i] += 1
+    
+    return counts
+
+
+def closure_xpinn(xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
+                   subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
+                   optimizer):
+    """
+    Closure function for XPINN training with multiple networks.
+    
+    Args:
+        xpinn_loss_model: XPINN_Loss instance
+        nets: List of neural networks
+        subdomain_collocs: List of subdomain collocation points
+        interface_collocs: Dict of interface collocation points
+        subdomain_ic_collocs: List of IC collocation points per subdomain
+        ic_functions: Initial condition functions
+        interfaces: List of interface tuples
+        exterior_boundaries: Dict of exterior boundary info
+        optimizer: Optimizer instance
+    
+    Returns:
+        Total loss (scalar tensor)
+    """
+    optimizer.zero_grad()
+    
+    # Compute total XPINN loss
+    total_loss, loss_dict = xpinn_loss_model.compute_total_loss(
+        nets, subdomain_collocs, interface_collocs,
+        subdomain_ic_collocs, ic_functions, interfaces,
+        exterior_boundaries
+    )
+    
+    # Backward pass
+    total_loss.backward(retain_graph=True)
+    
+    return total_loss
+
+
+def closure_xpinn_batched(xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
+                           subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
+                           optimizer, batch_size, num_batches):
+    """
+    Batched closure function for XPINN training with multiple networks.
+    Processes collocation points in mini-batches with gradient accumulation.
+    
+    Args:
+        xpinn_loss_model: XPINN_Loss instance
+        nets: List of neural networks
+        subdomain_collocs: List of subdomain collocation points
+        interface_collocs: Dict of interface collocation points
+        subdomain_ic_collocs: List of IC collocation points per subdomain
+        ic_functions: Initial condition functions
+        interfaces: List of interface tuples
+        exterior_boundaries: Dict of exterior boundary info
+        optimizer: Optimizer instance
+        batch_size: Maximum points per mini-batch
+        num_batches: Number of mini-batches to aggregate
+    
+    Returns:
+        Total loss (scalar tensor)
+    """
+    optimizer.zero_grad()
+    
+    # Aggregate losses across mini-batches
+    total_loss = 0.0
+    num_effective_batches = 0
+    
+    # Get device from first subdomain's collocation points
+    device = subdomain_collocs[0][0].device if len(subdomain_collocs) > 0 else 'cuda'
+    
+    for batch_idx in range(int(max(1, num_batches))):
+        # Create batched subdomain collocation points
+        batched_subdomain_collocs = []
+        for subdomain_colloc in subdomain_collocs:
+            dom_n = subdomain_colloc[0].size(0)
+            dom_idx = _random_batch_indices(dom_n, batch_size, device)
+            batch_dom = _make_batch_tensors(subdomain_colloc, dom_idx)
+            batched_subdomain_collocs.append(batch_dom)
+        
+        # Create batched subdomain IC points
+        batched_subdomain_ic_collocs = []
+        for subdomain_ic_colloc in subdomain_ic_collocs:
+            ic_n = subdomain_ic_colloc[0].size(0)
+            ic_idx = _random_batch_indices(ic_n, batch_size, device)
+            batch_ic = _make_batch_tensors(subdomain_ic_colloc, ic_idx)
+            batched_subdomain_ic_collocs.append(batch_ic)
+        
+        # Create batched interface collocation points
+        batched_interface_collocs = {}
+        for interface_key, interface_colloc in interface_collocs.items():
+            if_n = interface_colloc[0].size(0)
+            if_idx = _random_batch_indices(if_n, batch_size, device)
+            batch_if = _make_batch_tensors(interface_colloc, if_idx)
+            batched_interface_collocs[interface_key] = batch_if
+        
+        # Compute loss for this mini-batch
+        batch_loss, batch_loss_dict = xpinn_loss_model.compute_total_loss(
+            nets, batched_subdomain_collocs, batched_interface_collocs,
+            batched_subdomain_ic_collocs, ic_functions, interfaces,
+            exterior_boundaries
+        )
+        
+        # Accumulate loss
+        total_loss += batch_loss
+        num_effective_batches += 1
+    
+    # Average loss across batches
+    if num_effective_batches > 0:
+        total_loss = total_loss / num_effective_batches
+    
+    # Backward pass
+    total_loss.backward(retain_graph=True)
+    
+    return total_loss
+
+
+def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs,
+                ic_functions, interfaces, exterior_boundaries, xpinn_loss_model,
+                optimizer, optimizerL, iteration_adam, iterationL, device):
+    """
+    Train XPINN with multiple networks.
+    
+    Args:
+        nets: List of neural networks (one per subdomain)
+        subdomain_collocs: List of subdomain collocation points
+        interface_collocs: Dict of interface collocation points
+        subdomain_ic_collocs: List of IC collocation points per subdomain
+        ic_functions: Initial condition functions dictionary
+        interfaces: List of interface tuples
+        exterior_boundaries: Dict of exterior boundary information
+        xpinn_loss_model: XPINN_Loss instance
+        optimizer: Adam optimizer
+        optimizerL: L-BFGS optimizer
+        iteration_adam: Number of Adam iterations
+        iterationL: Number of L-BFGS iterations
+        device: PyTorch device
+    
+    Returns:
+        None (trains networks in-place)
+    """
+    from config import XPINN_ALTERNATING_TRAINING, USE_XPINN_BATCHING, BATCH_SIZE, NUM_BATCHES
+    
+    print(f"Starting XPINN training with {len(nets)} subdomains...")
+    print(f"Interfaces: {len(interfaces)}")
+    print(f"Optimizer strategy: {'unified' if optimizer is not None else 'separate'}")
+    print(f"Batching: {'enabled' if USE_XPINN_BATCHING else 'disabled'}")
+    
+    # Choose closure function based on batching setting
+    if USE_XPINN_BATCHING:
+        bs_global = int(BATCH_SIZE)
+        nb = int(NUM_BATCHES)
+        num_sub = len(nets)
+        bs = max(1, bs_global // max(1, num_sub))  # per-subdomain batch size
+        print(f"Batching: global={bs_global}, per_subdomain={bs}, num_subdomains={num_sub}, num_batches={nb}")
+        
+        def make_closure(opt):
+            return lambda: closure_xpinn_batched(
+                xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
+                subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
+                opt, bs, nb
+            )
+    else:
+        def make_closure(opt):
+            return lambda: closure_xpinn(
+                xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
+                subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
+                opt
+            )
+    
+    # Adam training
+    for i in range(iteration_adam):
+        if XPINN_ALTERNATING_TRAINING:
+            # Alternate between subdomains (not yet implemented - would need separate optimizers)
+            raise NotImplementedError("Alternating training not yet implemented")
+        else:
+            # Train all networks simultaneously
+            loss = optimizer.step(make_closure(optimizer))
+        
+        if i % 100 == 0:
+            with torch.autograd.no_grad():
+                print(f"XPINN Training Loss at {i} (Adam) = {loss.item():.2e}", flush=True)
+    
+    # L-BFGS training
+    for i in range(iterationL):
+        if XPINN_ALTERNATING_TRAINING:
+            raise NotImplementedError("Alternating training not yet implemented")
+        else:
+            loss = optimizerL.step(make_closure(optimizerL))
+        
+        if i % 50 == 0:
+            with torch.autograd.no_grad():
+                print(f"XPINN Training Loss at {i} (L-BFGS) = {loss.item():.2e}", flush=True)
+    
+    print("XPINN training completed.")

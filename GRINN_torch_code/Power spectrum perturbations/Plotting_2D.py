@@ -9,6 +9,7 @@ import os
 from LAX_2D import lax_solution, lax_solution_with_shared_velocity
 from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
+from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING
 
 # Global variable to store shared velocity fields for plotting
 _shared_vx_np = None
@@ -26,19 +27,141 @@ device = "mps" if torch.backends.mps.is_built() \
     else "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
+def predict_xpinn(nets, x, y, t, xmin, xmax, ymin, ymax):
+    """
+    Predict solution using XPINN with multiple networks.
+    Automatically determines which subdomain(s) each point belongs to and evaluates accordingly.
+    For points at interfaces, combines predictions using configured averaging method.
+    
+    Args:
+        nets: List of neural networks (one per subdomain)
+        x, y, t: Coordinate tensors [N, 1]
+        xmin, xmax, ymin, ymax: Global domain bounds
+    
+    Returns:
+        Combined predictions from all subdomains [N, 4] (rho, vx, vy, phi)
+    """
+    import xpinn_decomposition as xpinn_utils
+    
+    N = x.shape[0]
+    device = x.device
+    
+    # Initialize output
+    output = torch.zeros(N, 4, device=device, dtype=x.dtype)
+    
+    # If single subdomain, just evaluate directly
+    if len(nets) == 1:
+        return nets[0]([x, y, t])
+    
+    # For each point, determine which subdomain(s) it belongs to
+    for i in range(len(nets)):
+        subdomain_bounds = xpinn_utils.get_subdomain_bounds(
+            i, xmin, xmax, ymin, ymax, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y
+        )
+        x_min, x_max, y_min, y_max = subdomain_bounds
+        
+        # Find points in this subdomain (with small tolerance for boundaries)
+        tol = 1e-6
+        mask = ((x >= x_min - tol) & (x <= x_max + tol) & 
+                (y >= y_min - tol) & (y <= y_max + tol)).squeeze()
+        
+        if mask.any():
+            # Evaluate network for points in this subdomain
+            x_sub = x[mask]
+            y_sub = y[mask]
+            t_sub = t[mask]
+            pred_sub = nets[i]([x_sub, y_sub, t_sub])
+            
+            # For simple mean averaging (default)
+            if INTERFACE_AVERAGING == 'mean':
+                # Add prediction (will average later if point is in multiple subdomains)
+                output[mask] += pred_sub
+            else:
+                # For other strategies, just use first subdomain's prediction
+                output[mask] = pred_sub
+    
+    # For mean averaging, divide by number of subdomains that covered each point
+    # This automatically handles interface points by averaging
+    if INTERFACE_AVERAGING == 'mean' and len(nets) > 1:
+        # Count how many subdomains covered each point
+        counts = torch.zeros(N, 1, device=device, dtype=x.dtype)
+        for i in range(len(nets)):
+            subdomain_bounds = xpinn_utils.get_subdomain_bounds(
+                i, xmin, xmax, ymin, ymax, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y
+            )
+            x_min, x_max, y_min, y_max = subdomain_bounds
+            tol = 1e-6
+            mask = ((x >= x_min - tol) & (x <= x_max + tol) & 
+                    (y >= y_min - tol) & (y <= y_max + tol)).squeeze()
+            counts[mask] += 1
+        
+        # Avoid division by zero
+        counts = torch.clamp(counts, min=1.0)
+        output = output / counts
+    
+    return output
+
+
+def add_interface_lines(ax, xmin, xmax, ymin, ymax):
+    """
+    Add interface lines to plot showing subdomain boundaries.
+    
+    Args:
+        ax: Matplotlib axis
+        xmin, xmax, ymin, ymax: Domain bounds
+    """
+    if not SHOW_INTERFACE_LINES or NUM_SUBDOMAINS_X == 1 and NUM_SUBDOMAINS_Y == 1:
+        return
+    
+    # Calculate subdomain boundaries
+    dx = (xmax - xmin) / NUM_SUBDOMAINS_X
+    dy = (ymax - ymin) / NUM_SUBDOMAINS_Y
+    
+    # Vertical lines (constant x)
+    for i in range(1, NUM_SUBDOMAINS_X):
+        x_interface = xmin + i * dx
+        ax.axvline(x=x_interface, color='white', linestyle='--', linewidth=1.5, alpha=0.7, label='Interface' if i == 1 else '')
+    
+    # Horizontal lines (constant y)
+    for j in range(1, NUM_SUBDOMAINS_Y):
+        y_interface = ymin + j * dy
+        ax.axhline(y=y_interface, color='white', linestyle='--', linewidth=1.5, alpha=0.7)
+    
+    # Add legend only once
+    if NUM_SUBDOMAINS_X > 1 or NUM_SUBDOMAINS_Y > 1:
+        handles, labels = ax.get_legend_handles_labels()
+        if 'Interface' in labels:
+            # Only show interface label once
+            unique_labels = []
+            unique_handles = []
+            for handle, label in zip(handles, labels):
+                if label not in unique_labels:
+                    unique_labels.append(label)
+                    unique_handles.append(handle)
+            ax.legend(unique_handles, unique_labels, loc='upper right', fontsize=8)
+
+
 def plot_function(net, time_array, initial_params, velocity=False, isplot=False, animation=False):
     """
     Plot function for 1D slices through 2D domain
     
     Args:
-        net: Trained neural network
+        net: Trained neural network OR list of networks (for XPINN)
         time_array: Array of times to plot
         initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
         velocity: Whether to plot velocity
         isplot: Whether to save plots
         animation: Whether this is for animation
     """
-    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params  
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False  
     # rho_o imported from config.py
     num_of_waves_x = (xmax-xmin)/lam
     num_of_waves_y = (ymax-ymin)/lam
@@ -63,8 +186,11 @@ def plot_function(net, time_array, initial_params, velocity=False, isplot=False,
         pt_y_collocation = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
         pt_t_collocation = Variable(torch.from_numpy(t_).float(), requires_grad=True).to(device)
         
-        # PINN model expects a list of tensors [x, y, t]
-        output_0 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+        # Evaluate network(s)
+        if use_xpinn:
+            output_0 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+        else:
+            output_0 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
         rho_pred0 = output_0[:, 0:1].data.cpu().numpy()
         v_pred_x0 = output_0[:, 1:2].data.cpu().numpy()
@@ -137,13 +263,21 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     Create 2D surface plots with velocity vectors
 
     Args:
-        net: Trained neural network
+        net: Trained neural network OR list of networks (for XPINN)
         time: Time to plot
         initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
         ax: Optional axis to plot on
         which: "density" or "velocity"
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
     
     Q = 100
     xs = np.linspace(xmin, xmax, Q)
@@ -157,8 +291,11 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
     pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
     
-    # PINN model expects a list of tensors [x, y, t]
-    output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+    # Evaluate network(s)
+    if use_xpinn:
+        output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+    else:
+        output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
     
     rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
     U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
@@ -188,6 +325,10 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     
+    # Add interface lines if using XPINN
+    if use_xpinn:
+        add_interface_lines(ax, xmin, xmax, ymin, ymax)
+    
     return pc
 
 
@@ -196,7 +337,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     Create an animated 2D surface plot showing evolution over time
 
     Args:
-        net: Trained neural network
+        net: Trained neural network OR list of networks (for XPINN)
         initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
         time_points: Array of time points for animation (default: 50 points from 0 to 2.0)
         which: "density" or "velocity"
@@ -209,6 +350,14 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         time_points = np.linspace(0.0, float(tmax), 80)
     
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
     
     if verbose:
         print(f"Creating 2D animation with {len(time_points)} frames...")
@@ -234,7 +383,10 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
     
     # Get first frame data to set colorbar limits
-    output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+    if use_xpinn:
+        output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+    else:
+        output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
     rho_first = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
     U_first = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
     V_first = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
@@ -255,11 +407,19 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
         pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
         pt_t = Variable(torch.from_numpy(t_first).float(), requires_grad=True).to(device)
-        rho_first = net([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q)
+        if use_xpinn:
+            pred_first = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
+            rho_first = pred_first[:, 0].data.cpu().numpy().reshape(Q, Q)
+        else:
+            rho_first = nets[0]([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q)
         # Last frame
         t_last = time_points[-1] * np.ones(Q**2).reshape(Q**2, 1)
         pt_t_last = Variable(torch.from_numpy(t_last).float(), requires_grad=True).to(device)
-        rho_last = net([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q)
+        if use_xpinn:
+            pred_last = predict_xpinn(nets, pt_x, pt_y, pt_t_last, xmin, xmax, ymin, ymax)
+            rho_last = pred_last[:, 0].data.cpu().numpy().reshape(Q, Q)
+        else:
+            rho_last = nets[0]([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q)
         fixed_vmin = min(np.min(rho_first), np.min(rho_last))
         fixed_vmax = max(np.max(rho_first), np.max(rho_last))
         if fixed_vmin == fixed_vmax:
@@ -313,8 +473,11 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
         pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
         
-        # PINN model expects a list of tensors [x, y, t]
-        output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+        # Evaluate network(s)
+        if use_xpinn:
+            output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+        else:
+            output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
         rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
         U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
@@ -330,11 +493,17 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
                     eps = 1e-6 if rmin == 0 else 1e-6 * abs(rmin)
                     rmin, rmax = rmin - eps, rmax + eps
                 pc.set_clim(vmin=rmin, vmax=rmax)
+            # Add interface lines if using XPINN
+            if use_xpinn:
+                add_interface_lines(ax, xmin, xmax, ymin, ymax)
             pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
             ax.set_title(f"{pert_str} Density, t={t:.2f}")
         else:  # velocity magnitude surface plot
             Vmag = np.sqrt(U**2 + V**2)
             pc.set_array(Vmag.ravel())
+            # Add interface lines if using XPINN
+            if use_xpinn:
+                add_interface_lines(ax, xmin, xmax, ymin, ymax)
             pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
             ax.set_title(f"{pert_str} Velocity, t={t:.2f}")
         
@@ -744,7 +913,10 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
         pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
         pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
         pt_t = Variable(torch.from_numpy(t_vec).float(), requires_grad=True).to(device)
-        out = net([pt_x, pt_y, pt_t])
+        if use_xpinn:
+            out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
+        else:
+            out = nets[0]([pt_x, pt_y, pt_t])
         rho_pinn = out[:, 0].data.cpu().numpy().reshape(Q, Q)
         pinn_max_list.append(np.max(rho_pinn))
 
@@ -861,7 +1033,10 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         pt_x = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
         pt_y = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
         pt_t = Variable(torch.from_numpy(t_arr).float(), requires_grad=True).to(device)
-        out = net([pt_x, pt_y, pt_t])
+        if use_xpinn:
+            out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
+        else:
+            out = nets[0]([pt_x, pt_y, pt_t])
         rho_pinn = out[:, 0:1].data.cpu().numpy().reshape(-1)
         vx_pinn = out[:, 1:2].data.cpu().numpy().reshape(-1)
         # potential not used in cross-section plots
@@ -1119,6 +1294,14 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
     
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
     # Generate 5 time points uniformly distributed over [0, tmax]
     time_points = np.linspace(0.0, float(tmax), 5)
     
@@ -1149,7 +1332,10 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
         pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
         
-        output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+        if use_xpinn:
+            output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+        else:
+            output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
         if which == "density":
             pinn_field = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
@@ -1294,6 +1480,11 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         ax_pinn.set_title(f"PINN {which.title()}, t={t:.2f}")
         ax_pinn.set_xlim(xmin, xmax)
         ax_pinn.set_ylim(ymin, ymax)
+        
+        # Add interface lines for XPINN
+        if use_xpinn:
+            add_interface_lines(ax_pinn, xmin, xmax, ymin, ymax)
+        
         cbar_pinn = plt.colorbar(pc_pinn, ax=ax_pinn, shrink=0.6)
         cbar_pinn.ax.set_title(r"$\rho$" if which == "density" else r"$|v|$", fontsize=14)
         

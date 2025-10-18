@@ -3,18 +3,42 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from torch.autograd import Variable
-from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE
+from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION
 
 class Sin(nn.Module):
     def forward(self, input):
         return torch.sin(input)
 
+
+def get_activation(activation_type):
+    """
+    Factory function to create activation function instances.
+    
+    Args:
+        activation_type: String identifier ('sin', 'tanh', 'relu', 'elu')
+    
+    Returns:
+        nn.Module activation function
+    """
+    activation_type = activation_type.lower()
+    if activation_type == 'sin':
+        return Sin()
+    elif activation_type == 'tanh':
+        return nn.Tanh()
+    elif activation_type == 'relu':
+        return nn.ReLU()
+    elif activation_type == 'elu':
+        return nn.ELU()
+    else:
+        raise ValueError(f"Unknown activation type: {activation_type}. Choose from 'sin', 'tanh', 'relu', 'elu'.")
+
 class PINN(nn.Module):
-    def __init__(self, num_neurons=num_neurons, n_harmonics=1):
+    def __init__(self, num_neurons=num_neurons, n_harmonics=1, activation_type=DEFAULT_ACTIVATION):
         super(PINN, self).__init__()
         self.num_neurons = num_neurons
         self.n_harmonics = n_harmonics
         self.num_layers = max(2, int(num_layers))  # total Linear layers including output
+        self.activation_type = activation_type
         
         # Domain extents for periodic embeddings (set via set_domain)
         self.xmin = None
@@ -30,13 +54,13 @@ class PINN(nn.Module):
             # First layer
             layers.append(nn.Linear(in_dim, self.num_neurons))
             # Hidden layers: total linear layers = self.num_layers; we already added 1; 
-            # add (self.num_layers - 2) hidden Linear blocks with Sin activations after each
+            # add (self.num_layers - 2) hidden Linear blocks with activations after each
             for _ in range(self.num_layers - 2):
-                layers.append(Sin())
+                layers.append(get_activation(self.activation_type))
                 layers.append(nn.Linear(self.num_neurons, self.num_neurons))
             # Activation before output if there is at least one hidden block
             if self.num_layers > 2:
-                layers.append(Sin())
+                layers.append(get_activation(self.activation_type))
             # Output layer
             layers.append(nn.Linear(self.num_neurons, out_dim))
             return nn.Sequential(*layers)

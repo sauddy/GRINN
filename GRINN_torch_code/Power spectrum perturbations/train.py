@@ -2,15 +2,18 @@ import numpy as np
 import time
 import torch
 import torch.nn as nn
-from solver import input_taker, req_consts_calc, train, initialize_shared_velocity_fields
+from solver import input_taker, req_consts_calc, train, initialize_shared_velocity_fields, train_xpinn, distribute_collocation_points
 from config import BATCH_SIZE, NUM_BATCHES, N_0, N_r, DIMENSION
 from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o
-from losses import ASTPN
+from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, USE_DIFFERENT_ACTIVATIONS, ACTIVATION_FUNCTIONS, DEFAULT_ACTIVATION
+from config import N_INTERFACE, XPINN_OPTIMIZER_STRATEGY
+from losses import ASTPN, XPINN_Loss
 from model_architecture import PINN
 from Plotting_2D import create_2d_animation
 from Plotting_2D import create_1d_cross_sections_sinusoidal
 from Plotting_2D import create_density_growth_plot
 from config import PLOT_DENSITY_GROWTH, GROWTH_PLOT_TMAX, GROWTH_PLOT_DT
+import xpinn_decomposition as xpinn_utils
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -35,84 +38,215 @@ else:
 xmax = xmin + lam * num_of_waves
 ymax = ymin + lam * num_of_waves
 
-net = PINN(n_harmonics=harmonics)
-net = net.to(device)
-mse_cost_function = torch.nn.MSELoss() # Mean squared error
-optimizer = torch.optim.Adam(net.parameters(),lr=0.001,)
-optimizerL = torch.optim.LBFGS(net.parameters(),line_search_fn='strong_wolfe')
-
 # Initialize shared velocity fields for consistent PINN/FD initial conditions
 if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-
     vx_np, vy_np = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=1234)
     
     # Set shared velocity fields for plotting
     from Plotting_2D import set_shared_velocity_fields
     set_shared_velocity_fields(vx_np, vy_np)
 
-model_2D = ASTPN(rmin=[xmin, ymin, tmin],rmax=[xmax, ymax, tmax], N_0=N_0, N_b=0, N_r=N_r, dimension=DIMENSION)
+# ==================== MODE SWITCHING: ORIGINAL PINN vs XPINN ====================
 
-# Set domain on the network so periodic embeddings enforce hard BCs
-net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
+if not USE_XPINN:
+    # ==================== ORIGINAL SINGLE PINN MODE ====================
+    print("Running in original PINN mode (single network)...")
+    
+    net = PINN(n_harmonics=harmonics)
+    net = net.to(device)
+    mse_cost_function = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
+    optimizerL = torch.optim.LBFGS(net.parameters(), line_search_fn='strong_wolfe')
 
-collocation_domain_2D = model_2D.geo_time_coord(option= "Domain") 
-collocation_IC_2D = model_2D.geo_time_coord(option= "IC")
+    model_2D = ASTPN(rmin=[xmin, ymin, tmin], rmax=[xmax, ymax, tmax], N_0=N_0, N_b=0, N_r=N_r, dimension=DIMENSION)
 
-start_time = time.time()
-train(
-    net=net,
-    model=model_2D,
-    collocation_domain=collocation_domain_2D,
-    collocation_IC=collocation_IC_2D,
-    optimizer=optimizer,
-    optimizerL=optimizerL,
-    closure=None,
-    mse_cost_function=mse_cost_function,
-    iteration_adam=iteration_adam_2D,
-    iterationL=iteration_lbgfs_2D,
-    rho_1=rho_1,
-    lam=lam,
-    jeans=jeans,
-    v_1=v_1,
-    device=device
-)
-end_time = time.time()
-elapsed_time = end_time - start_time
-print(f"Training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+    # Set domain on the network so periodic embeddings enforce hard BCs
+    net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
+
+    collocation_domain_2D = model_2D.geo_time_coord(option="Domain") 
+    collocation_IC_2D = model_2D.geo_time_coord(option="IC")
+
+    start_time = time.time()
+    train(
+        net=net,
+        model=model_2D,
+        collocation_domain=collocation_domain_2D,
+        collocation_IC=collocation_IC_2D,
+        optimizer=optimizer,
+        optimizerL=optimizerL,
+        closure=None,
+        mse_cost_function=mse_cost_function,
+        iteration_adam=iteration_adam_2D,
+        iterationL=iteration_lbgfs_2D,
+        rho_1=rho_1,
+        lam=lam,
+        jeans=jeans,
+        v_1=v_1,
+        device=device
+    )
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+    
+    # Store net in a list for compatibility with plotting functions
+    nets = [net]
+
+else:
+    # ==================== XPINN MULTI-NETWORK MODE ====================
+    print(f"Running in XPINN mode with {NUM_SUBDOMAINS_X}x{NUM_SUBDOMAINS_Y} subdomain decomposition...")
+    
+    # Calculate total number of subdomains
+    num_subdomains = xpinn_utils.get_num_subdomains(NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y)
+    print(f"Total subdomains: {num_subdomains}")
+    
+    # Initialize multiple networks (one per subdomain)
+    nets = []
+    for i in range(num_subdomains):
+        # Select activation function
+        if USE_DIFFERENT_ACTIVATIONS:
+            activation = ACTIVATION_FUNCTIONS[i % len(ACTIVATION_FUNCTIONS)]
+        else:
+            activation = DEFAULT_ACTIVATION
+        
+        # Create network
+        net = PINN(n_harmonics=harmonics, activation_type=activation)
+        
+        # Get subdomain bounds and set domain
+        subdomain_bounds = xpinn_utils.get_subdomain_bounds(i, xmin, xmax, ymin, ymax, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y)
+        net.set_domain(rmin=[subdomain_bounds[0], subdomain_bounds[2]], 
+                      rmax=[subdomain_bounds[1], subdomain_bounds[3]], 
+                      dimension=DIMENSION)
+        net = net.to(device)
+        nets.append(net)
+        print(f"  Subdomain {i}: bounds={subdomain_bounds}, activation={activation}")
+    
+    # Distribute collocation points across subdomains
+    n_r_per_subdomain = distribute_collocation_points(N_r, num_subdomains)
+    n_0_per_subdomain = distribute_collocation_points(N_0, num_subdomains)
+    print(f"Residual points per subdomain: {n_r_per_subdomain}")
+    print(f"IC points per subdomain: {n_0_per_subdomain}")
+    
+    # Generate collocation points for each subdomain
+    subdomain_collocs = []
+    subdomain_ic_collocs = []
+    
+    for i in range(num_subdomains):
+        subdomain_bounds = xpinn_utils.get_subdomain_bounds(i, xmin, xmax, ymin, ymax, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y)
+        colloc_domain, colloc_ic = xpinn_utils.generate_subdomain_collocation(
+            subdomain_bounds, n_r_per_subdomain[i], n_0_per_subdomain[i],
+            tmin, tmax, 0.01, device=device  # Using STARTUP_DT from config
+        )
+        subdomain_collocs.append(colloc_domain)
+        subdomain_ic_collocs.append(colloc_ic)
+    
+    # Get interfaces between adjacent subdomains
+    interfaces = xpinn_utils.get_interfaces(NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y)
+    print(f"Number of interfaces: {len(interfaces)}")
+    
+    # Generate interface collocation points
+    interface_collocs = {}
+    for interface in interfaces:
+        subdomain_i, subdomain_j, _, _ = interface
+        interface_points = xpinn_utils.generate_interface_points(
+            interface, xmin, xmax, ymin, ymax, tmin, tmax, N_INTERFACE, device=device
+        )
+        interface_collocs[(subdomain_i, subdomain_j)] = interface_points
+    
+    # Create XPINN loss model
+    xpinn_loss_model = XPINN_Loss(rmin=[xmin, ymin, tmin], rmax=[xmax, ymax, tmax], dimension=DIMENSION)
+    
+    # Create initial condition functions (using power spectrum)
+    from solver import generate_power_spectrum_field, generate_power_spectrum_field_vy, fun_rho_0, func
+    
+    ic_functions = {
+        'rho': lambda colloc: fun_rho_0(rho_1, lam, colloc),
+        'vx': lambda colloc: generate_power_spectrum_field(lam, v_1, colloc),
+        'vy': lambda colloc: generate_power_spectrum_field_vy(lam, v_1, colloc),
+        'phi': lambda colloc: func(colloc)
+    }
+    
+    # Placeholder for exterior boundaries (to be implemented properly with periodic BC)
+    exterior_boundaries = {}  # TODO: implement proper exterior boundary handling
+    
+    # Setup optimizer
+    if XPINN_OPTIMIZER_STRATEGY == 'unified':
+        all_params = []
+        for net in nets:
+            all_params.extend(list(net.parameters()))
+        optimizer = torch.optim.Adam(all_params, lr=0.001)
+        optimizerL = torch.optim.LBFGS(all_params, line_search_fn='strong_wolfe')
+    else:
+        raise NotImplementedError("Separate optimizer strategy not yet implemented")
+    
+    # Train XPINN
+    start_time = time.time()
+    train_xpinn(
+        nets=nets,
+        subdomain_collocs=subdomain_collocs,
+        interface_collocs=interface_collocs,
+        subdomain_ic_collocs=subdomain_ic_collocs,
+        ic_functions=ic_functions,
+        interfaces=interfaces,
+        exterior_boundaries=exterior_boundaries,
+        xpinn_loss_model=xpinn_loss_model,
+        optimizer=optimizer,
+        optimizerL=optimizerL,
+        iteration_adam=iteration_adam_2D,
+        iterationL=iteration_lbgfs_2D,
+        device=device
+    )
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"XPINN training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
 
 # Clear GPU memory after training
 if device.startswith('cuda'):
     torch.cuda.empty_cache()
     print("GPU memory cleared after training")
 
-# Create animated visualization plots
+# ==================== VISUALIZATION ====================
 initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)
 
-anim_density = create_2d_animation(net, initial_params, which="density", fps=10, verbose=False)
-anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=10, verbose=False)
+if not USE_XPINN:
+    # Original single network visualization
+    net = nets[0]  # Extract single network from list
+    anim_density = create_2d_animation(net, initial_params, which="density", fps=10, verbose=False)
+    anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=10, verbose=False)
 
-# If using sinusoidal perturbations, also plot 1D cross-sections at fixed y
-if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-    # Use config.TIMES_1D when time_points is None
-    create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
 
-# Optional density growth comparison plot (PINN vs LAX)
-if PLOT_DENSITY_GROWTH:
-    try:
-        tmax_growth = float(GROWTH_PLOT_TMAX)
-    except Exception:
-        tmax_growth = float(TMAX_CFG)
-    dt_growth = float(GROWTH_PLOT_DT)
-    create_density_growth_plot(net, initial_params, tmax=tmax_growth, dt=dt_growth)
+    if PLOT_DENSITY_GROWTH:
+        try:
+            tmax_growth = float(GROWTH_PLOT_TMAX)
+        except Exception:
+            tmax_growth = float(TMAX_CFG)
+        dt_growth = float(GROWTH_PLOT_DT)
+        create_density_growth_plot(net, initial_params, tmax=tmax_growth, dt=dt_growth)
+else:
+    # XPINN multi-network visualization
+    print("Creating XPINN visualizations...")
+    anim_density = create_2d_animation(nets, initial_params, which="density", fps=10, verbose=False)
+    anim_velocity = create_2d_animation(nets, initial_params, which="velocity", fps=10, verbose=False)
+    print("XPINN visualizations created successfully!")
 
-# Always save the trained model to SNAPSHOT_DIR/GRINN
+# ==================== MODEL SAVING ====================
 try:
     import os
     from config import SNAPSHOT_DIR
     model_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
     os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, "model.pth")
-    torch.save(net.state_dict(), model_path)
-    print(f"Saved model to {model_path}")
+    
+    if not USE_XPINN:
+        # Save single network
+        model_path = os.path.join(model_dir, "model.pth")
+        torch.save(nets[0].state_dict(), model_path)
+        print(f"Saved model to {model_path}")
+    else:
+        # Save all subdomain networks
+        for i, net in enumerate(nets):
+            model_path = os.path.join(model_dir, f"model_subdomain_{i}.pth")
+            torch.save(net.state_dict(), model_path)
+        print(f"Saved {len(nets)} subdomain models to {model_dir}")
 except Exception as e:
     print(f"Warning: failed to save model: {e}")

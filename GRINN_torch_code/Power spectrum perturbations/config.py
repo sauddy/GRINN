@@ -12,15 +12,15 @@ G = 1.0
 
 # Collocation point parameters
 N_0 = 10000  # Number of initial condition points
-N_r = 80000 # Number of residual/collocation points
+N_r = 100000 # Number of residual/collocation points
 DIMENSION = 2  # Spatial dimension
 
 # Number of collocation/IC points per mini-batch and
 # how many such mini-batches to aggregate in a single optimizer step
 BATCH_SIZE = 30000
-NUM_BATCHES = 3
+NUM_BATCHES = 2
 
-a = 0.5
+a = 0.1
 
 tmin = 0.
 tmax = 2.0
@@ -32,11 +32,11 @@ num_layers = 5
 wave = 7.0
 k = 2 * np.pi / wave
 
-iteration_adam_2D = 800
-iteration_lbgfs_2D = 200
+iteration_adam_2D = 8
+iteration_lbgfs_2D = 2
 
 # Output/snapshot controls
-SAVE_STATIC_SNAPSHOTS = True
+SAVE_STATIC_SNAPSHOTS = False
 
 # Directory to save snapshots; default keeps Kaggle working dir
 SNAPSHOT_DIR = "/kaggle/working/"
@@ -60,3 +60,34 @@ DECAY_PORTION = 0.5 # Fraction of total training steps over which to fully decay
 PLOT_DENSITY_GROWTH = True
 GROWTH_PLOT_TMAX = 4.0
 GROWTH_PLOT_DT = 0.1
+
+# ==================== XPINN Domain Decomposition Configuration ====================
+
+# Domain Decomposition
+USE_XPINN = True  # Toggle XPINN on/off (False = original single PINN)
+NUM_SUBDOMAINS_X = 2  # Subdomain splits in x-direction (1 = no split)
+NUM_SUBDOMAINS_Y = 2  # Subdomain splits in y-direction (1 = no split)
+
+# Collocation Points
+N_INTERFACE = 1000  # Interface collocation points per interface
+N_r_PER_SUBDOMAIN = None  # Residual points per subdomain (None = auto-distribute N_r)
+N_0_PER_SUBDOMAIN = None  # IC points per subdomain (None = auto-distribute N_0)
+
+# Interface Loss Weights
+INTERFACE_SOLUTION_WEIGHT = 4.0  # Solution continuity weight
+INTERFACE_RESIDUAL_WEIGHT = 1.0  # Residual continuity weight
+INTERFACE_SOLUTION_COMPONENTS = ['rho', 'vx', 'vy', 'phi']  # Which components to enforce
+
+# Activation Functions
+USE_DIFFERENT_ACTIVATIONS = False  # Different activations per subdomain
+ACTIVATION_FUNCTIONS = ['sin', 'tanh', 'relu', 'elu']  # List to cycle through
+DEFAULT_ACTIVATION = 'sin'  # Used if USE_DIFFERENT_ACTIVATIONS = False
+
+# Training Strategy
+XPINN_OPTIMIZER_STRATEGY = 'unified'  # 'unified' = single optimizer, 'separate' = one per subdomain
+XPINN_ALTERNATING_TRAINING = False  # True = alternate subdomains, False = simultaneous
+USE_XPINN_BATCHING = True  # True = use mini-batch processing for XPINN (reduces GPU memory)
+
+# Visualization
+SHOW_INTERFACE_LINES = True  # Draw subdomain boundaries in plots
+INTERFACE_AVERAGING = 'mean'  # Combine overlapping predictions: 'mean', 'weighted', 'subdomain1', 'subdomain2'

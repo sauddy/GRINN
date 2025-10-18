@@ -273,3 +273,94 @@ class col_gen(object):
                     coor_r.append(t_bc)
                     
                     return coor_l , coor_r
+    
+    def geo_time_coord_subdomain(self, option, subdomain_bounds, device='cuda', coordinate=1):
+        """
+        Generate collocation points within a subdomain.
+        
+        Args:
+            option: "Domain", "IC", or "BC"
+            subdomain_bounds: Tuple (x_min, x_max, y_min, y_max) for 2D
+            device: PyTorch device
+            coordinate: For BC generation (1=x, 2=y)
+        
+        Returns:
+            Collocation points list constrained to subdomain
+        """
+        # For 2D (current focus)
+        if self.dimension == 2:
+            x_min, x_max, y_min, y_max = subdomain_bounds
+            
+            if option == "Domain":
+                coor = []
+                x_dom = torch.empty(self.N_r, 1, device=device, dtype=torch.float32).uniform_(x_min, x_max).requires_grad_()
+                y_dom = torch.empty(self.N_r, 1, device=device, dtype=torch.float32).uniform_(y_min, y_max).requires_grad_()
+                t_dom = torch.empty(self.N_r, 1, device=device, dtype=torch.float32).uniform_(max(self.rmin[2], STARTUP_DT), self.rmax[2]).requires_grad_()
+                coor.append(x_dom)
+                coor.append(y_dom)
+                coor.append(t_dom)
+                return coor
+            
+            elif option == "IC":
+                coor = []
+                x_ic = torch.empty(self.N_0, 1, device=device, dtype=torch.float32).uniform_(x_min, x_max).requires_grad_()
+                y_ic = torch.empty(self.N_0, 1, device=device, dtype=torch.float32).uniform_(y_min, y_max).requires_grad_()
+                t_ic = torch.empty(self.N_0, 1, device=device, dtype=torch.float32).fill_(0).requires_grad_()
+                coor.append(x_ic)
+                coor.append(y_ic)
+                coor.append(t_ic)
+                return coor
+            
+            elif option == "BC":
+                # Only generate BC if subdomain touches exterior boundary
+                # This is handled by get_exterior_boundary_info
+                if self.N_b == 0:
+                    return [], []
+                
+                t_bc = torch.empty(self.N_b, 1, device=device, dtype=torch.float32).uniform_(max(self.rmin[2], STARTUP_DT), self.rmax[2])
+                t_bc.requires_grad_()
+                
+                if coordinate == 1:
+                    x_bc_l = torch.empty(self.N_b, 1, device=device, dtype=torch.float32).fill_(x_min).requires_grad_()
+                    x_bc_r = torch.empty(self.N_b, 1, device=device, dtype=torch.float32).fill_(x_max).requires_grad_()
+                    y_bc = torch.empty(self.N_b, 1, device=device, dtype=torch.float32).uniform_(y_min, y_max).requires_grad_()
+                    
+                    coor_l = [x_bc_l, y_bc, t_bc]
+                    coor_r = [x_bc_r, y_bc, t_bc]
+                    return coor_l, coor_r
+                
+                elif coordinate == 2:
+                    y_bc_l = torch.empty(self.N_b, 1, device=device, dtype=torch.float32).fill_(y_min).requires_grad_()
+                    y_bc_r = torch.empty(self.N_b, 1, device=device, dtype=torch.float32).fill_(y_max).requires_grad_()
+                    x_bc = torch.empty(self.N_b, 1, device=device, dtype=torch.float32).uniform_(x_min, x_max).requires_grad_()
+                    
+                    coor_l = [x_bc, y_bc_l, t_bc]
+                    coor_r = [x_bc, y_bc_r, t_bc]
+                    return coor_l, coor_r
+        
+        else:
+            raise NotImplementedError(f"Subdomain collocation not yet implemented for dimension {self.dimension}")
+    
+    def get_exterior_boundary_info(self, subdomain_idx, nx_sub, ny_sub):
+        """
+        Determine which boundaries of a subdomain are exterior boundaries.
+        Uses xpinn_decomposition utilities.
+        
+        Args:
+            subdomain_idx: Linear subdomain index
+            nx_sub: Number of subdomain splits in x-direction
+            ny_sub: Number of subdomain splits in y-direction
+        
+        Returns:
+            Dict with keys 'left', 'right', 'bottom', 'top' indicating if boundary is exterior
+        """
+        from xpinn_decomposition import get_exterior_boundary_info
+        
+        # Extract global domain bounds from self.rmin, self.rmax
+        if self.dimension == 2:
+            xmin, ymin = self.rmin[0], self.rmin[1]
+            xmax, ymax = self.rmax[0], self.rmax[1]
+        else:
+            raise NotImplementedError(f"Exterior boundary info not yet implemented for dimension {self.dimension}")
+        
+        return get_exterior_boundary_info(subdomain_idx, nx_sub, ny_sub, xmin, xmax, ymin, ymax)
