@@ -14,7 +14,11 @@ Modify the configuration section below to explore different parameter values.
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-from LAX_2D import lax_solution
+import multiprocessing as mp
+from functools import partial
+import time
+from tqdm import tqdm
+from LAX_2D import lax_solution, generate_velocity_field_power_spectrum
 
 # =============================================================================
 # CONFIGURATION SECTION - MODIFY THESE PARAMETERS FOR ANALYSIS
@@ -25,7 +29,7 @@ N = 300                    # Grid resolution (Nx = Ny)
 nu = 0.5                   # Courant number for stability (typically 0.1-0.9)
 lam = 7.0                  # Wavelength
 num_of_waves = 2.0         # Number of wavelengths in domain
-time_points = [1.0]  # Times to plot
+time_points = [1.5]  # Times to plot
 
 # Physical Constants
 cs = 1.0                   # Sound speed
@@ -35,7 +39,7 @@ const = 1.0                # Constant multiplier
 a = 0.01                   # Amplitude parameter (same as in config.py)
 
 # Power Spectrum Parameters
-power_index = -4         # Power spectrum exponent (e.g., -3.0, -4.0)
+power_index = 0         # Power spectrum exponent (e.g., -3.0, -4.0)
 vel_rms = a * cs          # RMS velocity amplitude (consistent with train.py)
 random_seed = 1234         # Seed for reproducibility
 
@@ -52,13 +56,12 @@ show_plots = False          # Display plots on screen
 
 # Collapse Time Settings
 find_collapse_time = True   # Whether to find collapse time (set to False for faster execution)
+collapse_method = "full_lax"    # Method: "fast" (integrated solver) or "full_lax" (parallel LAX calls)
 target_density_ratio = 100.0  # Target density ratio (times initial density)
-max_search_time = 10.0     # Maximum time to search for collapse
-collapse_dt = 0.1          # Time step for collapse search (not used in fast algorithm)
+max_search_time = 20.0     # Maximum time to search for collapse
+collapse_dt = 0.1          # Time step for collapse search (used by full_lax method)
 
-# Validation Settings
-run_validation = True      # Whether to run validation test (set to False for faster execution)
-validation_times = [1.0, 2.0, 3.0, 4.0]  # Times to test for validation
+# Note: Validation functions removed for cleaner code - fast algorithm works well for core formation detection
 
 # =============================================================================
 # END CONFIGURATION SECTION
@@ -72,8 +75,13 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
     Returns:
         x, y, rho, vx, vy, phi, rho_max
     """
-    # Set random seed to ensure consistent initial conditions
-    np.random.seed(random_seed)
+    # Create a unique seed that combines random_seed and power_index
+    # This ensures different power_index values create different spatial patterns
+    unique_seed = random_seed + int(abs(power_index) * 1000)
+    
+    # Save current random state and set unique seed
+    original_state = np.random.get_state()
+    np.random.seed(unique_seed)
     
     # Run LAX solver with power spectrum velocity field
     result = lax_solution(
@@ -90,7 +98,7 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
         use_velocity_ps=True,
         ps_index=power_index,
         vel_rms=vel_rms,
-        random_seed=random_seed
+        random_seed=unique_seed
     )
     
     # Extract results
@@ -99,6 +107,9 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
     # Create y-coordinates (LAX solver uses square domain)
     Lx = lam * num_of_waves
     y = np.linspace(0, Lx, rho.shape[1])
+    
+    # Restore original random state
+    np.random.set_state(original_state)
     
     return x, y, rho, vx, vy, phi, rho_max
 
@@ -110,8 +121,10 @@ def run_lax_solver_with_velocity_field(time, N, nu, lam, num_of_waves, a, gravit
     Returns:
         x, y, rho, vx, vy, phi, rho_max
     """
-    # Set random seed to ensure consistent initial conditions
-    np.random.seed(random_seed)
+    # Create a unique seed that combines random_seed and power_index
+    # This ensures different power_index values create different spatial patterns
+    unique_seed = random_seed + int(abs(power_index) * 1000)
+    np.random.seed(unique_seed)
     
     # Run LAX solver with shared velocity field
     result = lax_solution(
@@ -128,7 +141,7 @@ def run_lax_solver_with_velocity_field(time, N, nu, lam, num_of_waves, a, gravit
         use_velocity_ps=True,
         ps_index=power_index,
         vel_rms=vel_rms,
-        random_seed=random_seed,
+        random_seed=unique_seed,
         vx0_shared=velocity_field[0],
         vy0_shared=velocity_field[1]
     )
@@ -176,6 +189,14 @@ def create_2d_surface_plot(x, y, field, title, cmap='viridis',
     
     # Formatting
     ax.set_title(title, fontsize=14)
+    # Annotate with parameter values
+    try:
+        ax.text(0.02, 0.96, f"a={a}, power_index={power_index}",
+                transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=dict(boxstyle='round,pad=0.2',
+                fc='white', ec='gray', alpha=0.6))
+    except Exception:
+        pass
     ax.set_xlabel('x', fontsize=12)
     ax.set_ylabel('y', fontsize=12)
     
@@ -200,7 +221,7 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
         velocity_field: Tuple of (vx0, vy0) initial velocity field for reuse
         collapse_state: Tuple of (x, y, rho, vx, vy, phi) at collapse time
     """
-    print(f"\nFast search for collapse time (density ratio = {target_ratio}x)...")
+    print(f"Fast search for collapse time (density ratio = {target_ratio}x)...")
     print(f"Searching from t=0 to t={max_time}")
     
     target_density = target_ratio * rho_o
@@ -209,8 +230,13 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
     from LAX_2D import generate_velocity_field_power_spectrum, fft_solver
     from numpy.fft import fft2, ifft2
     
-    # Set random seed to ensure consistent initial conditions
-    np.random.seed(random_seed)
+    # Create a unique seed that combines random_seed and power_index
+    # This ensures different power_index values create different spatial patterns
+    unique_seed = random_seed + int(abs(power_index) * 1000)
+    
+    # Save current random state and set unique seed
+    original_state = np.random.get_state()
+    np.random.seed(unique_seed)
     
     # Set up domain
     Lx = lam * num_of_waves
@@ -234,7 +260,7 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
     vx0, vy0 = generate_velocity_field_power_spectrum(Nx, Ny, Lx, Ly, 
                                                      power_index=power_index, 
                                                      amplitude=vel_rms, 
-                                                     random_seed=random_seed)
+                                                     random_seed=unique_seed)
     
     rho1 = rho0.copy()
     vx1 = vx0.copy()
@@ -250,8 +276,23 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
     
     # Time integration with collapse detection
     current_time = 0.0
+    current_max_density = rho_o  # Initialize
+    
+    # Create progress bar for time integration
+    pbar = tqdm(total=n_max, desc="Fast Algorithm", unit="steps", 
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                disable=False, leave=True)
+    
     for k in range(1, n_max):
         current_time += dt
+        
+        # Update progress bar with current info
+        pbar.set_postfix({
+            't': f'{current_time:.2f}',
+            'max_rho': f'{current_max_density:.2f}',
+            'target': f'{target_density:.0f}'
+        })
+        pbar.update(1)
         
         # LAX update (same as in LAX_2D.py)
         rho1 = (1/4)*(np.roll(rho0, -1, axis=0) + np.roll(rho0, 1, axis=0) +
@@ -288,7 +329,8 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
         # Check for collapse
         current_max_density = np.max(rho1)
         if current_max_density >= target_density:
-            print(f"Collapse reached at t = {current_time:.3f}")
+            pbar.close()  # Close progress bar
+            print(f"\nCollapse reached at t = {current_time:.3f}")
             print(f"  Maximum density: {current_max_density:.4f}")
             print(f"  Target density: {target_density:.4f}")
             print(f"  Ratio achieved: {current_max_density/rho_o:.1f}x")
@@ -296,6 +338,10 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
             # Save the exact collapse state
             y = np.linspace(0, Lx, rho1.shape[1])
             collapse_state = (x.copy(), y.copy(), rho1.copy(), vx1.copy(), vy1.copy(), phi1.copy())
+            
+            # Restore original random state
+            np.random.set_state(original_state)
+            
             return current_time, (vx0.copy(), vy0.copy()), collapse_state
         
         # Update for next iteration
@@ -307,20 +353,166 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
         dt = np.min([dt1, dt2])
         mux = dt/(2*dx)
         muy = dt/(2*dy)
-        
-        # Progress indicator (reduced frequency)
-        if k % 500 == 0:
-            print(f"  t = {current_time:.2f}, max density = {current_max_density:.4f}")
     
-    print(f"Collapse not reached within t={max_time}")
+    pbar.close()  # Close progress bar
+    print(f"\nCollapse not reached within t={max_time}")
     print(f"  Final maximum density: {current_max_density:.4f}")
     print(f"  Target density: {target_density:.4f}")
     print(f"  Ratio achieved: {current_max_density/rho_o:.1f}x")
+    
+    # Restore original random state
+    np.random.set_state(original_state)
+    
     return None, None, None
 
-def generate_analysis_plots():
+def run_lax_for_time_parallel(args):
+    """
+    Function to run LAX solver for a single time point (for multiprocessing).
+    """
+    time_point, unique_seed = args
+    try:
+        # Set unique seed for this process
+        np.random.seed(unique_seed)
+        
+        result = lax_solution(
+            time=time_point,
+            N=N,
+            nu=nu,
+            lam=lam,
+            num_of_waves=num_of_waves,
+            rho_1=a,
+            gravity=gravity,
+            isplot=False,
+            comparison=False,
+            animation=True,
+            use_velocity_ps=True,
+            ps_index=power_index,
+            vel_rms=vel_rms,
+            random_seed=unique_seed
+        )
+        
+        x, rho, vx, vy, phi, n, rho_max = result
+        return time_point, rho_max, (x, rho, vx, vy, phi)
+        
+    except Exception as e:
+        print(f"Error at t={time_point}: {e}")
+        return time_point, 0.0, None
+
+def find_collapse_time_full_lax(target_ratio=100.0, max_time=10.0, random_seed=1234):
+    """
+    Find collapse time using full LAX solver with parallel processing.
+    
+    This method runs the complete LAX solver for each time point in parallel,
+    providing the most accurate results but taking longer than the fast algorithm.
+    
+    Args:
+        target_ratio: Target density ratio (times initial density)
+        max_time: Maximum time to search
+        random_seed: Random seed for reproducibility
+    
+    Returns:
+        collapse_time, initial_velocity_field, collapse_state, results
+        where results is a list of (time_point, max_density, state) tuples
+    """
+    print(f"Full LAX search for collapse time (density ratio = {target_ratio}x)...")
+    print(f"Searching from t=0 to t={max_time}")
+    
+    # Create a unique seed that combines random_seed and power_index
+    unique_seed = random_seed + int(abs(power_index) * 1000)
+    
+    # Save current random state and set unique seed
+    original_state = np.random.get_state()
+    np.random.seed(unique_seed)
+    
+    # Set up domain
+    Lx = lam * num_of_waves
+    Ly = lam * num_of_waves
+    Nx = N
+    Ny = N
+    dx = float(Lx/Nx)
+    dy = float(Ly/Ny)
+    
+    # Generate initial velocity field
+    vx0, vy0 = generate_velocity_field_power_spectrum(
+        Nx, Ny, Lx, Ly, power_index, vel_rms, unique_seed
+    )
+    
+    # Restore original random state
+    np.random.set_state(original_state)
+    
+    # Create time points to test
+    time_points = np.arange(0, max_time + collapse_dt, collapse_dt)
+    
+    # Prepare arguments for parallel processing
+    args_list = [(time_point, unique_seed) for time_point in time_points]
+    
+    # Use all available CPU cores
+    num_cores = mp.cpu_count()
+    print(f"Using {num_cores} CPU cores for parallel processing...")
+    
+    # Run LAX solver sequentially until collapse is found
+    print(f"Running LAX simulations sequentially until collapse is found...")
+    print(f"Searching from t=0 to t={max_time} with dt={collapse_dt}")
+    
+    target_density = rho_o * target_ratio
+    collapse_time = None
+    collapse_state = None
+    results = []
+    
+    # Create progress bar for sequential search
+    pbar = tqdm(total=len(time_points), desc="Full LAX", unit="sim")
+    
+    for i, time_point in enumerate(time_points):
+        # Run single LAX simulation
+        result = run_lax_for_time_parallel((time_point, unique_seed))
+        time_point, max_density, state = result
+        results.append(result)
+        
+        # Update progress bar
+        pbar.set_postfix({
+            't': f'{time_point:.2f}',
+            'max_rho': f'{max_density:.2f}',
+            'target': f'{target_density:.0f}'
+        })
+        pbar.update(1)
+        
+        # Check for collapse
+        if max_density >= target_density and state is not None and collapse_time is None:
+            collapse_time = time_point
+            pbar.close()  # Close progress bar
+            print(f"\nCollapse reached at t = {time_point:.3f}")
+            print(f"  Maximum density: {max_density:.4f}")
+            print(f"  Target density: {target_density:.4f}")
+            print(f"  Ratio achieved: {max_density/rho_o:.1f}x")
+            
+            # Create collapse state
+            x, rho, vx, vy, phi = state
+            y = np.linspace(0, Lx, rho.shape[1])
+            collapse_state = (x.copy(), y.copy(), rho.copy(), vx.copy(), vy.copy(), phi.copy())
+            
+            # Stop searching - collapse found!
+            break
+    
+    if collapse_time is None:
+        pbar.close()  # Close progress bar if no collapse found
+    
+    if collapse_time is None:
+        print(f"Collapse not reached within t={max_time}")
+        if results:
+            final_max_density = max(rho_max for _, rho_max, _ in results)
+            print(f"  Final maximum density: {final_max_density:.4f}")
+            print(f"  Target density: {target_density:.4f}")
+            print(f"  Ratio achieved: {final_max_density/rho_o:.1f}x")
+    
+    # Return all results for summary statistics
+    return collapse_time, (vx0.copy(), vy0.copy()) if collapse_time else None, collapse_state, results
+
+def generate_analysis_plots(full_lax_results=None):
     """
     Generate all analysis plots for the configured parameters.
+    
+    Args:
+        full_lax_results: Optional results from full LAX method (list of tuples)
     """
     # Create output directory
     if save_plots:
@@ -335,8 +527,9 @@ def generate_analysis_plots():
         'v_min': []
     }
     
-    # Generate plots for each time point
-    for i, time in enumerate(time_points):
+    # Generate plots for each time point (regular density/velocity plots)
+    print(f"\nGenerating plots for {len(time_points)} time points...")
+    for i, time in enumerate(tqdm(time_points, desc="Plotting", unit="plot")):
         # Run LAX solver
         x, y, rho, vx, vy, phi, rho_max = run_lax_solver(
             time, N, nu, lam, num_of_waves, a, gravity,
@@ -346,12 +539,13 @@ def generate_analysis_plots():
         # Calculate velocity magnitude
         v_mag = np.sqrt(vx**2 + vy**2)
         
-        # Store statistics
-        stats['times'].append(time)
-        stats['rho_max'].append(np.max(rho))
-        stats['rho_min'].append(np.min(rho))
-        stats['v_max'].append(np.max(v_mag))
-        stats['v_min'].append(np.min(v_mag))
+        # Store statistics (only if not using full_lax_results)
+        if full_lax_results is None:
+            stats['times'].append(time)
+            stats['rho_max'].append(np.max(rho))
+            stats['rho_min'].append(np.min(rho))
+            stats['v_max'].append(np.max(v_mag))
+            stats['v_min'].append(np.min(v_mag))
         
         # Generate density plot
         if plot_density:
@@ -388,262 +582,70 @@ def generate_analysis_plots():
                 plt.close(fig_vel)
     
     # Generate summary statistics plot
-    if len(time_points) > 1:
+    # Use full_lax_results if provided, otherwise use stats from time_points
+    if full_lax_results is not None:
+        # Extract statistics from full LAX results
+        print(f"\nExtracting statistics from {len(full_lax_results)} full LAX results...")
+        for i, (time_point, max_density, state) in enumerate(tqdm(full_lax_results, desc="Statistics", unit="point")):
+            if state is not None:
+                x, rho, vx, vy, phi = state
+                v_mag = np.sqrt(vx**2 + vy**2)
+                
+                stats['times'].append(time_point)
+                stats['rho_max'].append(np.max(rho))
+                stats['rho_min'].append(np.min(rho))
+                stats['v_max'].append(np.max(v_mag))
+                stats['v_min'].append(np.min(v_mag))
+        
+        if len(stats['times']) > 1:
+            create_summary_plot(stats)
+    elif len(time_points) > 1:
         create_summary_plot(stats)
-    
-    # Print final statistics
-    print_summary_statistics(stats)
 
 def create_summary_plot(stats):
     """
-    Create a summary plot showing evolution of key quantities over time.
+    Create a summary plot showing evolution of key density quantities over time.
+    Plots only density-based metrics (no velocities).
     """
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    
-    times = np.array(stats['times'])
-    
-    # Density evolution
-    axes[0, 0].plot(times, stats['rho_max'], 'o-', label='Max', linewidth=2)
-    axes[0, 0].plot(times, stats['rho_min'], 's-', label='Min', linewidth=2)
-    axes[0, 0].set_title('Density Evolution')
-    axes[0, 0].set_xlabel('Time')
-    axes[0, 0].set_ylabel('Density')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
-    
-    # Velocity evolution
-    axes[0, 1].plot(times, stats['v_max'], 'o-', label='Max', linewidth=2)
-    axes[0, 1].plot(times, stats['v_min'], 's-', label='Min', linewidth=2)
-    axes[0, 1].set_title('Velocity Magnitude Evolution')
-    axes[0, 1].set_xlabel('Time')
-    axes[0, 1].set_ylabel('Velocity')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
+    # Sort by time to ensure monotonic x-axis
+    times_np = np.array(stats['times'])
+    order = np.argsort(times_np)
+    times = times_np[order]
+    rho_max_sorted = np.array(stats['rho_max'])[order]
+    rho_min_sorted = np.array(stats['rho_min'])[order]
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
+    # Global annotation with parameters
+    try:
+        fig.suptitle(f"Summary (a={a}, power_index={power_index})", fontsize=12)
+    except Exception:
+        pass
+
+    # Density evolution (max/min)
+    axes[0].plot(times, rho_max_sorted, 'o-', label='Max', linewidth=2)
+    axes[0].plot(times, rho_min_sorted, 's-', label='Min', linewidth=2)
+    axes[0].set_title('Density Evolution')
+    axes[0].set_xlabel('Time')
+    axes[0].set_ylabel('Density')
+    axes[0].legend()
+    axes[0].grid(True)
+
     # Density range
-    rho_range = np.array(stats['rho_max']) - np.array(stats['rho_min'])
-    axes[1, 0].plot(times, rho_range, 'o-', linewidth=2, color='green')
-    axes[1, 0].set_title('Density Range (Max - Min)')
-    axes[1, 0].set_xlabel('Time')
-    axes[1, 0].set_ylabel('Density Range')
-    axes[1, 0].grid(True)
-    
-    # Velocity range
-    v_range = np.array(stats['v_max']) - np.array(stats['v_min'])
-    axes[1, 1].plot(times, v_range, 'o-', linewidth=2, color='purple')
-    axes[1, 1].set_title('Velocity Range (Max - Min)')
-    axes[1, 1].set_xlabel('Time')
-    axes[1, 1].set_ylabel('Velocity Range')
-    axes[1, 1].grid(True)
-    
-    plt.tight_layout()
-    
+    rho_range = rho_max_sorted - rho_min_sorted
+    axes[1].plot(times, rho_range, 'o-', linewidth=2, color='green')
+    axes[1].set_title('Density Range (Max - Min)')
+    axes[1].set_xlabel('Time')
+    axes[1].set_ylabel('Density Range')
+    axes[1].grid(True)
+
     if save_plots:
         filepath = os.path.join(output_dir, "summary_statistics.png")
         fig.savefig(filepath, dpi=300, bbox_inches='tight')
-    
+
     if show_plots:
         plt.show()
     else:
         plt.close(fig)
-
-def print_summary_statistics(stats):
-    """
-    Print summary statistics to console.
-    """
-    print("\n" + "="*60)
-    print("SUMMARY STATISTICS")
-    print("="*60)
-    
-    print(f"{'Time':<8} {'Rho Max':<10} {'Rho Min':<10} {'V Max':<10} {'V Min':<10}")
-    print("-" * 60)
-    
-    for i, time in enumerate(stats['times']):
-        print(f"{time:<8.2f} {stats['rho_max'][i]:<10.4f} {stats['rho_min'][i]:<10.4f} "
-              f"{stats['v_max'][i]:<10.4f} {stats['v_min'][i]:<10.4f}")
-
-def validate_fast_algorithm(target_ratio=100.0, test_times=[1.0, 2.0, 3.0, 4.0, 5.0]):
-    """
-    Validate the fast algorithm against the original LAX solver.
-    
-    Args:
-        target_ratio: Target density ratio for collapse detection
-        test_times: List of times to compare results
-    
-    Returns:
-        validation_results: Dictionary with comparison data
-    """
-    print("\n" + "="*60)
-    print("VALIDATION TEST: Fast Algorithm vs Original LAX")
-    print("="*60)
-    
-    # Set random seed for consistency
-    np.random.seed(random_seed)
-    
-    validation_results = {
-        'times': [],
-        'fast_density': [],
-        'original_density': [],
-        'density_error': [],
-        'density_error_percent': []
-    }
-    
-    print(f"Testing at times: {test_times}")
-    print(f"Using parameters: a={a}, power_index={power_index}, vel_rms={vel_rms}")
-    print("-" * 60)
-    
-    for time in test_times:
-        # Run fast algorithm (integrate to this time)
-        fast_density = get_density_at_time_fast(time, random_seed)
-        
-        # Run original LAX solver
-        x, y, rho, vx, vy, phi, rho_max = run_lax_solver(
-            time, N, nu, lam, num_of_waves, a, gravity,
-            power_index, vel_rms, random_seed
-        )
-        original_density = np.max(rho)
-        
-        # Calculate errors
-        density_error = abs(fast_density - original_density)
-        density_error_percent = (density_error / original_density) * 100
-        
-        # Store results
-        validation_results['times'].append(time)
-        validation_results['fast_density'].append(fast_density)
-        validation_results['original_density'].append(original_density)
-        validation_results['density_error'].append(density_error)
-        validation_results['density_error_percent'].append(density_error_percent)
-    
-    # Print summary
-    print("\n" + "="*60)
-    print("VALIDATION SUMMARY")
-    print("="*60)
-    print(f"{'Time':<8} {'Fast':<12} {'Original':<12} {'Error':<10} {'Error %':<10}")
-    print("-" * 60)
-    
-    for i, time in enumerate(validation_results['times']):
-        print(f"{time:<8.1f} {validation_results['fast_density'][i]:<12.4f} "
-              f"{validation_results['original_density'][i]:<12.4f} "
-              f"{validation_results['density_error'][i]:<10.4f} "
-              f"{validation_results['density_error_percent'][i]:<10.2f}")
-    
-    # Calculate overall statistics
-    avg_error_percent = np.mean(validation_results['density_error_percent'])
-    max_error_percent = np.max(validation_results['density_error_percent'])
-    
-    print("-" * 60)
-    print(f"Average relative error: {avg_error_percent:.2f}%")
-    print(f"Maximum relative error: {max_error_percent:.2f}%")
-    
-    if avg_error_percent < 5.0:
-        print("VALIDATION PASSED: Fast algorithm is highly accurate")
-    elif avg_error_percent < 15.0:
-        print("VALIDATION ACCEPTABLE: Fast algorithm has moderate accuracy")
-    else:
-        print("VALIDATION FAILED: Fast algorithm has poor accuracy")
-    
-    print("="*60)
-    
-    return validation_results
-
-def get_density_at_time_fast(target_time, random_seed):
-    """
-    Get maximum density at a specific time using the fast algorithm.
-    """
-    # Import LAX solver components
-    from LAX_2D import generate_velocity_field_power_spectrum, fft_solver
-    from numpy.fft import fft2, ifft2
-    
-    # Set random seed
-    np.random.seed(random_seed)
-    
-    # Set up domain (same as fast algorithm)
-    Lx = lam * num_of_waves
-    Ly = lam * num_of_waves
-    Nx = N
-    Ny = N
-    dx = float(Lx/Nx)
-    dy = float(Ly/Ny)
-    dt = nu*dx/cs
-    mux = dt/(2*dx)
-    muy = dt/(2*dy)
-    
-    # Initialize arrays
-    x = np.linspace(0, Lx, Nx)
-    y = np.linspace(0, Ly, Ny)
-    xx, yy = np.meshgrid(x, y, indexing='ij')
-    
-    # Initial conditions
-    rho0 = rho_o * np.ones((Nx, Ny))
-    vx0, vy0 = generate_velocity_field_power_spectrum(Nx, Ny, Lx, Ly, 
-                                                     power_index=power_index, 
-                                                     amplitude=vel_rms, 
-                                                     random_seed=random_seed)
-    
-    rho1 = rho0.copy()
-    vx1 = vx0.copy()
-    vy1 = vy0.copy()
-    Px0 = rho0*vx0
-    Py0 = rho0*vy0
-    Px1 = Px0.copy()
-    Py1 = Py0.copy()
-    
-    # Initial potential
-    phi0 = fft_solver(const*(rho0-rho_o), Lx, Nx, Ly, Ny, dim=2)
-    phi1 = phi0.copy()
-    
-    # Time integration
-    current_time = 0.0
-    while current_time < target_time:
-        # LAX update (same as in fast algorithm)
-        rho1 = (1/4)*(np.roll(rho0, -1, axis=0) + np.roll(rho0, 1, axis=0) +
-                      np.roll(rho0, -1, axis=1) + np.roll(rho0, 1, axis=1)) - \
-               (mux*(np.roll(rho0,-1,axis=0)*np.roll(vx0,-1,axis=0) - 
-                     np.roll(rho0,1, axis=0)*np.roll(vx0,1,axis=0))) - \
-               (muy*(np.roll(rho0,-1,axis=1)*np.roll(vy0,-1,axis=1) - 
-                     np.roll(rho0,1, axis=1)*np.roll(vy0,1,axis=1)))
-        
-        if gravity:
-            Px1 = 0.25*(np.roll(Px0,-1,axis=0) + np.roll(Px0,1,axis=0) + 
-                        np.roll(Px0,-1,axis=1) + np.roll(Px0,1,axis=1)) - \
-                  (mux*(np.roll(Px0,-1,axis=0)*np.roll(vx0,-1,axis=0) - 
-                        np.roll(Px0,1,axis=0)*np.roll(vx0,1,axis=0))) - \
-                  (muy*(np.roll(Px0,-1,axis=1)*np.roll(vy0,-1,axis=1) - 
-                        np.roll(Px0,1,axis=1)*np.roll(vy0,1,axis=1))) - \
-                  ((cs**2)*mux*(np.roll(rho0,-1,axis=0) - np.roll(rho0,1,axis=0))) - \
-                  (mux*rho0*(np.roll(phi0,-1,axis=0) - np.roll(phi0,1,axis=0)))
-            
-            Py1 = 0.25*(np.roll(Py0,-1,axis=0) + np.roll(Py0,1,axis=0) + 
-                        np.roll(Py0,-1,axis=1) + np.roll(Py0,1,axis=1)) - \
-                  (muy*(np.roll(Py0,-1,axis=1)*np.roll(vy0,-1,axis=1) - 
-                        np.roll(Py0,1,axis=1)*np.roll(vy0,1,axis=1))) - \
-                  (mux*(np.roll(Py0,-1,axis=0)*np.roll(vx0,-1,axis=0) - 
-                        np.roll(Py0,1,axis=0)*np.roll(vx0,1,axis=0))) - \
-                  ((cs**2)*muy*(np.roll(rho0,-1,axis=1) - np.roll(rho0,1,axis=1))) - \
-                  (muy*rho0*(np.roll(phi0,-1,axis=1) - np.roll(phi0,1,axis=1)))
-            
-            phi1 = fft_solver(const*(rho1-rho_o), Lx, Nx, Ly, Ny, dim=2)
-        
-        vx1 = Px1/rho1
-        vy1 = Py1/rho1
-        
-        # Update for next iteration
-        rho0, vx0, vy0, Px0, Py0, phi0 = rho1, vx1, vy1, Px1, Py1, phi1
-        
-        # Adaptive time step
-        dt1 = nu*dx/np.max([abs(vx1), abs(vy1)])
-        dt2 = nu*dx/cs
-        dt = np.min([dt1, dt2])
-        mux = dt/(2*dx)
-        muy = dt/(2*dy)
-        
-        current_time += dt
-        
-        # Check if we've reached the target time
-        if current_time >= target_time:
-            break
-    
-    return np.max(rho1)
 
 def main():
     """
@@ -656,26 +658,35 @@ def main():
     print("=" * 40)
     
     try:
-        # Run validation test if enabled
-        if run_validation:
-            validation_results = validate_fast_algorithm(
-                target_ratio=target_density_ratio,
-                test_times=validation_times
-            )
-        
         # First, find collapse time if enabled
         collapse_time = None
         velocity_field = None
         collapse_state = None
+        full_lax_results = None
+        
         if find_collapse_time:
-            collapse_time, velocity_field, collapse_state = find_collapse_time_fast(
-                target_ratio=target_density_ratio, 
-                max_time=max_search_time,
-                random_seed=random_seed
-            )
+            if collapse_method == "fast":
+                print(f"Using fast algorithm for collapse detection...")
+                collapse_time, velocity_field, collapse_state = find_collapse_time_fast(
+                    target_ratio=target_density_ratio, 
+                    max_time=max_search_time,
+                    random_seed=random_seed
+                )
+            elif collapse_method == "full_lax":
+                print(f"Using full LAX method for collapse detection...")
+                collapse_time, velocity_field, collapse_state, full_lax_results = find_collapse_time_full_lax(
+                    target_ratio=target_density_ratio, 
+                    max_time=max_search_time,
+                    random_seed=random_seed
+                )
+            else:
+                print(f"Unknown collapse method: {collapse_method}")
+                print("Available methods: 'fast', 'full_lax'")
+                return
         
         # Then generate analysis plots
-        generate_analysis_plots()
+        # Pass full_lax_results if using full_lax method for summary statistics
+        generate_analysis_plots(full_lax_results=full_lax_results)
         
         # Plot at collapse time if found
         if collapse_time is not None and collapse_state is not None:

@@ -9,6 +9,8 @@ from losses import ASTPN
 from model_architecture import PINN
 from Plotting_2D import create_2d_animation
 from Plotting_2D import create_1d_cross_sections_sinusoidal
+from Plotting_2D import create_density_growth_plot
+from config import PLOT_DENSITY_GROWTH, GROWTH_PLOT_TMAX, GROWTH_PLOT_DT
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -93,6 +95,15 @@ anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=1
 if str(PERTURBATION_TYPE).lower() == "sinusoidal":
     # Use config.TIMES_1D when time_points is None
     create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
+
+# Optional density growth comparison plot (PINN vs LAX)
+if PLOT_DENSITY_GROWTH:
+    try:
+        tmax_growth = float(GROWTH_PLOT_TMAX)
+    except Exception:
+        tmax_growth = float(TMAX_CFG)
+    dt_growth = float(GROWTH_PLOT_DT)
+    create_density_growth_plot(net, initial_params, tmax=tmax_growth, dt=dt_growth)
 
 # Always save the trained model to SNAPSHOT_DIR/GRINN
 try:

@@ -389,20 +389,17 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
 
     if model.dimension == 1:
         # time is at index 1
-        if not is_sin:
-            colloc_shifted[1] = colloc_shifted[1] + startup_dt
+        # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
         rho_r,vx_r,phi_r = pde_residue(colloc_shifted, net, dimension = 1)
 
     elif model.dimension == 2:
         # time is at index 2
-        if not is_sin:
-            colloc_shifted[2] = colloc_shifted[2] + startup_dt
+        # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
         rho_r,vx_r,vy_r,phi_r = pde_residue(colloc_shifted, net, dimension = 2)
 
     elif model.dimension == 3:
         # time is at index 3
-        if not is_sin:
-            colloc_shifted[3] = colloc_shifted[3] + startup_dt
+        # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
         rho_r,vx_r,vy_r,vz_r,phi_r = pde_residue(colloc_shifted, net, dimension = 3)
     
 
@@ -608,16 +605,13 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         else:
             colloc_shifted = batch_dom
         if model.dimension == 1:
-            if not is_sin:
-                colloc_shifted[1] = colloc_shifted[1] + startup_dt
+            # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
             rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
         elif model.dimension == 2:
-            if not is_sin:
-                colloc_shifted[2] = colloc_shifted[2] + startup_dt
+            # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
             rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
         else:
-            if not is_sin:
-                colloc_shifted[3] = colloc_shifted[3] + startup_dt
+            # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
             rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
 
         mse_rho  = torch.mean(rho_r ** 2)

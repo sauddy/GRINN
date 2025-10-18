@@ -710,6 +710,117 @@ def create_all_plots(net, initial_params, include_growth=False,
     }
 
 
+def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
+    """
+    Create a PINN vs LAX density growth comparison plot.
+
+    Plots over time: (1) maximum density, (2) log(rho_max - rho_o + eps).
+
+    Args:
+        net: trained PINN model
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax_train)
+        tmax: maximum time to plot (independent of training tmax)
+        dt: temporal spacing (default 0.1)
+    """
+    xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax_train = initial_params
+    num_of_waves = (xmax - xmin) / lam
+
+    # Time grid (inclusive of tmax)
+    time_points = np.arange(0.0, float(tmax) + 1e-9, float(dt))
+
+    pinn_max_list = []
+    fd_max_list = []
+
+    # PINN grid sampling settings (match animation resolution)
+    Q = 100
+    xs = np.linspace(xmin, xmax, Q)
+    ys = np.linspace(ymin, ymax, Q)
+    TAU, PHI = np.meshgrid(xs, ys)
+    Xgrid = np.vstack([TAU.flatten(), PHI.flatten()]).T
+
+    for idx, t in enumerate(time_points):
+        # PINN evaluation on QxQ grid
+        t_vec = t * np.ones(Q**2).reshape(Q**2, 1)
+        pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_t = Variable(torch.from_numpy(t_vec).float(), requires_grad=True).to(device)
+        out = net([pt_x, pt_y, pt_t])
+        rho_pinn = out[:, 0].data.cpu().numpy().reshape(Q, Q)
+        pinn_max_list.append(np.max(rho_pinn))
+
+        # LAX/FD evaluation; use shared velocity fields when available
+        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+            if _shared_vx_np is not None and _shared_vy_np is not None:
+                # Use the native resolution of the shared velocity fields to avoid shape mismatch
+                n_fd_use = int(_shared_vx_np.shape[0])
+                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
+                    t, n_fd_use, 0.5, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                    gravity=True, isplot=False, comparison=False, animation=True
+                )
+            else:
+                # Fallback: when shared fields absent, still use N_GRID for power spectrum LAX
+                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                    t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
+                )
+        else:
+            # Sinusoidal case (keep defaults)
+            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                use_velocity_ps=False
+            )
+
+        fd_max_list.append(np.max(rho_fd))
+
+    # Build figure with two subplots
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # (1) Max density vs time
+    axes[0].plot(time_points, fd_max_list, label="LAX", color='k', linewidth=2)
+    axes[0].plot(time_points, pinn_max_list, label="PINN", color='c', linewidth=2)
+    axes[0].set_xlabel("t")
+    axes[0].set_ylabel(r"$\rho_{\max}$")
+    axes[0].set_title("Maximum Density vs Time")
+    axes[0].grid(True)
+    axes[0].legend()
+    # Annotate parameters on the plot
+    try:
+        param_str = f"a={a}, power_index={POWER_EXPONENT}"
+        axes[0].text(0.02, 0.95, param_str, transform=axes[0].transAxes,
+                     fontsize=9, va='top', bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='gray', alpha=0.6))
+    except Exception:
+        pass
+
+    # (2) log growth vs time
+    eps = 1e-12
+    axes[1].plot(time_points, np.log(np.maximum(np.array(fd_max_list) - rho_o, 0.0) + eps), label="LAX", color='k', linewidth=2)
+    axes[1].plot(time_points, np.log(np.maximum(np.array(pinn_max_list) - rho_o, 0.0) + eps), label="PINN", color='c', linewidth=2)
+    axes[1].set_xlabel("t")
+    axes[1].set_ylabel(r"$\log(\rho_{\max} - \rho_0)$")
+    axes[1].set_title("Density Growth (log)")
+    axes[1].grid(True)
+    axes[1].legend()
+    # Mirror annotation on second axis
+    try:
+        param_str = f"a={a}, power_index={POWER_EXPONENT}"
+        axes[1].text(0.02, 0.95, param_str, transform=axes[1].transAxes,
+                     fontsize=9, va='top', bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='gray', alpha=0.6))
+    except Exception:
+        pass
+
+    plt.tight_layout()
+
+    # Save figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "density_growth_comparison.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved density growth comparison plot to {save_path}")
+
+    plt.show()
+
+    return fig, axes
+
+
 def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=1000, nu_fd=0.5):
     """
     Create 1D cross-section plots at fixed y for sinusoidal perturbations, comparing
@@ -894,11 +1005,17 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="
     # Domain properties for LAX_2D (Lx = Ly and Nx = Ny in solver)
     num_of_waves = (xmax - xmin) / lam
 
+    # Decide grid resolution policy: use N_GRID for power spectrum; FD_N_2D for sinusoidal when N is None
+    if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+        N_use = N_GRID
+    else:
+        N_use = FD_N_2D if N is None else N
+
     # Run LAX solver (finite difference) with self-gravity enabled to obtain 2D fields
     # Returns (gravity=True, comparison=False, animation=True):
     #   x (Nx,), rho (Nx,Ny), vx (Nx,Ny), vy (Nx,Ny), phi (Nx,Ny), n, rho_max
     x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-        time, FD_N_2D if N is None else N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+        time, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
         use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
     )
 
@@ -961,7 +1078,12 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
     for i, t in enumerate(time_points):
         if i < len(axes):
             print(f"FD plotting at t = {t}")
-            Two_D_surface_plots_FD(t, initial_params, N=N, nu=nu, ax=axes[i], which=which,
+            # Enforce grid policy: use N_GRID for power spectrum; else pass through N
+            if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                N_call = N_GRID
+            else:
+                N_call = N
+            Two_D_surface_plots_FD(t, initial_params, N=N_call, nu=nu, ax=axes[i], which=which,
                                    use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed)
 
     if len(time_points) < len(axes):
