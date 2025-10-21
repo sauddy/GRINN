@@ -83,7 +83,7 @@ def get_interfaces(nx_sub, ny_sub):
         List of tuples (subdomain_i, subdomain_j, interface_type, position_idx)
         where:
         - subdomain_i, subdomain_j: indices of adjacent subdomains
-        - interface_type: 'vertical' (constant x) or 'horizontal' (constant y)
+        - interface_type: 'vertical', 'horizontal', 'periodic_vertical', or 'periodic_horizontal'
         - position_idx: which vertical/horizontal line (for position calculation)
     """
     interfaces = []
@@ -101,6 +101,19 @@ def get_interfaces(nx_sub, ny_sub):
             subdomain_bottom = i * ny_sub + j
             subdomain_top = i * ny_sub + (j + 1)
             interfaces.append((subdomain_bottom, subdomain_top, 'horizontal', j + 1))
+    
+    # Periodic wrap-around interfaces (enforce periodic BC across domain boundaries)
+    # Vertical wrap-around: right edge ↔ left edge (at x=xmax ↔ x=xmin)
+    for j in range(ny_sub):  # For each y-slice
+        subdomain_left = 0 * ny_sub + j              # Leftmost column (i=0)
+        subdomain_right = (nx_sub - 1) * ny_sub + j  # Rightmost column (i=nx_sub-1)
+        interfaces.append((subdomain_right, subdomain_left, 'periodic_vertical', nx_sub))
+    
+    # Horizontal wrap-around: top edge ↔ bottom edge (at y=ymax ↔ y=ymin)
+    for i in range(nx_sub):  # For each x-slice
+        subdomain_bottom = i * ny_sub + 0              # Bottom row (j=0)
+        subdomain_top = i * ny_sub + (ny_sub - 1)      # Top row (j=ny_sub-1)
+        interfaces.append((subdomain_top, subdomain_bottom, 'periodic_horizontal', ny_sub))
     
     return interfaces
 
@@ -128,14 +141,17 @@ def generate_interface_points(interface_info, xmin, xmax, ymin, ymax,
     n_spatial = max(int(np.sqrt(n_points)), 1)
     n_temporal = max(n_points // n_spatial, 1)
     
-    if interface_type == 'vertical':
+    if interface_type in ('vertical', 'periodic_vertical'):
         # Constant x interface
-        dx = (xmax - xmin) / (position_idx + 1 - 1)  # This will be recalculated properly
-        # Get x position from interface position
-        # Vertical interface position_idx means between x-slice (position_idx-1) and position_idx
         from config import NUM_SUBDOMAINS_X
         dx = (xmax - xmin) / NUM_SUBDOMAINS_X
-        x_interface = xmin + position_idx * dx
+        
+        if interface_type == 'periodic_vertical':
+            # Periodic wrap-around: sample at x=xmax (which is equivalent to x=xmin due to periodic BC)
+            x_interface = xmax
+        else:
+            # Interior vertical interface
+            x_interface = xmin + position_idx * dx
         
         # Sample along y and t
         y_vals = torch.empty(n_spatial, 1, device=device, dtype=torch.float32).uniform_(ymin, ymax).requires_grad_()
@@ -146,11 +162,17 @@ def generate_interface_points(interface_info, xmin, xmax, ymin, ymax,
         t_grid = t_vals.repeat_interleave(n_spatial, dim=0)
         x_grid = torch.full_like(y_grid, x_interface).requires_grad_()
         
-    else:  # 'horizontal'
+    else:  # 'horizontal' or 'periodic_horizontal'
         # Constant y interface
         from config import NUM_SUBDOMAINS_Y
         dy = (ymax - ymin) / NUM_SUBDOMAINS_Y
-        y_interface = ymin + position_idx * dy
+        
+        if interface_type == 'periodic_horizontal':
+            # Periodic wrap-around: sample at y=ymax (which is equivalent to y=ymin due to periodic BC)
+            y_interface = ymax
+        else:
+            # Interior horizontal interface
+            y_interface = ymin + position_idx * dy
         
         # Sample along x and t
         x_vals = torch.empty(n_spatial, 1, device=device, dtype=torch.float32).uniform_(xmin, xmax).requires_grad_()

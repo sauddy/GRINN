@@ -33,7 +33,7 @@ def get_activation(activation_type):
         raise ValueError(f"Unknown activation type: {activation_type}. Choose from 'sin', 'tanh', 'relu', 'elu'.")
 
 class PINN(nn.Module):
-    def __init__(self, num_neurons=num_neurons, n_harmonics=1, activation_type=DEFAULT_ACTIVATION):
+    def __init__(self, num_neurons=num_neurons, num_layers=num_layers, n_harmonics=1, activation_type=DEFAULT_ACTIVATION):
         super(PINN, self).__init__()
         self.num_neurons = num_neurons
         self.n_harmonics = n_harmonics

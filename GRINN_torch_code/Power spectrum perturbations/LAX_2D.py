@@ -14,6 +14,8 @@ import scipy
 from numpy.fft import fft, ifft,fft2, ifft2
 from scipy import signal
 
+from config import RANDOM_SEED
+
 # Import wave vector components and physical constants for 2D sinusoidal perturbations
 try:
     from config import KX, KY, cs, rho_o, const, G
@@ -26,7 +28,7 @@ except ImportError:
     const = 1.0
     G = 1.0
 
-np.random.seed(1234)
+np.random.seed(RANDOM_SEED)
 #tf.random.set_seed(1234)
 
 def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amplitude=0.02, random_seed=None):
@@ -61,12 +63,14 @@ def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amp
     vy0 = synthesize_component()
     return vx0, vy0
 
-def generate_shared_velocity_field(nx, ny, Lx, Ly, power_index=-4.0, amplitude=0.01, random_seed=1234):
+def generate_shared_velocity_field(nx, ny, Lx, Ly, power_index=-4.0, amplitude=0.01, random_seed=None):
     """
     Generate shared velocity field for both PINN and FD to ensure identical initial conditions.
     This function creates the velocity field once and returns both numpy arrays (for FD) 
     and interpolation functions (for PINN).
     """
+    if random_seed is None:
+        random_seed = RANDOM_SEED
     # Generate the velocity field using the FD method
     vx_np, vy_np = generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index, amplitude, random_seed)
     

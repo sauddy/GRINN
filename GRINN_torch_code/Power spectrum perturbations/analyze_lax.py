@@ -19,6 +19,7 @@ from functools import partial
 import time
 from tqdm import tqdm
 from LAX_2D import lax_solution, generate_velocity_field_power_spectrum
+from config import RANDOM_SEED
 
 # =============================================================================
 # CONFIGURATION SECTION - MODIFY THESE PARAMETERS FOR ANALYSIS
@@ -41,7 +42,7 @@ a = 0.01                   # Amplitude parameter (same as in config.py)
 # Power Spectrum Parameters
 power_index = 0         # Power spectrum exponent (e.g., -3.0, -4.0)
 vel_rms = a * cs          # RMS velocity amplitude (consistent with train.py)
-random_seed = 1234         # Seed for reproducibility
+random_seed = RANDOM_SEED         # Seed for reproducibility
 
 # Output Settings
 output_dir = "lax_analysis_output"  # Directory to save plots
@@ -207,14 +208,14 @@ def create_2d_surface_plot(x, y, field, title, cmap='viridis',
     plt.tight_layout()
     return fig, ax
 
-def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234):
+def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=None):
     """
     Fast algorithm to find collapse time by integrating directly in LAX solver.
     
     Args:
         target_ratio: Target density ratio (default: 100.0)
         max_time: Maximum time to search (default: 10.0)
-        random_seed: Random seed for reproducibility
+        random_seed: Random seed for reproducibility (default: RANDOM_SEED)
     
     Returns:
         collapse_time: Time when target ratio is reached, or None if not reached
@@ -223,6 +224,9 @@ def find_collapse_time_fast(target_ratio=100.0, max_time=10.0, random_seed=1234)
     """
     print(f"Fast search for collapse time (density ratio = {target_ratio}x)...")
     print(f"Searching from t=0 to t={max_time}")
+    
+    if random_seed is None:
+        random_seed = RANDOM_SEED
     
     target_density = target_ratio * rho_o
     
@@ -398,7 +402,7 @@ def run_lax_for_time_parallel(args):
         print(f"Error at t={time_point}: {e}")
         return time_point, 0.0, None
 
-def find_collapse_time_full_lax(target_ratio=100.0, max_time=10.0, random_seed=1234):
+def find_collapse_time_full_lax(target_ratio=100.0, max_time=10.0, random_seed=None):
     """
     Find collapse time using full LAX solver with parallel processing.
     
@@ -408,12 +412,14 @@ def find_collapse_time_full_lax(target_ratio=100.0, max_time=10.0, random_seed=1
     Args:
         target_ratio: Target density ratio (times initial density)
         max_time: Maximum time to search
-        random_seed: Random seed for reproducibility
+        random_seed: Random seed for reproducibility (default: RANDOM_SEED)
     
     Returns:
         collapse_time, initial_velocity_field, collapse_state, results
         where results is a list of (time_point, max_density, state) tuples
     """
+    if random_seed is None:
+        random_seed = RANDOM_SEED
     print(f"Full LAX search for collapse time (density ratio = {target_ratio}x)...")
     print(f"Searching from t=0 to t={max_time}")
     

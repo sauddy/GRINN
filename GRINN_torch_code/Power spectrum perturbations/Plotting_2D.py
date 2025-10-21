@@ -9,7 +9,7 @@ import os
 from LAX_2D import lax_solution, lax_solution_with_shared_velocity
 from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
-from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING
+from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED
 
 # Global variable to store shared velocity fields for plotting
 _shared_vx_np = None
@@ -20,6 +20,21 @@ def set_shared_velocity_fields(vx_np, vy_np):
     global _shared_vx_np, _shared_vy_np
     _shared_vx_np = vx_np
     _shared_vy_np = vy_np
+
+def get_fd_default_params():
+    """
+    Get default FD parameters that match PINN training configuration.
+    This ensures consistency between PINN and FD initial conditions.
+    
+    Returns:
+        dict with keys: use_velocity_ps, ps_index, vel_rms, random_seed
+    """
+    return {
+        'use_velocity_ps': (str(PERTURBATION_TYPE).lower() == "power_spectrum"),
+        'ps_index': POWER_EXPONENT,
+        'vel_rms': a * cs,
+        'random_seed': RANDOM_SEED
+    }
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -70,7 +85,17 @@ def predict_xpinn(nets, x, y, t, xmin, xmax, ymin, ymax):
             x_sub = x[mask]
             y_sub = y[mask]
             t_sub = t[mask]
+            
+            # Move data to network's device
+            net_device = next(nets[i].parameters()).device
+            x_sub = x_sub.to(net_device)
+            y_sub = y_sub.to(net_device)
+            t_sub = t_sub.to(net_device)
+            
             pred_sub = nets[i]([x_sub, y_sub, t_sub])
+            
+            # Move prediction back to output device
+            pred_sub = pred_sub.to(device)
             
             # For simple mean averaging (default)
             if INTERFACE_AVERAGING == 'mean':
@@ -832,7 +857,7 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
 
 
 def create_all_plots(net, initial_params, include_growth=False,
-                     fd_use_velocity_ps=True, fd_ps_index=-3.0, fd_vel_rms=0.02, fd_random_seed=None):
+                     fd_use_velocity_ps=None, fd_ps_index=None, fd_vel_rms=None, fd_random_seed=None):
     """
     Create only 2D surface plot grids (density and velocity). Optionally create FD grids and return figures.
 
@@ -840,6 +865,10 @@ def create_all_plots(net, initial_params, include_growth=False,
         net: Trained neural network
         initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
         include_growth: Unused now; kept for API compatibility.
+        fd_use_velocity_ps: Override for FD velocity power spectrum flag (defaults to config)
+        fd_ps_index: Override for FD power spectrum index (defaults to POWER_EXPONENT)
+        fd_vel_rms: Override for FD velocity RMS (defaults to a*cs)
+        fd_random_seed: Override for FD random seed (defaults to 1234)
     Returns:
         dict with figures/axes: {"pinn_density": (fig, axes), "pinn_velocity": (fig, axes),
                                  "fd_density": (fig, axes), "fd_velocity": (fig, axes)}
@@ -847,6 +876,16 @@ def create_all_plots(net, initial_params, include_growth=False,
     print("="*60)
     print("CREATING GRID VISUALIZATION PLOTS")
     print("="*60)
+    
+    # Use config defaults if not overridden to ensure consistency with PINN training
+    if fd_use_velocity_ps is None:
+        fd_use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if fd_ps_index is None:
+        fd_ps_index = POWER_EXPONENT
+    if fd_vel_rms is None:
+        fd_vel_rms = a * cs
+    if fd_random_seed is None:
+        fd_random_seed = RANDOM_SEED
 
     # 1. PINN density grid
     fig_den, axes_den = create_2d_surface_plots(net, initial_params, which="density")
@@ -854,12 +893,12 @@ def create_all_plots(net, initial_params, include_growth=False,
     # 2. PINN velocity grid
     fig_vel, axes_vel = create_2d_surface_plots(net, initial_params, which="velocity")
 
-    # 3. FD density grid
+    # 3. FD density grid - now uses consistent parameters with PINN training
     fig_fd_den, axes_fd_den = create_2d_surface_plots_FD(initial_params, which="density",
                                                          use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
                                                          vel_rms=fd_vel_rms, random_seed=fd_random_seed)
 
-    # 4. FD velocity grid
+    # 4. FD velocity grid - now uses consistent parameters with PINN training
     fig_fd_vel, axes_fd_vel = create_2d_surface_plots_FD(initial_params, which="velocity",
                                                          use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
                                                          vel_rms=fd_vel_rms, random_seed=fd_random_seed)
@@ -892,6 +931,14 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
         dt: temporal spacing (default 0.1)
     """
     xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax_train = initial_params
+    
+    # Handle both single network and list of networks (XPINN)
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
     num_of_waves = (xmax - xmin) / lam
 
     # Time grid (inclusive of tmax)
@@ -933,7 +980,7 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
                 # Fallback: when shared fields absent, still use N_GRID for power spectrum LAX
                 x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
                     t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
+                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
                 )
         else:
             # Sinusoidal case (keep defaults)
@@ -1160,7 +1207,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
 
 
 def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="density",
-                           use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None):
+                           use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
     """
     Create 2D surface plots with velocity vectors using the Finite Difference (LAX) solver
 
@@ -1171,11 +1218,25 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="
         nu: Courant number for LAX solver
         ax: Optional matplotlib axis to plot on
         which: "density" or "velocity"
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config)
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT)
+        vel_rms: Velocity RMS amplitude (defaults to a*cs)
+        random_seed: Random seed (defaults to 1234)
 
     Returns:
         The QuadMesh object from pcolormesh
     """
     xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax = initial_params
+
+    # Use config defaults if not specified to ensure consistency with PINN training
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
 
     # Domain properties for LAX_2D (Lx = Ly and Nx = Ny in solver)
     num_of_waves = (xmax - xmin) / lam
@@ -1187,12 +1248,23 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="
         N_use = FD_N_2D if N is None else N
 
     # Run LAX solver (finite difference) with self-gravity enabled to obtain 2D fields
+    # Prefer using the exact shared velocity fields (if available) to ensure identical realization
+    # across PINN ICs and all FD visualizations.
     # Returns (gravity=True, comparison=False, animation=True):
     #   x (Nx,), rho (Nx,Ny), vx (Nx,Ny), vy (Nx,Ny), phi (Nx,Ny), n, rho_max
-    x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-        time, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
-    )
+    if (str(PERTURBATION_TYPE).lower() == "power_spectrum" \
+        and _shared_vx_np is not None and _shared_vy_np is not None):
+        # Use native resolution of shared fields to avoid resampling artifacts
+        n_fd_use = int(_shared_vx_np.shape[0])
+        x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
+            time, n_fd_use, nu, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+            gravity=True, isplot=False, comparison=False, animation=True
+        )
+    else:
+        x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+            time, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+            use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+        )
 
     # Build y-array consistent with solver setup (square domain with same resolution)
     Lx = lam * num_of_waves
@@ -1231,7 +1303,7 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="
 
 
 def create_2d_surface_plots_FD(initial_params, time_points=None, which="density", N=200, nu=0.5,
-                               use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None):
+                               use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
     """
     Create 2D surface plots at multiple time points using the LAX FD solver
 
@@ -1241,9 +1313,23 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
         which: "density" or "velocity"
         N: grid size
         nu: Courant number
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config)
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT)
+        vel_rms: Velocity RMS amplitude (defaults to a*cs)
+        random_seed: Random seed (defaults to 1234)
     """
     if time_points is None:
         time_points = [0.0, 0.5, 1.0, 1.5, 2.0]
+
+    # Use config defaults if not specified to ensure consistency with PINN training
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
 
     print("Creating 2D FD surface plots...")
 
@@ -1277,7 +1363,7 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
 
 
 def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=0.5,
-                                use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02, random_seed=None):
+                                use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
     """
     Create 5x3 comparison table showing PINN, FD, and epsilon metric at 5 time snapshots
     
@@ -1287,12 +1373,22 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         which: "density" or "velocity"
         N: Grid resolution for LAX solver
         nu: Courant number for LAX solver
-        use_velocity_ps: Whether to use velocity power spectrum for FD
-        ps_index: Power spectrum index for FD
-        vel_rms: Velocity RMS for FD
-        random_seed: Random seed for FD
+        use_velocity_ps: Whether to use velocity power spectrum for FD (defaults to config)
+        ps_index: Power spectrum index for FD (defaults to POWER_EXPONENT)
+        vel_rms: Velocity RMS for FD (defaults to a*cs)
+        random_seed: Random seed for FD (defaults to 1234)
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Use config defaults if not specified to ensure consistency with PINN training
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
     
     # Handle both single network and list of networks
     if isinstance(net, list):
@@ -1367,7 +1463,7 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
                 # Fallback to original method
                 x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
                     t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=1234
+                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
                 )
             # Debug: Check FD density range (commented out to reduce output noise)
             # print(f"  FD {which} range: [{np.min(rho_fd):.6f}, {np.max(rho_fd):.6f}], std: {np.std(rho_fd):.6f}")

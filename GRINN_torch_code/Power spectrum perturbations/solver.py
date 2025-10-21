@@ -6,7 +6,7 @@ from torch.autograd import Variable
 from losses import ASTPN, pde_residue
 from data_generator import diff
 from model_architecture import PINN
-from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES
+from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
 
 def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     lam = float(lam)  # Wavelength
@@ -43,12 +43,19 @@ def req_consts_calc(lam, rho_1):
 _shared_vx_interp = None
 _shared_vy_interp = None
 
-def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=1234):
+def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
     """
     Initialize shared velocity fields for consistent PINN/FD initial conditions.
     This should be called once at the beginning of training.
+    
+    IMPORTANT: The parameters used here (POWER_EXPONENT, v_1=a*cs, seed) MUST match
+    the parameters used in FD plotting functions to ensure identical initial conditions.
+    All FD visualization functions should use the same defaults.
     """
     global _shared_vx_interp, _shared_vy_interp
+    
+    if seed is None:
+        seed = RANDOM_SEED
     
     # Import LAX_2D functions
     from LAX_2D import generate_shared_velocity_field
@@ -71,8 +78,11 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=1234):
     
     return vx_np, vy_np
 
-def generate_power_spectrum_field(lam, v_1, x, seed=1234):
+def generate_power_spectrum_field(lam, v_1, x, seed=None):
     '''Generate 2D Gaussian random field with power spectrum using shared fields if available'''
+    
+    if seed is None:
+        seed = RANDOM_SEED
     
     # Use shared velocity fields if available
     if _shared_vx_interp is not None and _shared_vy_interp is not None:
@@ -217,8 +227,11 @@ def fun_rho_0(rho_1, lam, x):
         else:
             return rho_0
 
-def generate_power_spectrum_field_vy(lam, v_1, x, seed=5678):
+def generate_power_spectrum_field_vy(lam, v_1, x, seed=None):
     '''Generate vy component using shared fields if available'''
+    
+    if seed is None:
+        seed = RANDOM_SEED
     
     # Use shared velocity fields if available
     if _shared_vx_interp is not None and _shared_vy_interp is not None:
@@ -254,7 +267,7 @@ def fun_vx_0(lam, jeans, v_1, x):
         else:  # 1D case
             return _sinusoidal_component(x[0], lam, jeans, v_1)
     else:
-        return generate_power_spectrum_field(lam, v_1, x, seed=1234)
+        return generate_power_spectrum_field(lam, v_1, x, seed=RANDOM_SEED)
 
 def fun_vy_0(lam, jeans, v_1, x):
     '''initial condition for y-velocity -- branch by PERTURBATION_TYPE'''
@@ -267,7 +280,7 @@ def fun_vy_0(lam, jeans, v_1, x):
             # fallback to x if y is unavailable (1D)
             return _sinusoidal_component(x[0], lam, jeans, v_1)
     else:
-        return generate_power_spectrum_field_vy(lam, v_1, x, seed=5678)
+        return generate_power_spectrum_field_vy(lam, v_1, x, seed=RANDOM_SEED)
 
 def func(x):
     return x[0]*0
@@ -389,17 +402,17 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
 
     if model.dimension == 1:
         # time is at index 1
-        # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
+        # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
         rho_r,vx_r,phi_r = pde_residue(colloc_shifted, net, dimension = 1)
 
     elif model.dimension == 2:
         # time is at index 2
-        # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
+        # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
         rho_r,vx_r,vy_r,phi_r = pde_residue(colloc_shifted, net, dimension = 2)
 
     elif model.dimension == 3:
         # time is at index 3
-        # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
+        # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
         rho_r,vx_r,vy_r,vz_r,phi_r = pde_residue(colloc_shifted, net, dimension = 3)
     
 
@@ -436,7 +449,39 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     optimizer.zero_grad()
     loss.backward(retain_graph=True)
     
-    return loss
+    # Create loss breakdown dictionary
+    loss_breakdown = {}
+    
+    # IC losses (grouped together)
+    ic_loss = mse_vx_ic.item()
+    if isinstance(mse_rho_ic, torch.Tensor) and mse_rho_ic.item() > 0:
+        ic_loss += mse_rho_ic.item()
+    
+    if model.dimension == 2:
+        ic_loss += mse_vy_ic.item()
+    elif model.dimension == 3:
+        ic_loss += mse_vy_ic.item()
+        ic_loss += mse_vz_ic.item()
+    
+    loss_breakdown['IC'] = ic_loss
+    
+    # Continuity loss
+    if continuity_weight > 0 and continuity_ic_loss.item() > 0:
+        loss_breakdown['Continuity'] = (continuity_weight * continuity_ic_loss).item()
+    
+    # PDE losses (grouped together)
+    pde_loss = mse_rho.item() + mse_velx.item()
+    
+    if model.dimension == 2:
+        pde_loss += mse_vely.item()
+    elif model.dimension == 3:
+        pde_loss += mse_vely.item()
+        pde_loss += mse_velz.item()
+    
+    pde_loss += mse_phi.item()
+    loss_breakdown['PDE'] = pde_loss
+    
+    return loss, loss_breakdown
 
 def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device):
     # Batched training is the default
@@ -459,11 +504,15 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb))
 
         with torch.autograd.no_grad():
             if i % 100 == 0:
                 print(f"Training Loss at {i} for Adam (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
+                # Print loss breakdown
+                breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
+                if breakdown_str:
+                    print(f"  Loss breakdown: {breakdown_str}", flush=True)
 
     for i in range(iterationL):
         optimizer.zero_grad()
@@ -471,11 +520,25 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss = optimizerL.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb))
+        # L-BFGS expects a closure that returns only scalar loss
+        # Store loss_breakdown in a list so we can access it after the step
+        loss_breakdown_holder = [None]
+        
+        def lbfgs_closure():
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb)
+            loss_breakdown_holder[0] = loss_breakdown
+            return loss
+        
+        loss = optimizerL.step(lbfgs_closure)
+        loss_breakdown = loss_breakdown_holder[0]
 
         with torch.autograd.no_grad():
-            if i % 50 == 0:
+            if i % 40 == 0:
                 print(f"Training Loss at {i} for LBGFS (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
+                # Print loss breakdown
+                breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
+                if breakdown_str:
+                    print(f"  Loss breakdown: {breakdown_str}", flush=True)
 
 
 def _random_batch_indices(total_count, batch_size, device):
@@ -484,7 +547,8 @@ def _random_batch_indices(total_count, batch_size, device):
 
 
 def _make_batch_tensors(tensors_list, indices):
-    return [t[indices].clone() for t in tensors_list]
+    """Create batch tensors by indexing. No cloning for speed."""
+    return [t[indices] for t in tensors_list]
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
@@ -639,7 +703,42 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     optimizer.zero_grad()
     avg_loss = total_loss / max(1, num_effective_batches)
     avg_loss.backward(retain_graph=True)
-    return avg_loss
+    
+    # Create loss breakdown dictionary (averaged across batches)
+    loss_breakdown = {}
+    
+    # For batched version, we need to compute breakdown from the last batch
+    # This is an approximation since we can't easily track individual terms across batches
+    # IC losses (grouped together)
+    ic_loss = mse_vx_ic.item()
+    if isinstance(mse_rho_ic, torch.Tensor) and mse_rho_ic.item() > 0:
+        ic_loss += mse_rho_ic.item()
+    
+    if model.dimension == 2:
+        ic_loss += mse_vy_ic.item()
+    elif model.dimension == 3:
+        ic_loss += mse_vy_ic.item()
+        ic_loss += mse_vz_ic.item()
+    
+    loss_breakdown['IC'] = ic_loss
+    
+    # Continuity loss
+    if continuity_weight > 0 and continuity_ic_loss.item() > 0:
+        loss_breakdown['Continuity'] = (continuity_weight * continuity_ic_loss).item()
+    
+    # PDE losses (grouped together)
+    pde_loss = mse_rho.item() + mse_velx.item()
+    
+    if model.dimension == 2:
+        pde_loss += mse_vely.item()
+    elif model.dimension == 3:
+        pde_loss += mse_vely.item()
+        pde_loss += mse_velz.item()
+    
+    pde_loss += mse_phi.item()
+    loss_breakdown['PDE'] = pde_loss
+    
+    return avg_loss, loss_breakdown
 
 
 def distribute_collocation_points(n_total, num_subdomains):
@@ -675,7 +774,7 @@ def distribute_collocation_points(n_total, num_subdomains):
 
 def closure_xpinn(xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
                    subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
-                   optimizer):
+                   optimizer, subdomain_devices=None, cached_ic_values=None):
     """
     Closure function for XPINN training with multiple networks.
     
@@ -689,28 +788,30 @@ def closure_xpinn(xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
         interfaces: List of interface tuples
         exterior_boundaries: Dict of exterior boundary info
         optimizer: Optimizer instance
+        subdomain_devices: List of devices per subdomain
+        cached_ic_values: Precomputed IC values
     
     Returns:
-        Total loss (scalar tensor)
+        Total loss (scalar tensor), loss_dict
     """
     optimizer.zero_grad()
     
-    # Compute total XPINN loss
+    # Compute total XPINN loss (passing cached IC if available)
     total_loss, loss_dict = xpinn_loss_model.compute_total_loss(
         nets, subdomain_collocs, interface_collocs,
         subdomain_ic_collocs, ic_functions, interfaces,
-        exterior_boundaries
+        exterior_boundaries, cached_ic_values
     )
     
     # Backward pass
     total_loss.backward(retain_graph=True)
     
-    return total_loss
+    return total_loss, loss_dict
 
 
 def closure_xpinn_batched(xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
                            subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
-                           optimizer, batch_size, num_batches):
+                           optimizer, batch_size, num_batches, subdomain_devices=None, cached_ic_values=None):
     """
     Batched closure function for XPINN training with multiple networks.
     Processes collocation points in mini-batches with gradient accumulation.
@@ -727,10 +828,16 @@ def closure_xpinn_batched(xpinn_loss_model, nets, subdomain_collocs, interface_c
         optimizer: Optimizer instance
         batch_size: Maximum points per mini-batch
         num_batches: Number of mini-batches to aggregate
+        subdomain_devices: List of devices per subdomain
+        cached_ic_values: Precomputed IC values
     
     Returns:
-        Total loss (scalar tensor)
+        Total loss (scalar tensor), loss_dict
     """
+    if subdomain_devices is None:
+        subdomain_devices = [subdomain_collocs[0][0].device] * len(nets)
+    if cached_ic_values is None:
+        cached_ic_values = [None] * len(nets)
     optimizer.zero_grad()
     
     # Aggregate losses across mini-batches
@@ -741,35 +848,52 @@ def closure_xpinn_batched(xpinn_loss_model, nets, subdomain_collocs, interface_c
     device = subdomain_collocs[0][0].device if len(subdomain_collocs) > 0 else 'cuda'
     
     for batch_idx in range(int(max(1, num_batches))):
-        # Create batched subdomain collocation points
+        # Create batched subdomain collocation points (on correct devices)
         batched_subdomain_collocs = []
-        for subdomain_colloc in subdomain_collocs:
+        for i, subdomain_colloc in enumerate(subdomain_collocs):
             dom_n = subdomain_colloc[0].size(0)
-            dom_idx = _random_batch_indices(dom_n, batch_size, device)
+            sub_device = subdomain_devices[i]
+            dom_idx = _random_batch_indices(dom_n, batch_size, sub_device)
             batch_dom = _make_batch_tensors(subdomain_colloc, dom_idx)
             batched_subdomain_collocs.append(batch_dom)
         
-        # Create batched subdomain IC points
+        # Create batched subdomain IC points and batched cached IC values
         batched_subdomain_ic_collocs = []
-        for subdomain_ic_colloc in subdomain_ic_collocs:
+        batched_cached_ic = []
+        for i, subdomain_ic_colloc in enumerate(subdomain_ic_collocs):
             ic_n = subdomain_ic_colloc[0].size(0)
-            ic_idx = _random_batch_indices(ic_n, batch_size, device)
+            sub_device = subdomain_devices[i]
+            ic_idx = _random_batch_indices(ic_n, batch_size, sub_device)
             batch_ic = _make_batch_tensors(subdomain_ic_colloc, ic_idx)
             batched_subdomain_ic_collocs.append(batch_ic)
+            
+            # Batch cached IC values if available
+            if cached_ic_values[i] is not None:
+                batched_ic_cache = {
+                    key: val[ic_idx] for key, val in cached_ic_values[i].items()
+                }
+                batched_cached_ic.append(batched_ic_cache)
+            else:
+                batched_cached_ic.append(None)
         
-        # Create batched interface collocation points
+        # Create batched interface collocation points (use device of first subdomain in pair)
         batched_interface_collocs = {}
         for interface_key, interface_colloc in interface_collocs.items():
             if_n = interface_colloc[0].size(0)
-            if_idx = _random_batch_indices(if_n, batch_size, device)
-            batch_if = _make_batch_tensors(interface_colloc, if_idx)
+            # Use device of first subdomain in the interface pair
+            sub_device = subdomain_devices[interface_key[0]]
+            if_idx = _random_batch_indices(if_n, batch_size, sub_device)
+            
+            # Move interface collocation points to the correct device before indexing
+            interface_colloc_on_device = [t.to(sub_device) for t in interface_colloc]
+            batch_if = _make_batch_tensors(interface_colloc_on_device, if_idx)
             batched_interface_collocs[interface_key] = batch_if
         
-        # Compute loss for this mini-batch
+        # Compute loss for this mini-batch (with cached IC if available)
         batch_loss, batch_loss_dict = xpinn_loss_model.compute_total_loss(
             nets, batched_subdomain_collocs, batched_interface_collocs,
             batched_subdomain_ic_collocs, ic_functions, interfaces,
-            exterior_boundaries
+            exterior_boundaries, batched_cached_ic
         )
         
         # Accumulate loss
@@ -783,12 +907,17 @@ def closure_xpinn_batched(xpinn_loss_model, nets, subdomain_collocs, interface_c
     # Backward pass
     total_loss.backward(retain_graph=True)
     
-    return total_loss
+    # For batched XPINN, we need to compute breakdown from the last batch
+    # This is an approximation since we can't easily track individual terms across batches
+    # Note: batch_loss_dict is already computed from the last batch iteration above
+    
+    return total_loss, batch_loss_dict
 
 
 def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs,
                 ic_functions, interfaces, exterior_boundaries, xpinn_loss_model,
-                optimizer, optimizerL, iteration_adam, iterationL, device):
+                optimizer, optimizerL, iteration_adam, iterationL, device,
+                subdomain_devices=None, cached_ic_values=None):
     """
     Train XPINN with multiple networks.
     
@@ -806,61 +935,282 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
         iteration_adam: Number of Adam iterations
         iterationL: Number of L-BFGS iterations
         device: PyTorch device
+        subdomain_devices: List of devices per subdomain (for multi-GPU)
+        cached_ic_values: Precomputed IC values (list of dicts per subdomain)
     
     Returns:
         None (trains networks in-place)
     """
+    # Set defaults
+    if subdomain_devices is None:
+        subdomain_devices = [device] * len(nets)
+    if cached_ic_values is None:
+        cached_ic_values = [None] * len(nets)
     from config import XPINN_ALTERNATING_TRAINING, USE_XPINN_BATCHING, BATCH_SIZE, NUM_BATCHES
     
-    print(f"Starting XPINN training with {len(nets)} subdomains...")
-    print(f"Interfaces: {len(interfaces)}")
-    print(f"Optimizer strategy: {'unified' if optimizer is not None else 'separate'}")
-    print(f"Batching: {'enabled' if USE_XPINN_BATCHING else 'disabled'}")
+    # Determine if we need per-subdomain optimizers (multi-GPU case)
+    use_per_subdomain_adam = (optimizer is None)
     
-    # Choose closure function based on batching setting
-    if USE_XPINN_BATCHING:
-        bs_global = int(BATCH_SIZE)
-        nb = int(NUM_BATCHES)
-        num_sub = len(nets)
-        bs = max(1, bs_global // max(1, num_sub))  # per-subdomain batch size
-        print(f"Batching: global={bs_global}, per_subdomain={bs}, num_subdomains={num_sub}, num_batches={nb}")
-        
-        def make_closure(opt):
-            return lambda: closure_xpinn_batched(
-                xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
-                subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
-                opt, bs, nb
-            )
+    if use_per_subdomain_adam:
+        # Multi-GPU: create separate Adam optimizer for each subdomain
+        print("Creating per-subdomain Adam optimizers for multi-GPU training...")
+        adam_optimizers = [torch.optim.Adam(net.parameters(), lr=0.001) for net in nets]
     else:
-        def make_closure(opt):
-            return lambda: closure_xpinn(
-                xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
-                subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
-                opt
-            )
+        # Single-GPU: use unified optimizer
+        adam_optimizers = None
+        
+        # Choose closure function based on batching setting
+        if USE_XPINN_BATCHING:
+            bs_global = int(BATCH_SIZE)
+            nb = int(NUM_BATCHES)
+            num_sub = len(nets)
+            bs = max(1, bs_global // max(1, num_sub))  # per-subdomain batch size
+            
+            def make_closure(opt):
+                return lambda: closure_xpinn_batched(
+                    xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
+                    subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
+                    opt, bs, nb, subdomain_devices, cached_ic_values
+                )
+        else:
+            def make_closure(opt):
+                return lambda: closure_xpinn(
+                    xpinn_loss_model, nets, subdomain_collocs, interface_collocs,
+                    subdomain_ic_collocs, ic_functions, interfaces, exterior_boundaries,
+                    opt, subdomain_devices, cached_ic_values
+                )
     
     # Adam training
     for i in range(iteration_adam):
-        if XPINN_ALTERNATING_TRAINING:
-            # Alternate between subdomains (not yet implemented - would need separate optimizers)
-            raise NotImplementedError("Alternating training not yet implemented")
+        if use_per_subdomain_adam:
+            # Per-subdomain Adam training (multi-GPU)
+            # Process each subdomain completely independently to avoid graph sharing issues
+            subdomain_losses = []
+            
+            # Track component losses across all subdomains
+            total_pde_loss = 0.0
+            total_ic_loss = 0.0
+            total_interface_sol_loss = 0.0
+            total_interface_res_loss = 0.0
+            
+            for sub_idx in range(len(nets)):
+                try:
+                    adam_optimizers[sub_idx].zero_grad()
+                    
+                    # Compute PDE and IC loss for this subdomain
+                    # Create fresh copies of collocation points to avoid graph reuse across iterations
+                    colloc_orig = subdomain_collocs[sub_idx]
+                    colloc_ic_orig = subdomain_ic_collocs[sub_idx]
+                    
+                    colloc = [t.clone().detach().requires_grad_(True) for t in colloc_orig]
+                    colloc_ic = [t.clone().detach().requires_grad_(False) for t in colloc_ic_orig]
+                    
+                    # Detach cached IC values to avoid graph reuse across iterations
+                    cached_ic = None
+                    if cached_ic_values and cached_ic_values[sub_idx] is not None:
+                        cached_ic = {
+                            key: val.detach() for key, val in cached_ic_values[sub_idx].items()
+                        }
+                    
+                    pde_loss = xpinn_loss_model.compute_pde_loss(colloc, nets[sub_idx])
+                    ic_loss = xpinn_loss_model.compute_ic_loss(colloc_ic, nets[sub_idx], ic_functions, cached_ic)
+                    
+                    total_loss = pde_loss + ic_loss
+                    
+                    # Track component losses
+                    total_pde_loss += pde_loss.item()
+                    total_ic_loss += ic_loss.item()
+                    
+                    # Accumulate all interface losses for this subdomain
+                    interface_sol_loss_sum = 0.0
+                    interface_res_loss_sum = 0.0
+                    for interface in interfaces:
+                        subdomain_i, subdomain_j, _, _ = interface
+                        interface_key = (subdomain_i, subdomain_j)
+                        
+                        # Only compute interface losses where this subdomain participates
+                        if sub_idx == subdomain_i or sub_idx == subdomain_j:
+                            if interface_key in interface_collocs:
+                                # Create fresh copies of interface collocation points to avoid graph sharing
+                                colloc_interface = interface_collocs[interface_key]
+                                colloc_interface_fresh = [t.clone().detach().requires_grad_(False) for t in colloc_interface]
+                                
+                                net1 = nets[subdomain_i]
+                                net2 = nets[subdomain_j]
+                                
+                                # Backprop only to current subdomain's network
+                                if sub_idx == subdomain_i:
+                                    sol_loss = xpinn_loss_model.compute_interface_solution_loss(
+                                        colloc_interface_fresh, net1, net2, grad_to='net1')
+                                    res_loss = xpinn_loss_model.compute_interface_residual_loss(
+                                        colloc_interface_fresh, net1, net2, grad_to='net1')
+                                else:  # sub_idx == subdomain_j
+                                    sol_loss = xpinn_loss_model.compute_interface_solution_loss(
+                                        colloc_interface_fresh, net1, net2, grad_to='net2')
+                                    res_loss = xpinn_loss_model.compute_interface_residual_loss(
+                                        colloc_interface_fresh, net1, net2, grad_to='net2')
+                                
+                                interface_sol_loss_sum += sol_loss.item()
+                                interface_res_loss_sum += res_loss.item()
+                                
+                                total_loss = total_loss + sol_loss + res_loss
+                    
+                    # Track interface losses
+                    total_interface_sol_loss += interface_sol_loss_sum
+                    total_interface_res_loss += interface_res_loss_sum
+                    
+                    # Single backward pass for this subdomain
+                    total_loss.backward()
+                    adam_optimizers[sub_idx].step()
+                    subdomain_losses.append(total_loss.item())
+                    
+                except Exception as e:
+                    print(f"Error in subdomain {sub_idx}: {e}")
+                    raise
+            
+            if i % 100 == 0:
+                avg_loss = sum(subdomain_losses) / len(subdomain_losses)
+                # Average component losses across subdomains
+                avg_pde = total_pde_loss / len(nets)
+                avg_ic = total_ic_loss / len(nets)
+                avg_if_sol = total_interface_sol_loss / len(nets)
+                avg_if_res = total_interface_res_loss / len(nets)
+                
+                print(f"XPINN Training Loss at {i} (Adam, per-subdomain) = {avg_loss:.2e}", flush=True)
+                print(f"  Component losses: PDE={avg_pde:.2e} | IC={avg_ic:.2e} | IF_sol={avg_if_sol:.2e} | IF_res={avg_if_res:.2e}", flush=True)
         else:
-            # Train all networks simultaneously
-            loss = optimizer.step(make_closure(optimizer))
-        
-        if i % 100 == 0:
-            with torch.autograd.no_grad():
-                print(f"XPINN Training Loss at {i} (Adam) = {loss.item():.2e}", flush=True)
+            # Unified Adam training (single-GPU, original approach)
+            if XPINN_ALTERNATING_TRAINING:
+                # Alternate between subdomains (not yet implemented - would need separate optimizers)
+                raise NotImplementedError("Alternating training not yet implemented")
+            else:
+                # Train all networks simultaneously
+                loss, loss_dict = optimizer.step(make_closure(optimizer))
+            
+            if i % 100 == 0:
+                with torch.autograd.no_grad():
+                    print(f"XPINN Training Loss at {i} (Adam) = {loss.item():.2e}", flush=True)
+                    # Print loss breakdown
+                    breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_dict.items() if v > 0])
+                    if breakdown_str:
+                        print(f"  Loss breakdown: {breakdown_str}", flush=True)
     
-    # L-BFGS training
-    for i in range(iterationL):
-        if XPINN_ALTERNATING_TRAINING:
-            raise NotImplementedError("Alternating training not yet implemented")
-        else:
-            loss = optimizerL.step(make_closure(optimizerL))
+    # L-BFGS training - per-subdomain optimization
+    # Each subdomain network is optimized separately while others are frozen
+    # This avoids multi-GPU gradient gathering issues and memory constraints
+    if iterationL > 0:
+        print("\nStarting per-subdomain L-BFGS training...")
         
-        if i % 50 == 0:
-            with torch.autograd.no_grad():
-                print(f"XPINN Training Loss at {i} (L-BFGS) = {loss.item():.2e}", flush=True)
+        # Optimize each subdomain network separately
+        for subdomain_idx in range(len(nets)):
+            print(f"  Optimizing subdomain {subdomain_idx}...")
+            
+            net = nets[subdomain_idx]
+            net_device = subdomain_devices[subdomain_idx] if subdomain_devices else device
+            
+            # Create optimizer for this subdomain only
+            optimizer_sub = torch.optim.LBFGS(
+                net.parameters(),
+                lr=1.0,
+                max_iter=20,
+                max_eval=None,
+                tolerance_grad=1e-11,
+                tolerance_change=1e-11,
+                history_size=100,
+                line_search_fn='strong_wolfe'
+            )
+            
+            # Create closure for this subdomain
+            # Computes loss for this subdomain + its interface losses
+            def make_subdomain_lbfgs_closure(sub_idx, current_net):
+                def subdomain_closure():
+                    optimizer_sub.zero_grad()
+                    
+                    # Compute PDE and IC loss for this subdomain
+                    colloc = subdomain_collocs[sub_idx]
+                    colloc_ic = subdomain_ic_collocs[sub_idx]
+                    cached_ic = cached_ic_values[sub_idx] if cached_ic_values else None
+                    
+                    pde_loss = xpinn_loss_model.compute_pde_loss(colloc, current_net)
+                    ic_loss = xpinn_loss_model.compute_ic_loss(colloc_ic, current_net, ic_functions, cached_ic)
+                    
+                    total_loss = pde_loss + ic_loss
+                    
+                    # Add interface losses where this subdomain is involved
+                    for interface in interfaces:
+                        subdomain_i, subdomain_j, _, _ = interface
+                        interface_key = (subdomain_i, subdomain_j)
+                        
+                        # Only compute interface losses where this subdomain participates
+                        if sub_idx == subdomain_i or sub_idx == subdomain_j:
+                            if interface_key in interface_collocs:
+                                colloc_interface = interface_collocs[interface_key]
+                                net1 = nets[subdomain_i]
+                                net2 = nets[subdomain_j]
+                                
+                                # Compute interface losses (gradients only flow to this net)
+                                sol_loss = xpinn_loss_model.compute_interface_solution_loss(
+                                    colloc_interface, net1, net2)
+                                res_loss = xpinn_loss_model.compute_interface_residual_loss(
+                                    colloc_interface, net1, net2)
+                                
+                                # Move interface losses to current net's device before adding
+                                current_device = next(current_net.parameters()).device
+                                sol_loss = sol_loss.to(current_device)
+                                res_loss = res_loss.to(current_device)
+                                
+                                total_loss = total_loss + sol_loss + res_loss
+                    
+                    # L-BFGS will call this closure multiple times for line search
+                    # Use retain_graph=True to allow multiple backward passes
+                    total_loss.backward(retain_graph=True)
+                    return total_loss
+                
+                return subdomain_closure
+            
+            # Helper to compute and print a detailed loss breakdown for this subdomain (no grad)
+            def _lbfgs_subdomain_breakdown(sub_idx, current_net):
+                with torch.no_grad():
+                    colloc = subdomain_collocs[sub_idx]
+                    colloc_ic = subdomain_ic_collocs[sub_idx]
+                    cached_ic = cached_ic_values[sub_idx] if cached_ic_values else None
+                    pde_loss = xpinn_loss_model.compute_pde_loss(colloc, current_net)
+                    ic_loss = xpinn_loss_model.compute_ic_loss(colloc_ic, current_net, ic_functions, cached_ic)
+                    if len(nets) > 1:
+                        device0 = next(current_net.parameters()).device
+                        pde_loss = pde_loss.to(device0)
+                        ic_loss = ic_loss.to(device0)
+                    if_sol = torch.tensor(0.0, device=next(current_net.parameters()).device)
+                    if_res = torch.tensor(0.0, device=next(current_net.parameters()).device)
+                    for interface in interfaces:
+                        subdomain_i, subdomain_j, _, _ = interface
+                        interface_key = (subdomain_i, subdomain_j)
+                        if sub_idx == subdomain_i or sub_idx == subdomain_j:
+                            if interface_key in interface_collocs:
+                                colloc_interface = interface_collocs[interface_key]
+                                net1 = nets[subdomain_i]
+                                net2 = nets[subdomain_j]
+                                sol_loss = xpinn_loss_model.compute_interface_solution_loss(colloc_interface, net1, net2)
+                                res_loss = xpinn_loss_model.compute_interface_residual_loss(colloc_interface, net1, net2)
+                                current_device = next(current_net.parameters()).device
+                                if_sol = if_sol + sol_loss.to(current_device)
+                                if_res = if_res + res_loss.to(current_device)
+                    total = pde_loss + ic_loss + if_sol + if_res
+                    return total.item(), pde_loss.item(), ic_loss.item(), if_sol.item(), if_res.item()
+
+            # Run L-BFGS for this subdomain
+            for i in range(iterationL):
+                loss = optimizer_sub.step(make_subdomain_lbfgs_closure(subdomain_idx, net))
+                
+                if i % 40 == 0:
+                    total_v, pde_v, ic_v, if_sol_v, if_res_v = _lbfgs_subdomain_breakdown(subdomain_idx, net)
+                    print(
+                        f"    Subdomain {subdomain_idx} L-BFGS step {i}: "
+                        f"Total={total_v:.2e} | PDE={pde_v:.2e} | IC={ic_v:.2e} | "
+                        f"IF_sol={if_sol_v:.2e} | IF_res={if_res_v:.2e}",
+                        flush=True
+                    )
+        
+        print("Per-subdomain L-BFGS training completed.")
     
     print("XPINN training completed.")

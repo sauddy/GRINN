@@ -62,16 +62,66 @@
 - `INTERFACE_RESIDUAL_WEIGHT`: Weight for residual continuity at interfaces
 - `INTERFACE_SOLUTION_COMPONENTS`: Which solution components to enforce continuity for
 
-## Activation Functions
-- `USE_DIFFERENT_ACTIVATIONS`: Whether to use different activations per subdomain
-- `ACTIVATION_FUNCTIONS`: List of activation functions to cycle through
-- `DEFAULT_ACTIVATION`: Default activation function if not using different activations
+## Per-Subdomain Network Architecture
+- `SUBDOMAIN_CONFIGS`: List of dicts configuring each subdomain's network architecture
+  - **Format**: `[{config_0}, {config_1}, ..., {config_N-1}]` where N = NUM_SUBDOMAINS_X × NUM_SUBDOMAINS_Y
+  - **Each dict can contain**:
+    - `num_neurons`: Number of neurons per hidden layer (int)
+    - `num_layers`: Total number of linear layers (int)
+    - `n_harmonics`: Number of harmonic features for periodic BCs (int)
+    - `activation`: Activation function ('sin', 'tanh', 'relu', 'elu')
+  - **Fallback**: Missing keys use global defaults (`num_neurons`, `num_layers`, `harmonics`, `DEFAULT_ACTIVATION`)
+  - **Disable**: Set to `None` to use global defaults for all subdomains
+  
+  **Subdomain Ordering** (for 2×2 grid):
+  ```
+  [1] | [3]    (top row, y: ymax/2 → ymax)
+  ----+----
+  [0] | [2]    (bottom row, y: ymin → ymax/2)
+  ```
+  
+  **Example 1 - Full specification**:
+  ```python
+  SUBDOMAIN_CONFIGS = [
+      {'num_neurons': 64, 'num_layers': 4, 'n_harmonics': 2, 'activation': 'tanh'},
+      {'num_neurons': 64, 'num_layers': 4, 'n_harmonics': 2, 'activation': 'tanh'},
+      {'num_neurons': 64, 'num_layers': 4, 'n_harmonics': 2, 'activation': 'tanh'},
+      {'num_neurons': 128, 'num_layers': 6, 'n_harmonics': 4, 'activation': 'sin'},
+  ]
+  ```
+  
+  **Example 2 - Only specify activation**:
+  ```python
+  SUBDOMAIN_CONFIGS = [
+      {'activation': 'tanh'},  # Uses global num_neurons, num_layers, harmonics
+      {'activation': 'tanh'},
+      {'activation': 'tanh'},
+      {'activation': 'sin'},
+  ]
+  ```
+  
+  **Example 3 - Use global defaults**:
+  ```python
+  SUBDOMAIN_CONFIGS = None  # All subdomains use global settings
+  ```
+  
+  **Use Cases**:
+  - **Gravitational collapse**: Use stronger network (more neurons/layers/harmonics, 'sin' activation) in collapse region; lighter networks ('tanh') elsewhere
+  - **Varying complexity**: Allocate compute resources based on local physics complexity
+  - **Faster convergence**: Use 'tanh' for smooth regions (faster), 'sin' for high-frequency/nonlinear regions
+  
+- `DEFAULT_ACTIVATION`: Default activation function used when not specified in SUBDOMAIN_CONFIGS
 
 ## Training Strategy
 - `XPINN_OPTIMIZER_STRATEGY`: Optimizer strategy ('unified' or 'separate')
 - `XPINN_ALTERNATING_TRAINING`: Whether to alternate subdomain training
 - `USE_XPINN_BATCHING`: Whether to use mini-batch processing for XPINN (reduces GPU memory)
+- `USE_MULTI_GPU`: Whether to distribute subdomains across available GPUs
+  - If `True`: Automatically detects available GPUs and assigns subdomains round-robin
+  - Networks stay on assigned devices during Adam; L-BFGS optimizes per-subdomain on its device
+  - Works with any number of GPUs (1, 2, 4, 8, etc.)
+- `CACHE_IC_VALUES`: Whether to precompute and cache initial condition values for faster training
 
 ## Visualization
 - `SHOW_INTERFACE_LINES`: Whether to draw subdomain boundaries in plots
-- `INTERFACE_AVERAGING`: Method to combine overlapping predictions at interfaces
+- `INTERFACE_AVERAGING`: Method to combine overlapping predictions at interfaces ('mean', 'weighted', 'subdomain1', 'subdomain2')

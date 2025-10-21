@@ -233,7 +233,7 @@ class XPINN_Loss:
         loss = sum(torch.mean(r**2) for r in residuals)
         return loss
     
-    def compute_ic_loss(self, colloc_ic, net, ic_functions):
+    def compute_ic_loss(self, colloc_ic, net, ic_functions, cached_ic=None):
         """
         Compute initial condition loss for a subdomain.
         
@@ -242,6 +242,7 @@ class XPINN_Loss:
             net: Neural network for this subdomain
             ic_functions: Dictionary of initial condition functions
                           {'rho': func, 'vx': func, 'vy': func, 'phi': func}
+            cached_ic: Precomputed IC values (optional)
         
         Returns:
             IC loss (scalar)
@@ -249,11 +250,18 @@ class XPINN_Loss:
         # Get network predictions at t=0
         u_pred = net(colloc_ic)
         
-        # Compute initial conditions
-        ic_rho = ic_functions['rho'](colloc_ic)
-        ic_vx = ic_functions['vx'](colloc_ic)
-        ic_vy = ic_functions['vy'](colloc_ic)
-        ic_phi = ic_functions['phi'](colloc_ic)
+        # Use cached IC values if available, otherwise compute them
+        if cached_ic is not None:
+            ic_rho = cached_ic['rho']
+            ic_vx = cached_ic['vx']
+            ic_vy = cached_ic['vy']
+            ic_phi = cached_ic['phi']
+        else:
+            # Compute initial conditions
+            ic_rho = ic_functions['rho'](colloc_ic)
+            ic_vx = ic_functions['vx'](colloc_ic)
+            ic_vy = ic_functions['vy'](colloc_ic)
+            ic_phi = ic_functions['phi'](colloc_ic)
         
         # Compute MSE for each component
         loss_rho = torch.mean((u_pred[:, 0:1] - ic_rho)**2)
@@ -264,7 +272,7 @@ class XPINN_Loss:
         total_ic_loss = loss_rho + loss_vx + loss_vy + loss_phi
         return total_ic_loss
     
-    def compute_interface_solution_loss(self, colloc_interface, net1, net2):
+    def compute_interface_solution_loss(self, colloc_interface, net1, net2, grad_to='both'):
         """
         Compute solution continuity loss at interface.
         
@@ -274,34 +282,62 @@ class XPINN_Loss:
         Args:
             colloc_interface: Interface collocation points [x, y, t]
             net1, net2: Neural networks for adjacent subdomains
+            grad_to: 'both' (default), 'net1', or 'net2' - controls which network receives gradients
         
         Returns:
             Solution continuity loss (scalar)
         """
+        # Move interface points to each network's device
+        device1 = next(net1.parameters()).device
+        device2 = next(net2.parameters()).device
+        
+        colloc_interface_1 = [t.to(device1) for t in colloc_interface]
+        colloc_interface_2 = [t.to(device2) for t in colloc_interface]
+        
         # Get predictions from both networks at interface
-        u1 = net1(colloc_interface)
-        u2 = net2(colloc_interface)
+        u1 = net1(colloc_interface_1)
+        u2 = net2(colloc_interface_2)
         
-        # Compute average
-        u_avg = (u1 + u2) / 2.0
+        # Detach neighbor network BEFORE any device transfers to avoid graph sharing
+        if grad_to == 'net1':
+            u2 = u2.detach()
+        elif grad_to == 'net2':
+            u1 = u1.detach()
         
-        # Compute loss for specified components only
-        loss = 0.0
-        for comp_name in self.interface_components:
-            if comp_name in self.component_map:
-                idx = self.component_map[comp_name]
-                if idx < u1.shape[1]:  # Check component exists
-                    u1_comp = u1[:, idx:idx+1]
-                    u2_comp = u2[:, idx:idx+1]
-                    u_avg_comp = u_avg[:, idx:idx+1]
-                    
-                    # XPINN approach: enforce average value
-                    loss += torch.mean((u1_comp - u_avg_comp)**2)
-                    loss += torch.mean((u2_comp - u_avg_comp)**2)
+        # Compute loss on the device of the network we're training
+        if grad_to == 'net2':
+            # Backprop only to net2; compute on device2
+            # u1 is already detached, so moving it won't create gradients
+            u1_on_device2 = u1.to(device2)
+            u_avg = (u1_on_device2 + u2) / 2.0
+            loss = 0.0
+            for comp_name in self.interface_components:
+                if comp_name in self.component_map:
+                    idx = self.component_map[comp_name]
+                    if idx < u2.shape[1]:
+                        u2_comp = u2[:, idx:idx+1]
+                        u_avg_comp = u_avg[:, idx:idx+1]
+                        loss += torch.mean((u2_comp - u_avg_comp)**2)
+        else:
+            # Backprop to net1 (or both); compute on device1
+            # u2 is already detached, so moving it won't create gradients
+            u2_on_device1 = u2.to(device1)
+            u_avg = (u1 + u2_on_device1) / 2.0
+            loss = 0.0
+            for comp_name in self.interface_components:
+                if comp_name in self.component_map:
+                    idx = self.component_map[comp_name]
+                    if idx < u1.shape[1]:
+                        u1_comp = u1[:, idx:idx+1]
+                        u_avg_comp = u_avg[:, idx:idx+1]
+                        loss += torch.mean((u1_comp - u_avg_comp)**2)
+                        if grad_to == 'both':
+                            u2_comp = u2_on_device1[:, idx:idx+1]
+                            loss += torch.mean((u2_comp - u_avg_comp)**2)
         
         return self.interface_solution_weight * loss
     
-    def compute_interface_residual_loss(self, colloc_interface, net1, net2):
+    def compute_interface_residual_loss(self, colloc_interface, net1, net2, grad_to='both'):
         """
         Compute residual continuity loss at interface.
         
@@ -310,18 +346,39 @@ class XPINN_Loss:
         Args:
             colloc_interface: Interface collocation points [x, y, t]
             net1, net2: Neural networks for adjacent subdomains
+            grad_to: 'both' (default), 'net1', or 'net2' - controls which network receives gradients
         
         Returns:
             Residual continuity loss (scalar)
         """
+        # Move interface points to each network's device
+        device1 = next(net1.parameters()).device
+        device2 = next(net2.parameters()).device
+        
+        colloc_interface_1 = [t.to(device1) for t in colloc_interface]
+        colloc_interface_2 = [t.to(device2) for t in colloc_interface]
+        
         # Compute PDE residuals from both networks at interface
-        residuals1 = pde_residue(colloc_interface, net1, dimension=self.dimension)
-        residuals2 = pde_residue(colloc_interface, net2, dimension=self.dimension)
+        residuals1 = pde_residue(colloc_interface_1, net1, dimension=self.dimension)
+        residuals2 = pde_residue(colloc_interface_2, net2, dimension=self.dimension)
         
         # Enforce residual matching for all PDE components
         loss = 0.0
-        for r1, r2 in zip(residuals1, residuals2):
-            loss += torch.mean((r1 - r2)**2)
+        if grad_to == 'net2':
+            # Backprop only to net2; compute on device2
+            for r1, r2 in zip(residuals1, residuals2):
+                r1_detached = r1.detach().to(device2)
+                loss += torch.mean((r2 - r1_detached)**2)
+        elif grad_to == 'net1':
+            # Backprop only to net1; compute on device1
+            for r1, r2 in zip(residuals1, residuals2):
+                r2_detached = r2.detach().to(device1)
+                loss += torch.mean((r1 - r2_detached)**2)
+        else:
+            # Backprop to both (original behavior); compute on device1
+            for r1, r2 in zip(residuals1, residuals2):
+                r2_on_device1 = r2.to(device1)
+                loss += torch.mean((r1 - r2_on_device1)**2)
         
         return self.interface_residual_weight * loss
     
@@ -331,7 +388,7 @@ class XPINN_Loss:
     
     def compute_total_loss(self, nets, subdomain_collocs, interface_collocs, 
                           subdomain_ic_collocs, ic_functions, interfaces, 
-                          exterior_boundaries):
+                          exterior_boundaries, cached_ic_values=None):
         """
         Compute total XPINN loss aggregating all components.
         
@@ -343,21 +400,36 @@ class XPINN_Loss:
             ic_functions: Initial condition functions
             interfaces: List of interface tuples (subdomain_i, subdomain_j, type, pos)
             exterior_boundaries: Dict mapping subdomain_idx to boundary info
+            cached_ic_values: Precomputed IC values (list of dicts per subdomain, optional)
         
         Returns:
             Tuple (total_loss, loss_dict) where loss_dict contains component losses
         """
+        if cached_ic_values is None:
+            cached_ic_values = [None] * len(nets)
+            
+        # Initialize loss dict on device 0 (or appropriate device for single GPU)
+        device = 'cuda:0' if len(nets) > 1 else next(nets[0].parameters()).device
         loss_dict = {
-            'pde': 0.0,
-            'ic': 0.0,
-            'interface_solution': 0.0,
-            'interface_residual': 0.0
+            'pde': torch.tensor(0.0, device=device),
+            'ic': torch.tensor(0.0, device=device),
+            'interface_solution': torch.tensor(0.0, device=device),
+            'interface_residual': torch.tensor(0.0, device=device)
         }
         
         # PDE and IC losses for each subdomain
         for i, (net, colloc, colloc_ic) in enumerate(zip(nets, subdomain_collocs, subdomain_ic_collocs)):
-            loss_dict['pde'] += self.compute_pde_loss(colloc, net)
-            loss_dict['ic'] += self.compute_ic_loss(colloc_ic, net, ic_functions)
+            # Compute losses on the device where the network lives
+            pde_loss = self.compute_pde_loss(colloc, net)
+            ic_loss = self.compute_ic_loss(colloc_ic, net, ic_functions, cached_ic_values[i])
+            
+            # Move losses to device 0 for aggregation (or keep on same device if single GPU)
+            if len(nets) > 1:  # Multi-GPU case
+                pde_loss = pde_loss.to(device)
+                ic_loss = ic_loss.to(device)
+            
+            loss_dict['pde'] += pde_loss
+            loss_dict['ic'] += ic_loss
         
         # Interface losses
         for interface in interfaces:
@@ -369,10 +441,17 @@ class XPINN_Loss:
                 net1 = nets[subdomain_i]
                 net2 = nets[subdomain_j]
                 
-                loss_dict['interface_solution'] += self.compute_interface_solution_loss(
-                    colloc_interface, net1, net2)
-                loss_dict['interface_residual'] += self.compute_interface_residual_loss(
-                    colloc_interface, net1, net2)
+                # Compute interface losses
+                sol_loss = self.compute_interface_solution_loss(colloc_interface, net1, net2)
+                res_loss = self.compute_interface_residual_loss(colloc_interface, net1, net2)
+                
+                # Move losses to device 0 for aggregation (or keep on same device if single GPU)
+                if len(nets) > 1:  # Multi-GPU case
+                    sol_loss = sol_loss.to(device)
+                    res_loss = res_loss.to(device)
+                
+                loss_dict['interface_solution'] += sol_loss
+                loss_dict['interface_residual'] += res_loss
         
         # NOTE: Periodic BC NOT included here - enforced via periodic feature encoding (harmonics)
         # in the PINN architecture, which is a hard constraint approach.
