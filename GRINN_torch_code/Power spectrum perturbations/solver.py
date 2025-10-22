@@ -8,6 +8,136 @@ from data_generator import diff
 from model_architecture import PINN
 from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
 
+class ResidualTracker:
+    """
+    Tracks cumulative residuals across time bins for adaptive causal weighting.
+    Implements w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k, θ))
+    """
+    def __init__(self, t_min, t_max, num_bins, epsilon, device='cuda'):
+        """
+        Args:
+            t_min: Minimum time value
+            t_max: Maximum time value
+            num_bins: Number of time bins for tracking residuals
+            epsilon: Causality parameter (controls weight suppression strength)
+            device: PyTorch device
+        """
+        self.t_min = t_min
+        self.t_max = t_max
+        self.num_bins = num_bins
+        self.epsilon = epsilon
+        self.device = device
+        
+        # Bin edges for time discretization
+        self.bin_edges = torch.linspace(t_min, t_max, num_bins + 1, device=device)
+        self.bin_width = (t_max - t_min) / num_bins
+        
+        # Cumulative residuals per bin (initialized to zero)
+        self.cumulative_residuals = torch.zeros(num_bins, device=device)
+        
+        # Counter for number of updates per bin (for averaging)
+        self.update_counts = torch.zeros(num_bins, device=device)
+    
+    def get_bin_indices(self, t_values):
+        """
+        Get bin indices for given time values.
+        
+        Args:
+            t_values: Tensor of time values [N, 1]
+        
+        Returns:
+            Bin indices [N] (clamped to valid range)
+        """
+        t_flat = t_values.flatten()
+        # Compute bin index: floor((t - t_min) / bin_width)
+        bin_idx = ((t_flat - self.t_min) / self.bin_width).long()
+        # Clamp to valid range [0, num_bins-1]
+        bin_idx = torch.clamp(bin_idx, 0, self.num_bins - 1)
+        return bin_idx
+    
+    def update_residuals(self, t_values, residuals):
+        """
+        Update cumulative residuals for time bins based on current batch.
+        Vectorized for speed.
+        
+        Args:
+            t_values: Time values [N, 1]
+            residuals: PDE residuals [N, 1] or list of residuals
+        """
+        # Convert residuals to single scalar per point if it's a list
+        if isinstance(residuals, (list, tuple)):
+            # Aggregate all residual components
+            total_residual = sum(r.flatten() ** 2 for r in residuals)
+            residual_values = torch.sqrt(total_residual)
+        else:
+            residual_values = residuals.flatten().abs()
+        
+        bin_idx = self.get_bin_indices(t_values)
+        
+        # Vectorized accumulation using bincount
+        bin_sums = torch.bincount(bin_idx, weights=residual_values, minlength=self.num_bins)
+        bin_counts = torch.bincount(bin_idx, minlength=self.num_bins).to(bin_sums.dtype)
+        
+        self.cumulative_residuals += bin_sums.detach()
+        self.update_counts += bin_counts.detach()
+    
+    def get_adaptive_weights(self, t_values):
+        """
+        Compute adaptive causal weights based on cumulative past residuals.
+        w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k))
+        Vectorized for speed with normalization to prevent weight collapse.
+        
+        Args:
+            t_values: Time values [N, 1]
+        
+        Returns:
+            Weights [N, 1]
+        """
+        eps = 1e-12
+        bin_idx = self.get_bin_indices(t_values)
+        
+        # Compute average residual per bin (point-averaged)
+        avg_residuals = self.cumulative_residuals / (self.update_counts + eps)
+        
+        # Normalize by early-time scale (bin 0) to keep magnitude stable
+        # This prevents the cumulative sum from growing too large with more bins
+        ref_scale = avg_residuals[0].clamp_min(eps)
+        avg_residuals_norm = avg_residuals / ref_scale
+        
+        # Compute cumulative sum of normalized average residuals
+        cumsum_avg = torch.cumsum(avg_residuals_norm, dim=0)
+        
+        # For bin i, we want sum from bins 0 to i-1, so shift cumsum by 1
+        # cumsum_shifted[i] = sum of bins 0 to i-1
+        cumsum_shifted = torch.cat([torch.zeros(1, device=self.device), cumsum_avg[:-1]], dim=0)
+        
+        # Gather the appropriate cumulative sum for each point based on its bin
+        bin_idx_flat = bin_idx.clamp(min=0, max=self.num_bins-1)
+        past_residual_sum = cumsum_shifted[bin_idx_flat]
+        
+        # Apply exponential suppression with floor to prevent starving later times
+        weights = torch.exp(-self.epsilon * past_residual_sum).clamp_min(0.05)
+        
+        return weights.unsqueeze(-1) if weights.dim() == 1 else weights
+    
+    def reset(self):
+        """Reset cumulative residuals and counts."""
+        self.cumulative_residuals.zero_()
+        self.update_counts.zero_()
+    
+    def get_stats(self):
+        """Get current statistics for logging."""
+        avg_residuals = torch.where(
+            self.update_counts > 0,
+            self.cumulative_residuals / self.update_counts,
+            torch.zeros_like(self.cumulative_residuals)
+        )
+        return {
+            'cumulative': self.cumulative_residuals.cpu().numpy(),
+            'counts': self.update_counts.cpu().numpy(),
+            'average': avg_residuals.cpu().numpy()
+        }
+
 def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     lam = float(lam)  # Wavelength
     rho_1 = float(rho_1)  # Amplitude of perturbation
@@ -483,7 +613,7 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     
     return loss, loss_breakdown
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None):
     # Batched training is the default
     total_steps = iteration_adam + iterationL
     total_for_decay = max(1, int(total_steps * DECAY_PORTION))
@@ -504,10 +634,10 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True))
 
         with torch.autograd.no_grad():
-            if i % 100 == 0:
+            if i % 200 == 0:
                 print(f"Training Loss at {i} for Adam (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
                 # Print loss breakdown
                 breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
@@ -525,7 +655,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
@@ -533,7 +663,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown = loss_breakdown_holder[0]
 
         with torch.autograd.no_grad():
-            if i % 40 == 0:
+            if i % 20 == 0:
                 print(f"Training Loss at {i} for LBGFS (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
                 # Print loss breakdown
                 breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
@@ -552,7 +682,13 @@ def _make_batch_tensors(tensors_list, indices):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches):
+                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True):
+
+    def _causal_weight_static(t_values, gamma):
+        """Compute static causal weights: w(t) = exp(-gamma * t)"""
+        if gamma == 0.0:
+            return torch.ones_like(t_values)
+        return torch.exp(-gamma * torch.clamp(t_values, min=0.0))
 
     # Aggregate losses across mini-batches
     total_loss = 0.0
@@ -678,14 +814,45 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
             # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
             rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
 
-        mse_rho  = torch.mean(rho_r ** 2)
-        mse_velx = torch.mean(vx_r  ** 2)
-        if model.dimension == 2:
-            mse_vely = torch.mean(vy_r  ** 2)
+        # Extract time values from batch_dom
+        if model.dimension == 1:
+            t_dom = batch_dom[1]
+        elif model.dimension == 2:
+            t_dom = batch_dom[2]
         elif model.dimension == 3:
-            mse_vely = torch.mean(vy_r  ** 2)
-            mse_velz = torch.mean(vz_r  ** 2)
-        mse_phi  = torch.mean(phi_r ** 2)
+            t_dom = batch_dom[3]
+
+        # Compute causal weights for PDE residuals based on mode
+        causal_weights = None
+        if causal_mode == "static" and causal_gamma > 0.0:
+            # Static exponential weighting
+            causal_weights = _causal_weight_static(t_dom, causal_gamma)
+        elif causal_mode == "adaptive" and residual_tracker is not None:
+            # Adaptive residual-based weighting
+            # Get adaptive weights based on PAST residuals (before updating)
+            # This ensures weights reflect only history up to previous iterations
+            causal_weights = residual_tracker.get_adaptive_weights(t_dom)
+        
+        # Apply weights to PDE residuals
+        if causal_weights is not None:
+            mse_rho  = torch.mean(causal_weights * (rho_r ** 2))
+            mse_velx = torch.mean(causal_weights * (vx_r ** 2))
+            if model.dimension == 2:
+                mse_vely = torch.mean(causal_weights * (vy_r ** 2))
+            elif model.dimension == 3:
+                mse_vely = torch.mean(causal_weights * (vy_r ** 2))
+                mse_velz = torch.mean(causal_weights * (vz_r ** 2))
+            mse_phi  = torch.mean(causal_weights * (phi_r ** 2))
+        else:
+            # Standard uniform weighting
+            mse_rho  = torch.mean(rho_r ** 2)
+            mse_velx = torch.mean(vx_r  ** 2)
+            if model.dimension == 2:
+                mse_vely = torch.mean(vy_r  ** 2)
+            elif model.dimension == 3:
+                mse_vely = torch.mean(vy_r  ** 2)
+                mse_velz = torch.mean(vz_r  ** 2)
+            mse_phi  = torch.mean(phi_r ** 2)
 
         if model.dimension == 1:
             base = mse_vx_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_phi
@@ -696,6 +863,17 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         else:
             base = mse_vx_ic + mse_vy_ic + mse_vz_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
+
+        # Update residual tracker AFTER computing loss (only during Adam)
+        # This ensures the tracker uses only past history for weight computation
+        if causal_mode == "adaptive" and residual_tracker is not None and update_tracker:
+            with torch.no_grad():
+                if model.dimension == 1:
+                    residual_tracker.update_residuals(t_dom, [rho_r, vx_r, phi_r])
+                elif model.dimension == 2:
+                    residual_tracker.update_residuals(t_dom, [rho_r, vx_r, vy_r, phi_r])
+                else:
+                    residual_tracker.update_residuals(t_dom, [rho_r, vx_r, vy_r, vz_r, phi_r])
 
         total_loss = total_loss + loss
         num_effective_batches += 1
@@ -1068,7 +1246,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                     print(f"Error in subdomain {sub_idx}: {e}")
                     raise
             
-            if i % 100 == 0:
+            if i % 200 == 0:
                 avg_loss = sum(subdomain_losses) / len(subdomain_losses)
                 # Average component losses across subdomains
                 avg_pde = total_pde_loss / len(nets)
@@ -1087,7 +1265,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                 # Train all networks simultaneously
                 loss, loss_dict = optimizer.step(make_closure(optimizer))
             
-            if i % 100 == 0:
+            if i % 200 == 0:
                 with torch.autograd.no_grad():
                     print(f"XPINN Training Loss at {i} (Adam) = {loss.item():.2e}", flush=True)
                     # Print loss breakdown
@@ -1116,7 +1294,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                 max_eval=None,
                 tolerance_grad=1e-11,
                 tolerance_change=1e-11,
-                history_size=100,
+                history_size=200,
                 line_search_fn='strong_wolfe'
             )
             
@@ -1202,7 +1380,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
             for i in range(iterationL):
                 loss = optimizer_sub.step(make_subdomain_lbfgs_closure(subdomain_idx, net))
                 
-                if i % 40 == 0:
+                if i % 20 == 0:
                     total_v, pde_v, ic_v, if_sol_v, if_res_v = _lbfgs_subdomain_breakdown(subdomain_idx, net)
                     print(
                         f"    Subdomain {subdomain_idx} L-BFGS step {i}: "

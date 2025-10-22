@@ -8,6 +8,11 @@ from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_ad
 from config import num_neurons, num_layers
 from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, DEFAULT_ACTIVATION, RANDOM_SEED
 from config import N_INTERFACE, XPINN_OPTIMIZER_STRATEGY, USE_MULTI_GPU, CACHE_IC_VALUES, STARTUP_DT
+from config import USE_CAUSAL_TRAINING, CAUSAL_WEIGHTING_MODE, USE_CAUSAL_CURRICULUM
+from config import CAUSAL_NUM_WINDOWS, CAUSAL_WINDOW_SCHEDULE
+from config import CAUSAL_GAMMA_MAX, CAUSAL_GAMMA_MIN
+from config import CAUSAL_EPSILON, CAUSAL_NUM_TIME_BINS
+from config import CAUSAL_ADAM_PER_WINDOW, CAUSAL_LBFGS_PER_WINDOW
 from losses import ASTPN, XPINN_Loss
 from model_architecture import PINN
 from Plotting_2D import create_2d_animation
@@ -64,27 +69,153 @@ if not USE_XPINN:
     # Set domain on the network so periodic embeddings enforce hard BCs
     net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
 
-    collocation_domain_2D = model_2D.geo_time_coord(option="Domain") 
+    # IC collocation stays at t=0 throughout
     collocation_IC_2D = model_2D.geo_time_coord(option="IC")
 
     start_time = time.time()
-    train(
-        net=net,
-        model=model_2D,
-        collocation_domain=collocation_domain_2D,
-        collocation_IC=collocation_IC_2D,
-        optimizer=optimizer,
-        optimizerL=optimizerL,
-        closure=None,
-        mse_cost_function=mse_cost_function,
-        iteration_adam=iteration_adam_2D,
-        iterationL=iteration_lbgfs_2D,
-        rho_1=rho_1,
-        lam=lam,
-        jeans=jeans,
-        v_1=v_1,
-        device=device
-    )
+    
+    if not USE_CAUSAL_TRAINING:
+        # Standard training (original behavior)
+        print("Using standard training (no causal curriculum)...")
+        collocation_domain_2D = model_2D.geo_time_coord(option="Domain")
+        train(
+            net=net,
+            model=model_2D,
+            collocation_domain=collocation_domain_2D,
+            collocation_IC=collocation_IC_2D,
+            optimizer=optimizer,
+            optimizerL=optimizerL,
+            closure=None,
+            mse_cost_function=mse_cost_function,
+            iteration_adam=iteration_adam_2D,
+            iterationL=iteration_lbgfs_2D,
+            rho_1=rho_1,
+            lam=lam,
+            jeans=jeans,
+            v_1=v_1,
+            device=device,
+            causal_gamma=0.0,  # No causal weighting
+            causal_mode="none"
+        )
+    else:
+        # Causal training with temporal curriculum and/or causal weighting
+        if USE_CAUSAL_CURRICULUM:
+            print(f"Using causal training with {CAUSAL_NUM_WINDOWS} temporal windows...")
+        else:
+            print(f"Using causal training (no curriculum, full domain)...")
+        
+        if CAUSAL_WEIGHTING_MODE == "static":
+            print(f"  Weighting mode: Static (gamma range: [{CAUSAL_GAMMA_MAX}, {CAUSAL_GAMMA_MIN}])")
+        elif CAUSAL_WEIGHTING_MODE == "adaptive":
+            print(f"  Weighting mode: Adaptive (epsilon: {CAUSAL_EPSILON}, time bins: {CAUSAL_NUM_TIME_BINS})")
+        else:
+            raise ValueError(f"Unknown CAUSAL_WEIGHTING_MODE: {CAUSAL_WEIGHTING_MODE}")
+        
+        # Initialize residual tracker for adaptive weighting
+        from solver import ResidualTracker
+        residual_tracker = None
+        if CAUSAL_WEIGHTING_MODE == "adaptive":
+            t_start = max(tmin, STARTUP_DT)
+            residual_tracker = ResidualTracker(
+                t_min=t_start,
+                t_max=tmax,
+                num_bins=CAUSAL_NUM_TIME_BINS,
+                epsilon=CAUSAL_EPSILON,
+                device=device
+            )
+        
+        if USE_CAUSAL_CURRICULUM:
+            # Temporal curriculum with windows
+            adam_per_window = CAUSAL_ADAM_PER_WINDOW if CAUSAL_ADAM_PER_WINDOW is not None else iteration_adam_2D // CAUSAL_NUM_WINDOWS
+            lbfgs_per_window = CAUSAL_LBFGS_PER_WINDOW if CAUSAL_LBFGS_PER_WINDOW is not None else iteration_lbgfs_2D // CAUSAL_NUM_WINDOWS
+            
+            t_start = max(tmin, STARTUP_DT)
+            t_range = tmax - t_start
+            
+            for window_idx in range(CAUSAL_NUM_WINDOWS):
+                # Compute time window upper bound
+                if CAUSAL_WINDOW_SCHEDULE == "linear":
+                    t_window_max = t_start + t_range * (window_idx + 1) / CAUSAL_NUM_WINDOWS
+                else:
+                    raise ValueError(f"Unknown CAUSAL_WINDOW_SCHEDULE: {CAUSAL_WINDOW_SCHEDULE}")
+                
+                # Compute causal gamma for static mode (decays linearly to 0)
+                if CAUSAL_WEIGHTING_MODE == "static":
+                    causal_gamma = CAUSAL_GAMMA_MAX * (1.0 - window_idx / max(1, CAUSAL_NUM_WINDOWS - 1))
+                    if window_idx == CAUSAL_NUM_WINDOWS - 1:
+                        causal_gamma = CAUSAL_GAMMA_MIN
+                else:
+                    causal_gamma = 0.0  # Not used in adaptive mode
+                
+                # Anneal epsilon for adaptive mode (strong early → near-uniform late)
+                if CAUSAL_WEIGHTING_MODE == "adaptive" and residual_tracker is not None:
+                    eps_k = CAUSAL_EPSILON * (1.0 - window_idx / max(1, CAUSAL_NUM_WINDOWS - 1))
+                    residual_tracker.epsilon = eps_k
+                    print(f"  Adaptive epsilon: {eps_k:.3f}")
+                
+                print(f"\n=== Causal Window {window_idx + 1}/{CAUSAL_NUM_WINDOWS} ===")
+                print(f"  Time range: [{t_start:.3f}, {t_window_max:.3f}]")
+                if CAUSAL_WEIGHTING_MODE == "static":
+                    print(f"  Causal gamma: {causal_gamma:.3f}")
+                print(f"  Iterations: {adam_per_window} Adam + {lbfgs_per_window} LBFGS")
+                
+                # Update model's temporal upper bound for this window
+                model_2D.rmax = [xmax, ymax, t_window_max]
+                
+                # Regenerate domain collocation for this window
+                collocation_domain_window = model_2D.geo_time_coord(option="Domain")
+                
+                # Train on this window
+                train(
+                    net=net,
+                    model=model_2D,
+                    collocation_domain=collocation_domain_window,
+                    collocation_IC=collocation_IC_2D,
+                    optimizer=optimizer,
+                    optimizerL=optimizerL,
+                    closure=None,
+                    mse_cost_function=mse_cost_function,
+                    iteration_adam=adam_per_window,
+                    iterationL=lbfgs_per_window,
+                    rho_1=rho_1,
+                    lam=lam,
+                    jeans=jeans,
+                    v_1=v_1,
+                    device=device,
+                    causal_gamma=causal_gamma,
+                    causal_mode=CAUSAL_WEIGHTING_MODE,
+                    residual_tracker=residual_tracker
+                )
+            
+            # Restore full time range for final evaluation/plotting
+            model_2D.rmax = [xmax, ymax, tmax]
+            print(f"\nCausal training completed. Final time range: [{tmin}, {tmax}]")
+        
+        else:
+            # No curriculum - train on full domain with adaptive weighting
+            collocation_domain_2D = model_2D.geo_time_coord(option="Domain")
+            train(
+                net=net,
+                model=model_2D,
+                collocation_domain=collocation_domain_2D,
+                collocation_IC=collocation_IC_2D,
+                optimizer=optimizer,
+                optimizerL=optimizerL,
+                closure=None,
+                mse_cost_function=mse_cost_function,
+                iteration_adam=iteration_adam_2D,
+                iterationL=iteration_lbgfs_2D,
+                rho_1=rho_1,
+                lam=lam,
+                jeans=jeans,
+                v_1=v_1,
+                device=device,
+                causal_gamma=0.0,  # Not used in adaptive mode
+                causal_mode=CAUSAL_WEIGHTING_MODE,
+                residual_tracker=residual_tracker
+            )
+            print(f"\nCausal training completed (full domain)")
+    
     end_time = time.time()
     elapsed_time = end_time - start_time
     print(f"Training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")

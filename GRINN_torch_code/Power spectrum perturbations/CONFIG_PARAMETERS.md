@@ -125,3 +125,199 @@
 ## Visualization
 - `SHOW_INTERFACE_LINES`: Whether to draw subdomain boundaries in plots
 - `INTERFACE_AVERAGING`: Method to combine overlapping predictions at interfaces ('mean', 'weighted', 'subdomain1', 'subdomain2')
+
+## Causal Training Configuration
+Causal training improves long-time predictions by using temporal curriculum learning and time-weighted PDE residuals. This approach trains the network progressively from early to late times, respecting the causality inherent in physical systems.
+
+### Core Settings
+- `USE_CAUSAL_TRAINING`: Enable/disable causal training (True/False)
+  - **True**: Uses temporal curriculum and/or causal weighting
+  - **False**: Uses standard training (original behavior)
+  - **Default**: True
+
+- `CAUSAL_WEIGHTING_MODE`: Type of causal weighting ("static" or "adaptive")
+  - **"static"**: Simple exp(-gamma*t) weighting (simpler, predictable)
+  - **"adaptive"**: Residual-based weighting w_i = exp(-epsilon * Σ L_r(t_k)) (paper's full method, progress-aware)
+  - **Default**: "adaptive"
+  - **Recommendation**: Use "adaptive" for best results, "static" for simplicity
+
+### Temporal Curriculum Settings
+- `USE_CAUSAL_CURRICULUM`: Enable temporal curriculum windows (True/False)
+  - **True**: Train progressively on expanding time windows
+  - **False**: Train on full temporal domain from start
+  - **Default**: True
+  - **Recommendation**: True with adaptive mode for best stability, optional with static mode
+
+- `CAUSAL_NUM_WINDOWS`: Number of progressive time windows (int)
+  - **Purpose**: Controls granularity of temporal curriculum
+  - **Range**: 2-10 recommended (more windows = more gradual progression)
+  - **Default**: 8 (increased for tmax=2.0)
+  - **Example**: With tmax=0.5 and 5 windows: [0.01,0.108], [0.01,0.206], [0.01,0.304], [0.01,0.402], [0.01,0.500]
+
+- `CAUSAL_WINDOW_SCHEDULE`: Time window progression schedule (string)
+  - **Options**: "linear" (currently only supported option)
+  - **Linear**: Each window covers 1/NUM_WINDOWS of the total time range
+  - **Default**: "linear"
+  - **Future**: Could support "exponential", "custom" schedules
+
+### Static Weighting Settings (CAUSAL_WEIGHTING_MODE = "static")
+- `CAUSAL_GAMMA_MAX`: Maximum gamma for exponential time-weighting (float)
+  - **Purpose**: Controls strength of early-time emphasis in PDE residuals
+  - **Formula**: w(t) = exp(-gamma * t) where higher gamma = stronger early-time focus
+  - **Range**: 0.5-5.0 recommended (0.0 = uniform weighting)
+  - **Default**: 1.5 (adjusted for tmax=2.0)
+  - **Effect**: Early times get weight ~1.0, later times get weight ~0.37 (for gamma=2.0, t=0.5)
+  - **Tuning**: Lower for longer tmax (e.g., 1.0-1.5 for tmax=2.0, 2.0-3.0 for tmax=0.5)
+
+- `CAUSAL_GAMMA_MIN`: Minimum gamma for final window (float)
+  - **Purpose**: Ensures final window uses uniform weighting (no bias)
+  - **Range**: 0.0 recommended (uniform weighting)
+  - **Default**: 0.0
+  - **Behavior**: Gamma decays linearly across windows: gamma_k = GAMMA_MAX * (1 - k/NUM_WINDOWS)
+
+### Adaptive Weighting Settings (CAUSAL_WEIGHTING_MODE = "adaptive")
+- `CAUSAL_EPSILON`: Causality parameter epsilon for adaptive weighting (float)
+  - **Purpose**: Controls how strongly past residuals suppress future time weights
+  - **Formula**: w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k, θ))
+  - **Range**: 0.1-2.0 recommended
+  - **Default**: 0.5
+  - **Tuning**: Lower for longer tmax (0.1-0.3 for tmax=2.0, 0.5-1.0 for tmax=0.5)
+  - **Effect**: Higher epsilon = weights shift forward only after early times converge well
+
+- `CAUSAL_NUM_TIME_BINS`: Number of time bins for tracking residuals (int)
+  - **Purpose**: Temporal resolution for adaptive weight calculation
+  - **Range**: 5-20 recommended
+  - **Default**: 10
+  - **Effect**: More bins = finer control but slightly more overhead
+  - **Recommendation**: 10-15 for most cases
+
+### Training Iterations per Window
+- `CAUSAL_ADAM_PER_WINDOW`: Adam iterations per temporal window (int or None)
+  - **None**: Auto-splits `iteration_adam_2D` equally across windows
+  - **Custom**: Specify exact iterations per window
+  - **Default**: None (auto-split)
+  - **Example**: With iteration_adam_2D=800 and 5 windows → 160 Adam iterations per window
+
+- `CAUSAL_LBFGS_PER_WINDOW`: L-BFGS iterations per temporal window (int or None)
+  - **None**: Auto-splits `iteration_lbgfs_2D` equally across windows
+  - **Custom**: Specify exact iterations per window
+  - **Default**: None (auto-split)
+  - **Example**: With iteration_lbgfs_2D=160 and 5 windows → 32 L-BFGS iterations per window
+
+### How Causal Training Works
+
+1. **Temporal Curriculum** (when USE_CAUSAL_CURRICULUM = True):
+   - Network trains on progressively longer time windows
+   - Window 1: [STARTUP_DT, t₁], Window 2: [STARTUP_DT, t₂], ..., Window N: [STARTUP_DT, tmax]
+   - Each window builds on previous windows' learned weights
+   - Provides stable initialization for longer time intervals
+
+2. **Static Causal Weighting** (when CAUSAL_WEIGHTING_MODE = "static"):
+   - PDE residuals weighted by w(t) = exp(-gamma * t)
+   - Early times (t≈0): w(t) ≈ 1.0 (full weight)
+   - Later times (t≈tmax): w(t) ≈ exp(-gamma * tmax) (reduced weight)
+   - Gamma decays across windows to gradually equalize weights
+   - Simple, predictable, easy to tune
+
+3. **Adaptive Causal Weighting** (when CAUSAL_WEIGHTING_MODE = "adaptive"):
+   - PDE residuals weighted by w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k, θ))
+   - Time domain divided into bins, residuals tracked per bin
+   - Weight for time bin i depends on cumulative residuals from earlier bins
+   - Automatically shifts focus forward as earlier times converge
+   - Progress-aware: only emphasizes later times after earlier times are well-learned
+   - More sophisticated, self-adapting, better for difficult problems
+
+4. **Combined Benefits**:
+   - Temporal curriculum provides stable progression
+   - Adaptive weighting ensures proper causality enforcement
+   - Together they provide robust training for long-time evolution
+
+### Usage Examples
+
+**Adaptive Mode with Curriculum (Recommended for tmax=2.0)**:
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "adaptive"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 8
+CAUSAL_EPSILON = 0.5
+CAUSAL_NUM_TIME_BINS = 10
+CAUSAL_ADAM_PER_WINDOW = None  # Auto-split
+CAUSAL_LBFGS_PER_WINDOW = None  # Auto-split
+```
+
+**Adaptive Mode without Curriculum** (for well-behaved problems):
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "adaptive"
+USE_CAUSAL_CURRICULUM = False  # Train on full domain
+CAUSAL_EPSILON = 0.3  # Lower epsilon for stability
+CAUSAL_NUM_TIME_BINS = 10
+```
+
+**Static Mode with Curriculum** (simpler alternative):
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "static"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 5
+CAUSAL_GAMMA_MAX = 2.0
+CAUSAL_GAMMA_MIN = 0.0
+```
+
+**Disable Causal Training**:
+```python
+USE_CAUSAL_TRAINING = False  # Uses original training method
+```
+
+### When to Use Causal Training
+
+**Recommended for**:
+- Long-time evolution problems (tmax > 0.3)
+- Problems with temporal instabilities
+- Gravitational collapse simulations
+- Any case where early-time accuracy is critical
+
+**May not help**:
+- Very short-time problems (tmax < 0.1)
+- Problems already well-solved by standard training
+- When computational cost is primary concern (adds ~20% overhead)
+
+### Console Output
+
+**Adaptive Mode with Curriculum**:
+```
+Using causal training with 8 temporal windows...
+  Weighting mode: Adaptive (epsilon: 0.5, time bins: 10)
+
+=== Causal Window 1/8 ===
+  Time range: [0.010, 0.260]
+  Iterations: 100 Adam + 20 LBFGS
+Training Loss at 0 for Adam (batched) in 2D system = 1.23e-01
+...
+
+=== Causal Window 2/8 ===
+  Time range: [0.010, 0.510]
+  Iterations: 100 Adam + 20 LBFGS
+...
+```
+
+**Static Mode with Curriculum**:
+```
+Using causal training with 5 temporal windows...
+  Weighting mode: Static (gamma range: [2.0, 0.0])
+
+=== Causal Window 1/5 ===
+  Time range: [0.010, 0.108]
+  Causal gamma: 2.000
+  Iterations: 160 Adam + 32 LBFGS
+...
+```
+
+**Adaptive Mode without Curriculum**:
+```
+Using causal training (no curriculum, full domain)...
+  Weighting mode: Adaptive (epsilon: 0.3, time bins: 10)
+Training Loss at 0 for Adam (batched) in 2D system = 1.45e-01
+...
+```
