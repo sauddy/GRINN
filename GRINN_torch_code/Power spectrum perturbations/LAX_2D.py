@@ -245,7 +245,6 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     vy1 = vy0.copy()
 
     if gravity == False and not use_velocity_ps:
-        print("Propagation of Sound wave") 
         v_1 = (c_s*rho_1)/rho_o # velocity perturbation
         # Use coupled 2D velocity components derived from the same wave pattern
         k_magnitude = np.sqrt(KX**2 + KY**2)
@@ -269,7 +268,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
             # Already initialized vx0, vy0; keep density uniform
             pass
         elif lam >= jeans:  
-            print("There is gravitational instabilty  lam = {} > l_jean ={}".format(lam,jeans))
+            #print("There is gravitational instabilty  lam = {} > l_jean ={}".format(lam,jeans))
             alpha = np.sqrt(const*G*rho_o-c_s**2*(2*np.pi/lam)**2)
             v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam)) ## With gravity     
             # Use coupled 2D velocity components derived from the same wave pattern
@@ -289,7 +288,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
                 vy_LT = np.zeros(Nx)
                 
         else:
-            print("There is no gravitational instabilty as lam = {} < l_jean ={}".format(lam,jeans))
+            #print("There is no gravitational instabilty as lam = {} < l_jean ={}".format(lam,jeans))
             alpha = np.sqrt(c_s**2*(2*np.pi/lam)**2 - const*G*rho_o)
             v_1 = (rho_1/rho_o) * (alpha/(2*np.pi/lam)) # velocity perturbation
             # Use coupled 2D velocity components derived from the same wave pattern

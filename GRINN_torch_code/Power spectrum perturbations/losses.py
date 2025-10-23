@@ -60,10 +60,28 @@ class ASTPN(col_gen):
             return torch.mean((der_l-der_r)**2)
 
 
-def pde_residue(colloc, net, dimension = 1):
+def pde_residue(colloc, net, dimension = 1, use_log_density=False):
     
     '''
     This is the main function that returns all the PDE residue
+    
+    Args:
+        colloc: Collocation points
+        net: Neural network
+        dimension: Spatial dimension (1, 2, or 3)
+        use_log_density: If True, network outputs s=log(rho) and PDEs are transformed accordingly
+    '''
+    
+    if use_log_density:
+        return pde_residue_log_density(colloc, net, dimension)
+    else:
+        return pde_residue_standard(colloc, net, dimension)
+
+
+def pde_residue_standard(colloc, net, dimension = 1):
+    
+    '''
+    Standard PDE residues (network predicts rho directly)
     '''
     net_outputs = net(colloc)
     
@@ -180,6 +198,143 @@ def pde_residue(colloc, net, dimension = 1):
         phi_r = phi_x_x + phi_y_y +phi_z_z - const*(rho - rho_o)
         
         return rho_r,vx_r,vy_r,vz_r,phi_r
+
+
+def pde_residue_log_density(colloc, net, dimension = 1):
+    '''
+    Log-density PDE residues (network predicts s=log(rho))
+    
+    Transformed PDEs for isothermal EOS (P = cs²ρ):
+    - Continuity: s_t + v·∇s + ∇·v = 0
+    - Momentum: v_t + (v·∇)v = -cs²∇s + g  (where g = -∇φ)
+    - Poisson: ∇²φ = const·(exp(s) - rho_o)
+    '''
+    from config import cs, const, G, rho_o
+    
+    net_outputs = net(colloc)
+    
+    x = colloc[0]
+    
+    if dimension == 1:
+        t = colloc[1]
+    elif dimension == 2:
+        y = colloc[1]
+        t = colloc[2]
+    elif dimension == 3:
+        y = colloc[1]
+        z = colloc[2]
+        t = colloc[3]
+    
+    # Network outputs s = log(rho), vx, vy, phi
+    s = net_outputs[:,0:1]  # log-density
+    vx = net_outputs[:,1:2]
+    
+    # Recover density: rho = exp(s)
+    rho = torch.exp(s)
+
+    if dimension == 1:
+        phi = net_outputs[:,2:3]
+
+        s_t = diff(s, t, order=1)
+        s_x = diff(s, x, order=1)
+
+        vx_t = diff(vx, t, order=1)
+        vx_x = diff(vx, x, order=1)
+        
+        phi_x = diff(phi, x, order=1)
+        phi_x_x = diff(phi, x, order=2)
+
+        # Transformed continuity: s_t + vx*s_x + vx_x = 0
+        rho_r = s_t + vx * s_x + vx_x
+
+        # Transformed momentum: vx_t + vx*vx_x = -cs²*s_x - phi_x
+        vx_r = vx_t + vx * vx_x + cs*cs * s_x + phi_x
+        
+        # Poisson: phi_xx = const*(rho - rho_o) = const*(exp(s) - rho_o)
+        phi_r = phi_x_x - const * (rho - rho_o)
+
+        return rho_r, vx_r, phi_r
+
+    elif dimension == 2:
+        vy = net_outputs[:,2:3]
+        phi = net_outputs[:,3:4]
+
+        s_t = diff(s, t, order=1)
+        s_x = diff(s, x, order=1)
+        s_y = diff(s, y, order=1)
+
+        vx_t = diff(vx, t, order=1)
+        vy_t = diff(vy, t, order=1)
+
+        vx_x = diff(vx, x, order=1)
+        vx_y = diff(vx, y, order=1)
+        vy_x = diff(vy, x, order=1)
+        vy_y = diff(vy, y, order=1)
+        
+        phi_x = diff(phi, x, order=1)
+        phi_x_x = diff(phi, x, order=2)
+        phi_y = diff(phi, y, order=1)
+        phi_y_y = diff(phi, y, order=2)
+
+        # Transformed continuity: s_t + vx*s_x + vy*s_y + vx_x + vy_y = 0
+        rho_r = s_t + vx * s_x + vy * s_y + vx_x + vy_y
+
+        # Transformed momentum (x): vx_t + vx*vx_x + vy*vx_y = -cs²*s_x - phi_x
+        vx_r = vx_t + vx * vx_x + vy * vx_y + cs*cs * s_x + phi_x
+        
+        # Transformed momentum (y): vy_t + vx*vy_x + vy*vy_y = -cs²*s_y - phi_y
+        vy_r = vy_t + vx * vy_x + vy * vy_y + cs*cs * s_y + phi_y
+        
+        # Poisson: ∇²φ = const*(exp(s) - rho_o)
+        phi_r = phi_x_x + phi_y_y - const * (rho - rho_o)
+
+        return rho_r, vx_r, vy_r, phi_r
+    
+    elif dimension == 3:
+        vy = net_outputs[:,2:3]
+        vz = net_outputs[:,3:4]
+        phi = net_outputs[:,4:5]
+
+        s_t = diff(s, t, order=1)
+        s_x = diff(s, x, order=1)
+        s_y = diff(s, y, order=1)
+        s_z = diff(s, z, order=1)
+
+        vx_t = diff(vx, t, order=1)
+        vy_t = diff(vy, t, order=1)
+        vz_t = diff(vz, t, order=1)
+
+        vx_x = diff(vx, x, order=1)
+        vy_x = diff(vy, x, order=1)
+        vz_x = diff(vz, x, order=1)
+
+        vx_y = diff(vx, y, order=1)
+        vy_y = diff(vy, y, order=1)
+        vz_y = diff(vz, y, order=1)
+        
+        vx_z = diff(vx, z, order=1)
+        vy_z = diff(vy, z, order=1)
+        vz_z = diff(vz, z, order=1)
+        
+        phi_x = diff(phi, x, order=1)
+        phi_x_x = diff(phi, x, order=2)
+        phi_y = diff(phi, y, order=1)
+        phi_y_y = diff(phi, y, order=2)
+        phi_z = diff(phi, z, order=1)
+        phi_z_z = diff(phi, z, order=2)
+
+        # Transformed continuity: s_t + v·∇s + ∇·v = 0
+        rho_r = s_t + vx * s_x + vy * s_y + vz * s_z + vx_x + vy_y + vz_z
+
+        # Transformed momentum
+        vx_r = vx_t + vx * vx_x + vy * vx_y + vz * vx_z + cs*cs * s_x + phi_x
+        vy_r = vy_t + vx * vy_x + vy * vy_y + vz * vy_z + cs*cs * s_y + phi_y
+        vz_r = vz_t + vx * vz_x + vy * vz_y + vz * vz_z + cs*cs * s_z + phi_z
+        
+        # Poisson: ∇²φ = const*(exp(s) - rho_o)
+        phi_r = phi_x_x + phi_y_y + phi_z_z - const * (rho - rho_o)
+        
+        return rho_r, vx_r, vy_r, vz_r, phi_r
 
 
 class XPINN_Loss:

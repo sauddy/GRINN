@@ -9,7 +9,7 @@ import os
 from LAX_2D import lax_solution, lax_solution_with_shared_velocity
 from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
-from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED
+from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED, USE_LOG_DENSITY
 
 # Global variable to store shared velocity fields for plotting
 _shared_vx_np = None
@@ -20,6 +20,26 @@ def set_shared_velocity_fields(vx_np, vy_np):
     global _shared_vx_np, _shared_vy_np
     _shared_vx_np = vx_np
     _shared_vy_np = vy_np
+
+def convert_log_density_to_density(log_density):
+    """
+    Convert log-density back to density if USE_LOG_DENSITY is enabled.
+    Only applies for power spectrum perturbations with single PINN (not XPINN).
+    
+    Args:
+        log_density: numpy array of log-density values (s = log(rho))
+    
+    Returns:
+        numpy array of density values (rho = exp(s))
+    """
+    # Only convert if:
+    # 1. USE_LOG_DENSITY is True
+    # 2. Not using XPINN (USE_XPINN is False)
+    # 3. Using power spectrum perturbations
+    if USE_LOG_DENSITY and not USE_XPINN and str(PERTURBATION_TYPE).lower() == "power_spectrum":
+        return np.exp(log_density)
+    else:
+        return log_density
 
 def get_fd_default_params():
     """
@@ -217,7 +237,7 @@ def plot_function(net, time_array, initial_params, velocity=False, isplot=False,
         else:
             output_0 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
-        rho_pred0 = output_0[:, 0:1].data.cpu().numpy()
+        rho_pred0 = convert_log_density_to_density(output_0[:, 0:1].data.cpu().numpy())
         v_pred_x0 = output_0[:, 1:2].data.cpu().numpy()
         v_pred_y0 = output_0[:, 2:3].data.cpu().numpy()
         phi_pred0 = output_0[:, 3:4].data.cpu().numpy()
@@ -322,7 +342,7 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     else:
         output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
     
-    rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+    rho = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
     U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
     V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
 
@@ -330,19 +350,34 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
         plt.figure(figsize=(5, 5))
         ax = plt.gca() 
 
+    # Clean velocity fields and avoid zero-length arrows
+    U_clean = np.nan_to_num(U, nan=0.0, posinf=0.0, neginf=0.0)
+    V_clean = np.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
+    Vmag = np.sqrt(U_clean**2 + V_clean**2)
+    mask = Vmag > 1e-12
+
     if which == "density":
         pc = ax.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr', vmin=np.min(rho), vmax=np.max(rho))
         skip = (slice(None, None, 5), slice(None, None, 5))
-        ax.quiver(tau[skip], phi[skip], U[skip], V[skip], color='k', headwidth=3.0, width=0.003)
+        ax.quiver(
+            tau[skip][mask[skip]], phi[skip][mask[skip]],
+            U_clean[skip][mask[skip]], V_clean[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
         ax.set_title("Density, t={}".format(round(time, 2)))
         cbar = plt.colorbar(pc, shrink=0.6, location='right')
         cbar.formatter.set_powerlimits((0, 0))
         cbar.ax.set_title(r"$\rho$", fontsize=14)
     else:  # velocity magnitude surface plot
-        Vmag = np.sqrt(U**2 + V**2)
         pc = ax.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis', vmin=np.min(Vmag), vmax=np.max(Vmag))
         skip = (slice(None, None, 5), slice(None, None, 5))
-        ax.quiver(tau[skip], phi[skip], U[skip], V[skip], color='k', headwidth=3.0, width=0.003)
+        ax.quiver(
+            tau[skip][mask[skip]], phi[skip][mask[skip]],
+            U_clean[skip][mask[skip]], V_clean[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
         ax.set_title("Velocity, t={}".format(round(time, 2)))
         cbar = plt.colorbar(pc, shrink=0.6, location='right')
         cbar.ax.set_title(r" $|v|$", fontsize=14)
@@ -412,7 +447,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
     else:
         output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
-    rho_first = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+    rho_first = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
     U_first = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
     V_first = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
     
@@ -434,17 +469,17 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         pt_t = Variable(torch.from_numpy(t_first).float(), requires_grad=True).to(device)
         if use_xpinn:
             pred_first = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
-            rho_first = pred_first[:, 0].data.cpu().numpy().reshape(Q, Q)
+            rho_first = convert_log_density_to_density(pred_first[:, 0].data.cpu().numpy().reshape(Q, Q))
         else:
-            rho_first = nets[0]([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q)
+            rho_first = convert_log_density_to_density(nets[0]([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q))
         # Last frame
         t_last = time_points[-1] * np.ones(Q**2).reshape(Q**2, 1)
         pt_t_last = Variable(torch.from_numpy(t_last).float(), requires_grad=True).to(device)
         if use_xpinn:
             pred_last = predict_xpinn(nets, pt_x, pt_y, pt_t_last, xmin, xmax, ymin, ymax)
-            rho_last = pred_last[:, 0].data.cpu().numpy().reshape(Q, Q)
+            rho_last = convert_log_density_to_density(pred_last[:, 0].data.cpu().numpy().reshape(Q, Q))
         else:
-            rho_last = nets[0]([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q)
+            rho_last = convert_log_density_to_density(nets[0]([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q))
         fixed_vmin = min(np.min(rho_first), np.min(rho_last))
         fixed_vmax = max(np.max(rho_first), np.max(rho_last))
         if fixed_vmin == fixed_vmax:
@@ -504,7 +539,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         else:
             output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
-        rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+        rho = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
         U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
         V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
         
@@ -964,7 +999,7 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
             out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
         else:
             out = nets[0]([pt_x, pt_y, pt_t])
-        rho_pinn = out[:, 0].data.cpu().numpy().reshape(Q, Q)
+        rho_pinn = convert_log_density_to_density(out[:, 0].data.cpu().numpy().reshape(Q, Q))
         pinn_max_list.append(np.max(rho_pinn))
 
         # LAX/FD evaluation; use shared velocity fields when available
@@ -1054,6 +1089,14 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         nu_fd: Courant number for 1D LAX solver
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, _output_folder, _tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
     num_of_waves = (xmax - xmin) / lam
 
     if time_points is None:
@@ -1084,7 +1127,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
             out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
         else:
             out = nets[0]([pt_x, pt_y, pt_t])
-        rho_pinn = out[:, 0:1].data.cpu().numpy().reshape(-1)
+        rho_pinn = convert_log_density_to_density(out[:, 0:1].data.cpu().numpy().reshape(-1))
         vx_pinn = out[:, 1:2].data.cpu().numpy().reshape(-1)
         # potential not used in cross-section plots
 
@@ -1279,19 +1322,34 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="
         plt.figure(figsize=(5, 5))
         ax = plt.gca()
 
+    # Clean FD velocity fields and avoid zero-length arrows
+    vx_c = np.nan_to_num(vx_fd, nan=0.0, posinf=0.0, neginf=0.0)
+    vy_c = np.nan_to_num(vy_fd, nan=0.0, posinf=0.0, neginf=0.0)
+    Vmag_fd = np.sqrt(vx_c**2 + vy_c**2)
+    mask = Vmag_fd > 1e-12
+
     if which == "density":
         pc = ax.pcolormesh(X, Y, rho_fd, shading='auto', cmap='YlOrBr', vmin=np.min(rho_fd), vmax=np.max(rho_fd))
         skip = (slice(None, None, max(1, Nx // 20)), slice(None, None, max(1, Ny // 20)))
-        ax.quiver(X[skip], Y[skip], vx_fd[skip], vy_fd[skip], color='k', headwidth=3.0, width=0.003)
+        ax.quiver(
+            X[skip][mask[skip]], Y[skip][mask[skip]],
+            vx_c[skip][mask[skip]], vy_c[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
         ax.set_title("FD Density, t={}".format(round(time, 2)))
         cbar = plt.colorbar(pc, shrink=0.6, location='right')
         cbar.formatter.set_powerlimits((0, 0))
         cbar.ax.set_title(r"$\rho$", fontsize=14)
     else:
-        Vmag_fd = np.sqrt(vx_fd**2 + vy_fd**2)
         pc = ax.pcolormesh(X, Y, Vmag_fd, shading='auto', cmap='viridis', vmin=np.min(Vmag_fd), vmax=np.max(Vmag_fd))
         skip = (slice(None, None, max(1, Nx // 20)), slice(None, None, max(1, Ny // 20)))
-        ax.quiver(X[skip], Y[skip], vx_fd[skip], vy_fd[skip], color='k', headwidth=3.0, width=0.003)
+        ax.quiver(
+            X[skip][mask[skip]], Y[skip][mask[skip]],
+            vx_c[skip][mask[skip]], vy_c[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
         ax.set_title("FD Velocity, t={}".format(round(time, 2)))
         cbar = plt.colorbar(pc, shrink=0.6, location='right')
         cbar.ax.set_title(r" $|v|$", fontsize=14)
@@ -1434,7 +1492,7 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
             output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
         if which == "density":
-            pinn_field = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+            pinn_field = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
             # Extract velocity components for density plots too
             U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
             V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)

@@ -6,7 +6,7 @@ from torch.autograd import Variable
 from losses import ASTPN, pde_residue
 from data_generator import diff
 from model_architecture import PINN
-from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
+from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED, CAUSAL_PRINT_DIAGNOSTICS, CAUSAL_PRINT_RESIDUAL_SCALES, USE_LOG_DENSITY, ADAPTIVE_COLLOCATION_LBFGS_MODE
 
 class ResidualTracker:
     """
@@ -116,7 +116,7 @@ class ResidualTracker:
         past_residual_sum = cumsum_shifted[bin_idx_flat]
         
         # Apply exponential suppression with floor to prevent starving later times
-        weights = torch.exp(-self.epsilon * past_residual_sum).clamp_min(0.05)
+        weights = torch.exp(-self.epsilon * past_residual_sum).clamp_min(0.1)
         
         return weights.unsqueeze(-1) if weights.dim() == 1 else weights
     
@@ -137,6 +137,60 @@ class ResidualTracker:
             'counts': self.update_counts.cpu().numpy(),
             'average': avg_residuals.cpu().numpy()
         }
+    
+    def print_diagnostics(self, step, window_idx=None):
+        """Print detailed diagnostics for causal weighting analysis."""
+        avg_residuals = torch.where(
+            self.update_counts > 0,
+            self.cumulative_residuals / self.update_counts,
+            torch.zeros_like(self.cumulative_residuals)
+        )
+        
+        # Compute effective weights for each bin
+        eps = 1e-12
+        ref_scale = avg_residuals[0].clamp_min(eps)
+        avg_residuals_norm = avg_residuals / ref_scale
+        cumsum_avg = torch.cumsum(avg_residuals_norm, dim=0)
+        cumsum_shifted = torch.cat([torch.zeros(1, device=self.device), cumsum_avg[:-1]], dim=0)
+        effective_weights = torch.exp(-self.epsilon * cumsum_shifted).clamp_min(0.1)
+        
+        # Compute time centers for each bin
+        bin_centers = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2
+        
+        print(f"\n=== Causal Weighting Diagnostics (Step {step}) ===")
+        if window_idx is not None:
+            print(f"Window: {window_idx}, Epsilon: {self.epsilon:.3f}")
+        
+        print("Bin | Time Range    | Avg Residual | Count | Effective Weight | Attention")
+        print("----|---------------|--------------|-------|-----------------|----------")
+        
+        total_attention = 0.0
+        for i in range(self.num_bins):
+            t_start = self.bin_edges[i].item()
+            t_end = self.bin_edges[i+1].item()
+            avg_res = avg_residuals[i].item()
+            count = self.update_counts[i].item()
+            weight = effective_weights[i].item()
+            
+            # Attention = weight * count (normalized)
+            attention = weight * count if count > 0 else 0.0
+            total_attention += attention
+            
+            status = "ACTIVE" if count > 0 else "INACTIVE"
+            print(f"{i:3d} | {t_start:6.3f}-{t_end:6.3f} | {avg_res:11.2e} | {count:5.0f} | {weight:15.3f} | {status}")
+        
+        print(f"\nTotal Attention: {total_attention:.3f}")
+        print(f"Weight Range: [{effective_weights.min().item():.3f}, {effective_weights.max().item():.3f}]")
+        print(f"Weight Std: {effective_weights.std().item():.3f}")
+        
+        # Check if weights are nearly flat (indicating potential issues)
+        weight_std = effective_weights.std().item()
+        if weight_std < 0.01:
+            print("⚠️  WARNING: Weights are nearly flat - causal weighting may not be effective!")
+        elif weight_std < 0.1:
+            print("⚠️  CAUTION: Weights have low variance - consider adjusting epsilon")
+        
+        print("=" * 60)
 
 def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     lam = float(lam)  # Wavelength
@@ -336,8 +390,19 @@ def _coupled_2d_velocity_components(x, lam, jeans, v_1):
     
     return vx, vy
 
-def fun_rho_0(rho_1, lam, x):
-    ''' Define initial condition for density Returning Eq (11a)'''
+def fun_rho_0(rho_1, lam, x, use_log_density=False):
+    ''' 
+    Define initial condition for density (or log-density if use_log_density=True)
+    
+    Args:
+        rho_1: Perturbation amplitude
+        lam: Wavelength
+        x: Spatial coordinates
+        use_log_density: If True, return s=log(rho) instead of rho
+    
+    Returns:
+        rho_0 if use_log_density=False, s_0=log(rho_0) if use_log_density=True
+    '''
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
         # Use separate kx and ky components for 2D wave vector
         if len(x) >= 2:  # 2D case
@@ -348,14 +413,17 @@ def fun_rho_0(rho_1, lam, x):
             coord = x[0]
             u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
             rho_0 = rho_o + rho_1 * torch.cos(2*np.pi*u/lam)
-        return rho_0
     else:
         rho_0 = torch.full_like(x[0], rho_o)
         # Ensure correct shape [N, 1]
         if rho_0.dim() == 1:
-            return rho_0.unsqueeze(-1)
-        else:
-            return rho_0
+            rho_0 = rho_0.unsqueeze(-1)
+    
+    # Transform to log-density if requested
+    if use_log_density:
+        return torch.log(rho_0)
+    else:
+        return rho_0
 
 def generate_power_spectrum_field_vy(lam, v_1, x, seed=None):
     '''Generate vy component using shared fields if available'''
@@ -419,7 +487,7 @@ def func(x):
 def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt):
 
     ############## Loss based on initial conditions ###############
-    rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
+    rho_0 = fun_rho_0(rho_1, lam, collocation_IC, use_log_density=USE_LOG_DENSITY)
     vx_0  = fun_vx_0(lam, jeans, v_1, collocation_IC)
 
     if model.dimension == 2:
@@ -493,8 +561,13 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
             rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
             vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
             div_v0 = diff(vx0, x_ic, order=1)
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+            if USE_LOG_DENSITY:
+                # For log-density: s_t ≈ -∇·v at t=0 (no rho_o factor)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -div_v0)
+            else:
+                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
+                rho0_field = rho_o * torch.ones_like(div_v0)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
     elif model.dimension == 2:
         if is_sin:
             continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
@@ -505,8 +578,13 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
             dvx_dx = diff(vx0, x_ic, order=1)
             dvy_dy = diff(vy0, y_ic, order=1)
             div_v0 = dvx_dx + dvy_dy
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+            if USE_LOG_DENSITY:
+                # For log-density: s_t ≈ -∇·v at t=0 (no rho_o factor)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -div_v0)
+            else:
+                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
+                rho0_field = rho_o * torch.ones_like(div_v0)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
     else: # dimension == 3
         if is_sin:
             continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
@@ -519,8 +597,13 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
             dvy_dy = diff(vy0, y_ic, order=1)
             dvz_dz = diff(vz0, z_ic, order=1)
             div_v0 = dvx_dx + dvy_dy + dvz_dz
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+            if USE_LOG_DENSITY:
+                # For log-density: s_t ≈ -∇·v at t=0 (no rho_o factor)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -div_v0)
+            else:
+                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
+                rho0_field = rho_o * torch.ones_like(div_v0)
+                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
 
     ############## Loss based on PDE ###################################
     
@@ -528,22 +611,23 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     if isinstance(collocation_domain, (list, tuple)):
         colloc_shifted = list(collocation_domain)
     else:
-        colloc_shifted = collocation_domain
+        # Single tensor format: split into [x, y, t]
+        colloc_shifted = [collocation_domain[:, i:i+1] for i in range(collocation_domain.shape[1])]
 
     if model.dimension == 1:
         # time is at index 1
         # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
-        rho_r,vx_r,phi_r = pde_residue(colloc_shifted, net, dimension = 1)
+        rho_r,vx_r,phi_r = pde_residue(colloc_shifted, net, dimension = 1, use_log_density=USE_LOG_DENSITY)
 
     elif model.dimension == 2:
         # time is at index 2
         # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
-        rho_r,vx_r,vy_r,phi_r = pde_residue(colloc_shifted, net, dimension = 2)
+        rho_r,vx_r,vy_r,phi_r = pde_residue(colloc_shifted, net, dimension = 2, use_log_density=USE_LOG_DENSITY)
 
     elif model.dimension == 3:
         # time is at index 3
         # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
-        rho_r,vx_r,vy_r,vz_r,phi_r = pde_residue(colloc_shifted, net, dimension = 3)
+        rho_r,vx_r,vy_r,vz_r,phi_r = pde_residue(colloc_shifted, net, dimension = 3, use_log_density=USE_LOG_DENSITY)
     
 
     mse_rho  = torch.mean(rho_r ** 2)
@@ -613,7 +697,7 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     
     return loss, loss_breakdown
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, adaptive_allocator=None):
     # Batched training is the default
     total_steps = iteration_adam + iterationL
     total_for_decay = max(1, int(total_steps * DECAY_PORTION))
@@ -637,12 +721,44 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True))
 
         with torch.autograd.no_grad():
-            if i % 200 == 0:
+            # Adaptive collocation allocation update
+            if adaptive_allocator is not None and adaptive_allocator.should_update(i):
+                print(f"\n=== Adaptive Collocation Update at iteration {i} ===")
+                
+                # Compute residuals at current points
+                residuals = adaptive_allocator.compute_residuals(net)
+                
+                # Redistribute points based on residuals
+                new_points = adaptive_allocator.redistribute_points(residuals, iteration=i)
+                
+                # Update collocation domain
+                collocation_domain = new_points
+                
+                # Store statistics
+                adaptive_allocator.allocation_history.append(i)
+                adaptive_allocator.residual_history.append(torch.mean(residuals).item())
+                
+                print(f"  Mean residual: {torch.mean(residuals).item():.2e}")
+                print(f"  Max residual: {torch.max(residuals).item():.2e}")
+                print(f"  Points redistributed successfully")
+                print(f"  Domain shape: {collocation_domain.shape}, first point: [{collocation_domain[0,0]:.3f}, {collocation_domain[0,1]:.3f}, {collocation_domain[0,2]:.3f}]")
+            
+            if i % 100 == 0:
                 print(f"Training Loss at {i} for Adam (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
                 # Print loss breakdown
                 breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
                 if breakdown_str:
                     print(f"  Loss breakdown: {breakdown_str}", flush=True)
+                
+                # Print causal weighting diagnostics
+                if causal_mode == "adaptive" and residual_tracker is not None and CAUSAL_PRINT_DIAGNOSTICS:
+                    residual_tracker.print_diagnostics(i, window_idx)
+
+    # Prepare collocation points for LBFGS phase
+    if adaptive_allocator is not None:
+        print(f"\n=== Preparing for LBFGS Phase ===")
+        collocation_domain = adaptive_allocator.prepare_for_lbfgs()
+        print(f"Collocation points prepared for LBFGS ({ADAPTIVE_COLLOCATION_LBFGS_MODE} mode)")
 
     for i in range(iterationL):
         optimizer.zero_grad()
@@ -663,7 +779,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown = loss_breakdown_holder[0]
 
         with torch.autograd.no_grad():
-            if i % 20 == 0:
+            if i % 50 == 0:
                 print(f"Training Loss at {i} for LBGFS (batched) in {model.dimension}D system = {loss.item():.2e}", flush=True)
                 # Print loss breakdown
                 breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
@@ -695,19 +811,31 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     num_effective_batches = 0
 
     # Determine counts and devices
-    dom_n = collocation_domain[0].size(0)
+    # Handle both formats: list of tensors [x, y, t] or single tensor [N, 3]
+    if isinstance(collocation_domain, (list, tuple)):
+        dom_n = collocation_domain[0].size(0)
+        device = collocation_domain[0].device
+    else:
+        dom_n = collocation_domain.size(0)
+        device = collocation_domain.device
+    
     ic_n = collocation_IC[0].size(0)
-    device = collocation_domain[0].device
 
     for _ in range(int(max(1, num_batches))):
         dom_idx = _random_batch_indices(dom_n, batch_size, device)
         ic_idx = _random_batch_indices(ic_n, batch_size, device)
 
-        batch_dom = _make_batch_tensors(collocation_domain, dom_idx)
+        # Handle both formats for collocation_domain
+        if isinstance(collocation_domain, (list, tuple)):
+            batch_dom = _make_batch_tensors(collocation_domain, dom_idx)
+        else:
+            # Single tensor format: split into [x, y, t]
+            batch_dom = [collocation_domain[dom_idx, i:i+1] for i in range(collocation_domain.shape[1])]
+        
         batch_ic = _make_batch_tensors(collocation_IC, ic_idx)
 
         # IC loss terms
-        rho_0 = fun_rho_0(rho_1, lam, batch_ic)
+        rho_0 = fun_rho_0(rho_1, lam, batch_ic, use_log_density=USE_LOG_DENSITY)
         vx_0  = fun_vx_0(lam, jeans, v_1, batch_ic)
 
         net_ic_out = net(batch_ic)
@@ -770,8 +898,13 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
                 vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
                 div_v0 = diff(vx0, x_ic, order=1)
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+                if USE_LOG_DENSITY:
+                    # For log-density: s_t ≈ -∇·v at t=0 (no rho_o factor)
+                    continuity_ic_loss = mse_cost_function(rho_t_ic, -div_v0)
+                else:
+                    # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
+                    rho0_field = rho_o * torch.ones_like(div_v0)
+                    continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
         elif model.dimension == 2:
             if is_sin:
                 continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
@@ -782,8 +915,13 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 dvx_dx = diff(vx0, x_ic, order=1)
                 dvy_dy = diff(vy0, y_ic, order=1)
                 div_v0 = dvx_dx + dvy_dy
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+                if USE_LOG_DENSITY:
+                    # For log-density: s_t ≈ -∇·v at t=0 (no rho_o factor)
+                    continuity_ic_loss = mse_cost_function(rho_t_ic, -div_v0)
+                else:
+                    # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
+                    rho0_field = rho_o * torch.ones_like(div_v0)
+                    continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
         else:
             if is_sin:
                 continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
@@ -796,23 +934,29 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 dvy_dy = diff(vy0, y_ic, order=1)
                 dvz_dz = diff(vz0, z_ic, order=1)
                 div_v0 = dvx_dx + dvy_dy + dvz_dz
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
+                if USE_LOG_DENSITY:
+                    # For log-density: s_t ≈ -∇·v at t=0 (no rho_o factor)
+                    continuity_ic_loss = mse_cost_function(rho_t_ic, -div_v0)
+                else:
+                    # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
+                    rho0_field = rho_o * torch.ones_like(div_v0)
+                    continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
 
         # PDE residuals on batched domain with startup shift
         if isinstance(batch_dom, (list, tuple)):
             colloc_shifted = list(batch_dom)
         else:
-            colloc_shifted = batch_dom
+            # Single tensor format: split into [x, y, t]
+            colloc_shifted = [batch_dom[:, i:i+1] for i in range(batch_dom.shape[1])]
         if model.dimension == 1:
             # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
-            rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
+            rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1, use_log_density=USE_LOG_DENSITY)
         elif model.dimension == 2:
             # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
-            rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
+            rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2, use_log_density=USE_LOG_DENSITY)
         else:
             # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
-            rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
+            rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3, use_log_density=USE_LOG_DENSITY)
 
         # Extract time values from batch_dom
         if model.dimension == 1:
@@ -853,6 +997,33 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 mse_vely = torch.mean(vy_r  ** 2)
                 mse_velz = torch.mean(vz_r  ** 2)
             mse_phi  = torch.mean(phi_r ** 2)
+        
+        # Diagnostic prints for residual scales and gradients
+        if CAUSAL_PRINT_RESIDUAL_SCALES:
+            print(f"\n=== Residual Scale Diagnostics ===")
+            print(f"Time range in batch: [{t_dom.min().item():.3f}, {t_dom.max().item():.3f}]")
+            print(f"Residual scales:")
+            print(f"  rho_r:  mean={torch.mean(rho_r.abs()).item():.2e}, std={torch.std(rho_r).item():.2e}, max={torch.max(rho_r.abs()).item():.2e}")
+            print(f"  vx_r:   mean={torch.mean(vx_r.abs()).item():.2e}, std={torch.std(vx_r).item():.2e}, max={torch.max(vx_r.abs()).item():.2e}")
+            if model.dimension >= 2:
+                print(f"  vy_r:   mean={torch.mean(vy_r.abs()).item():.2e}, std={torch.std(vy_r).item():.2e}, max={torch.max(vy_r.abs()).item():.2e}")
+            if model.dimension == 3:
+                print(f"  vz_r:   mean={torch.mean(vz_r.abs()).item():.2e}, std={torch.std(vz_r).item():.2e}, max={torch.max(vz_r.abs()).item():.2e}")
+            print(f"  phi_r:  mean={torch.mean(phi_r.abs()).item():.2e}, std={torch.std(phi_r).item():.2e}, max={torch.max(phi_r.abs()).item():.2e}")
+            
+            if causal_weights is not None:
+                print(f"Causal weights:")
+                print(f"  mean={torch.mean(causal_weights).item():.3f}, std={torch.std(causal_weights).item():.3f}")
+                print(f"  range=[{torch.min(causal_weights).item():.3f}, {torch.max(causal_weights).item():.3f}]")
+                print(f"  time-weighted residuals:")
+                print(f"    rho:  {torch.mean(causal_weights * (rho_r ** 2)).item():.2e}")
+                print(f"    vx:   {torch.mean(causal_weights * (vx_r ** 2)).item():.2e}")
+                if model.dimension >= 2:
+                    print(f"    vy:   {torch.mean(causal_weights * (vy_r ** 2)).item():.2e}")
+                if model.dimension == 3:
+                    print(f"    vz:   {torch.mean(causal_weights * (vz_r ** 2)).item():.2e}")
+                print(f"    phi:  {torch.mean(causal_weights * (phi_r ** 2)).item():.2e}")
+            print("=" * 50)
 
         if model.dimension == 1:
             base = mse_vx_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_phi
@@ -1246,7 +1417,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                     print(f"Error in subdomain {sub_idx}: {e}")
                     raise
             
-            if i % 200 == 0:
+            if i % 100 == 0:
                 avg_loss = sum(subdomain_losses) / len(subdomain_losses)
                 # Average component losses across subdomains
                 avg_pde = total_pde_loss / len(nets)
@@ -1265,7 +1436,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                 # Train all networks simultaneously
                 loss, loss_dict = optimizer.step(make_closure(optimizer))
             
-            if i % 200 == 0:
+            if i % 100 == 0:
                 with torch.autograd.no_grad():
                     print(f"XPINN Training Loss at {i} (Adam) = {loss.item():.2e}", flush=True)
                     # Print loss breakdown
@@ -1290,11 +1461,11 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
             optimizer_sub = torch.optim.LBFGS(
                 net.parameters(),
                 lr=1.0,
-                max_iter=20,
+                max_iter=50,
                 max_eval=None,
                 tolerance_grad=1e-11,
                 tolerance_change=1e-11,
-                history_size=200,
+                history_size=100,
                 line_search_fn='strong_wolfe'
             )
             
@@ -1380,7 +1551,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
             for i in range(iterationL):
                 loss = optimizer_sub.step(make_subdomain_lbfgs_closure(subdomain_idx, net))
                 
-                if i % 20 == 0:
+                if i % 50 == 0:
                     total_v, pde_v, ic_v, if_sol_v, if_res_v = _lbfgs_subdomain_breakdown(subdomain_idx, net)
                     print(
                         f"    Subdomain {subdomain_idx} L-BFGS step {i}: "

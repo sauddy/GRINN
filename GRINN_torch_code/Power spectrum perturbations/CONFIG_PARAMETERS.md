@@ -160,6 +160,18 @@ Causal training improves long-time predictions by using temporal curriculum lear
   - **Default**: "linear"
   - **Future**: Could support "exponential", "custom" schedules
 
+- `CAUSAL_USE_RESTARTS`: Use restart marching instead of expanding windows (bool)
+  - **False** (default): Expanding windows - train on [0, t₁], [0, t₂], ..., [0, tₘₐₓ]
+    - Network repeatedly trains on early times, reinforcing early-time accuracy
+    - Better for problems where early-time consistency is critical
+  - **True**: Restart marching - train on [t₀, t₁], [t₁, t₂], ..., [tₙ₋₁, tₘₐₓ]
+    - Network focuses on fresh time slabs with warm starts from previous window
+    - More stable for stiff/long-time dynamics (recommended for rapid growth)
+    - Automatically uses local bins (tracker reinitialized per window)
+    - Each window has internal early→late resolution
+  - **Default**: False
+  - **Recommendation**: Use True for stiff PDEs with rapid late-time growth (a=0.1, tmax≥3.0)
+
 ### Static Weighting Settings (CAUSAL_WEIGHTING_MODE = "static")
 - `CAUSAL_GAMMA_MAX`: Maximum gamma for exponential time-weighting (float)
   - **Purpose**: Controls strength of early-time emphasis in PDE residuals
@@ -180,9 +192,38 @@ Causal training improves long-time predictions by using temporal curriculum lear
   - **Purpose**: Controls how strongly past residuals suppress future time weights
   - **Formula**: w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k, θ))
   - **Range**: 0.1-2.0 recommended
-  - **Default**: 0.5
+  - **Default**: 0.8
   - **Tuning**: Lower for longer tmax (0.1-0.3 for tmax=2.0, 0.5-1.0 for tmax=0.5)
-  - **Effect**: Higher epsilon = weights shift forward only after early times converge well
+
+- `CAUSAL_EPSILON_FLOOR`: Minimum epsilon value to prevent flat weights (float)
+  - **Purpose**: Prevents epsilon from going to 0, maintaining causality in late windows (only used if USE_EPSILON_ANNEALING = False)
+  - **Range**: 0.0-0.3 (0.0 = no floor, weights can become uniform)
+  - **Default**: 0.15
+  - **Effect**: Keeps causal weighting active throughout training instead of reverting to uniform
+  - **Higher values**: Stronger causality maintained in final windows
+  - **Lower values**: Allows weights to become more uniform in late training
+  - **0.0**: Original behavior (epsilon → 0, weights become flat in final windows)
+
+- `USE_EPSILON_ANNEALING`: Enable automatic epsilon interpolation (bool)
+  - **Purpose**: Use automatic interpolation between MIN and MAX epsilon values
+  - **True**: Use CAUSAL_EPSILON_MIN and CAUSAL_EPSILON_MAX with automatic interpolation (recommended)
+  - **False**: Use linear decay from CAUSAL_EPSILON to CAUSAL_EPSILON_FLOOR
+  - **Default**: True
+  - **Paper recommendation**: Avoids hyper-parameter tuning by using automatic interpolation
+  - **Theory**: Small ε (early) = easy optimization, Large ε (later) = strong causality enforcement
+
+- `CAUSAL_EPSILON_MIN`: Starting epsilon value for interpolation (float)
+  - **Purpose**: Small epsilon value for early training windows (easy optimization)
+  - **Default**: 0.5
+  - **Range**: 0.1-2.0 recommended
+  - **Effect**: Lower values = easier early optimization, higher values = stronger early causality
+
+- `CAUSAL_EPSILON_MAX`: Final epsilon value for interpolation (float)
+  - **Purpose**: Large epsilon value for final training windows (strong causality enforcement)
+  - **Default**: 10.0
+  - **Range**: 5.0-50.0 recommended
+  - **Effect**: Higher values = stronger final causality enforcement
+  - **Formula**: ε_k = MIN + (MAX-MIN) * (k / (NUM_WINDOWS-1))
 
 - `CAUSAL_NUM_TIME_BINS`: Number of time bins for tracking residuals (int)
   - **Purpose**: Temporal resolution for adaptive weight calculation
@@ -203,6 +244,22 @@ Causal training improves long-time predictions by using temporal curriculum lear
   - **Custom**: Specify exact iterations per window
   - **Default**: None (auto-split)
   - **Example**: With iteration_lbgfs_2D=160 and 5 windows → 32 L-BFGS iterations per window
+
+### Diagnostic Settings
+
+- `CAUSAL_PRINT_DIAGNOSTICS`: Enable detailed causal weighting diagnostics (bool)
+  - **True**: Print per-bin residual tracking, effective weights, and attention analysis
+  - **False**: Disable detailed diagnostics (only basic loss info)
+  - **Default**: True
+  - **Output**: Shows bin-by-bin residual averages, update counts, effective weights, and attention distribution
+  - **Use**: Helps debug causal weighting effectiveness and identify flat weight issues
+
+- `CAUSAL_PRINT_RESIDUAL_SCALES`: Enable verbose residual scale diagnostics (bool)
+  - **True**: Print detailed residual statistics (mean, std, max) for each PDE term
+  - **False**: Disable verbose residual diagnostics
+  - **Default**: False (very verbose)
+  - **Output**: Shows residual scales, causal weight statistics, and time-weighted residuals
+  - **Use**: Helps identify scale imbalances between PDE terms and gradient issues
 
 ### How Causal Training Works
 
@@ -232,18 +289,109 @@ Causal training improves long-time predictions by using temporal curriculum lear
    - Adaptive weighting ensures proper causality enforcement
    - Together they provide robust training for long-time evolution
 
+### Interpreting Diagnostic Output
+
+When `CAUSAL_PRINT_DIAGNOSTICS = True`, you'll see output like:
+
+```
+=== Causal Weighting Diagnostics (Step 200) ===
+Window: 2, Epsilon: 0.400
+Bin | Time Range    | Avg Residual | Count | Effective Weight | Attention
+----|---------------|--------------|-------|-----------------|----------
+  0 |  0.010- 0.259 |     2.34e-03 |   156 |           1.000 | ACTIVE
+  1 |  0.259- 0.508 |     3.45e-03 |   142 |           0.847 | ACTIVE
+  2 |  0.508- 0.757 |     4.12e-03 |   138 |           0.712 | ACTIVE
+  3 |  0.757- 1.006 |     5.67e-03 |   134 |           0.598 | ACTIVE
+  4 |  1.006- 1.255 |     7.23e-03 |   130 |           0.501 | ACTIVE
+
+Total Attention: 245.3
+Weight Range: [0.501, 1.000]
+Weight Std: 0.199
+```
+
+**What to look for:**
+- **Effective Weight**: Should decrease with time (early bins > later bins)
+- **Weight Std**: Should be > 0.1 (if < 0.01, weights are nearly flat - problematic!)
+- **Attention**: Should be highest for early bins initially, then migrate forward
+- **Avg Residual**: Should decrease over training (convergence indicator)
+- **Count**: Should be roughly uniform across bins (sampling balance)
+
+**Warning signs:**
+- ⚠️ "Weights are nearly flat" → Increase `CAUSAL_EPSILON` or check residual scales
+- ⚠️ "Weights have low variance" → Consider adjusting epsilon or time bin count
+- All bins showing "INACTIVE" → Check time range and collocation point generation
+
+## Log-Density Transformation
+
+- `USE_LOG_DENSITY`: Enable log-density prediction (bool)
+  - **False** (default): Network predicts ρ directly
+  - **True**: Network predicts s = log(ρ), PDEs are transformed accordingly
+  - **Purpose**: Better numerical conditioning for exponential density growth
+  - **How it works**:
+    - Network outputs: s (log-density), vx, vy, φ instead of ρ, vx, vy, φ
+    - Continuity PDE becomes: s_t + v·∇s + ∇·v = 0 (linear in s)
+    - Momentum PDE becomes: v_t + (v·∇)v = -cs²∇s - ∇φ (for isothermal EOS)
+    - Poisson equation: ∇²φ = const·(exp(s) - ρ₀)
+    - Initial conditions: Network trained on s₀ = log(ρ₀)
+  - **Benefits**:
+    - Exponential growth (ρ: 1→100) becomes linear growth (s: 0→4.6)
+    - Better gradient scaling and optimizer stability
+    - Automatic positivity (ρ = exp(s) > 0 always)
+  - **When to use**: Stiff problems with rapid exponential growth (a=0.1, tmax≥3.0)
+  - **Note**: Only implemented for single PINN, not XPINN
+  - **Plotting**: Network outputs s; apply exp(s) to recover ρ for visualization
+
 ### Usage Examples
 
-**Adaptive Mode with Curriculum (Recommended for tmax=2.0)**:
+**Automatic Epsilon Interpolation (Recommended - from Paper)**:
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "adaptive"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 12
+USE_EPSILON_ANNEALING = True  # Use automatic interpolation
+CAUSAL_EPSILON_MIN = 0.5      # Starting value (easy optimization)
+CAUSAL_EPSILON_MAX = 10.0     # Final value (strong causality)
+CAUSAL_NUM_TIME_BINS = 10
+CAUSAL_ADAM_PER_WINDOW = None  # Auto-split
+CAUSAL_LBFGS_PER_WINDOW = None  # Auto-split
+```
+*This automatically interpolates: ε = [0.5, 1.3, 2.1, 2.9, 3.7, 4.5, 5.3, 6.1, 6.9, 7.7, 8.5, 10.0]*
+
+**Conservative Epsilon Range (for difficult/stiff problems)**:
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "adaptive"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 10
+USE_EPSILON_ANNEALING = True
+CAUSAL_EPSILON_MIN = 0.1      # Very gentle start
+CAUSAL_EPSILON_MAX = 5.0      # Moderate final strength
+CAUSAL_NUM_TIME_BINS = 10
+```
+
+**Aggressive Epsilon Range (for easier problems)**:
 ```python
 USE_CAUSAL_TRAINING = True
 CAUSAL_WEIGHTING_MODE = "adaptive"
 USE_CAUSAL_CURRICULUM = True
 CAUSAL_NUM_WINDOWS = 8
-CAUSAL_EPSILON = 0.5
+USE_EPSILON_ANNEALING = True
+CAUSAL_EPSILON_MIN = 1.0      # Strong start
+CAUSAL_EPSILON_MAX = 20.0     # Very strong final
 CAUSAL_NUM_TIME_BINS = 10
-CAUSAL_ADAM_PER_WINDOW = None  # Auto-split
-CAUSAL_LBFGS_PER_WINDOW = None  # Auto-split
+```
+
+**Adaptive Mode with Linear Decay (Original Method)**:
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "adaptive"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 8
+USE_EPSILON_ANNEALING = False  # Use linear decay instead
+CAUSAL_EPSILON = 0.8  # Starting value
+CAUSAL_EPSILON_FLOOR = 0.15  # Ending value
+CAUSAL_NUM_TIME_BINS = 10
 ```
 
 **Adaptive Mode without Curriculum** (for well-behaved problems):
@@ -251,6 +399,7 @@ CAUSAL_LBFGS_PER_WINDOW = None  # Auto-split
 USE_CAUSAL_TRAINING = True
 CAUSAL_WEIGHTING_MODE = "adaptive"
 USE_CAUSAL_CURRICULUM = False  # Train on full domain
+USE_EPSILON_ANNEALING = False
 CAUSAL_EPSILON = 0.3  # Lower epsilon for stability
 CAUSAL_NUM_TIME_BINS = 10
 ```
@@ -318,6 +467,242 @@ Using causal training with 5 temporal windows...
 ```
 Using causal training (no curriculum, full domain)...
   Weighting mode: Adaptive (epsilon: 0.3, time bins: 10)
+
+## **Adaptive Collocation Allocation (Single PINN Only)**
+
+This section describes the adaptive collocation allocation system that automatically redistributes collocation points based on PDE residuals to focus computational resources on high-error regions.
+
+### **Core Concept**
+
+Adaptive collocation allocation monitors PDE residuals during training and redistributes collocation points to focus on regions where the PINN is struggling to learn the physics. This is particularly useful for problems with sharp gradients, shocks, or complex multi-scale structures.
+
+### **Configuration Parameters**
+
+- `USE_ADAPTIVE_COLLOCATION`: Enable adaptive collocation allocation (bool)
+  - **Purpose**: Master switch for adaptive collocation system
+  - **True**: Enable adaptive point redistribution
+  - **False**: Use standard uniform collocation points
+  - **Default**: True
+  - **Note**: Only works with single PINN, not XPINN
+
+- `ADAPTIVE_FD_SPATIAL_GRID`: Spatial grid resolution for FD reference (int)
+  - **Purpose**: Grid resolution for generating FD reference solution
+  - **Default**: N_GRID (300)
+  - **Usage**: Reuses existing grid resolution from power spectrum generation
+  - **Effect**: Higher resolution = more accurate FD reference, but slower generation
+
+- `ADAPTIVE_FD_TIME_STEP`: Time step for FD reference solution (float)
+  - **Purpose**: Time step for generating FD reference solution
+  - **Default**: 0.1 (same as GROWTH_PLOT_DT)
+  - **Range**: 0.05-0.2 recommended
+  - **Effect**: Smaller step = finer temporal resolution, but slower generation
+  - **Note**: Number of time points is automatically calculated as int((tmax-tmin)/step) + 1
+
+- `ADAPTIVE_COLLOCATION_FREQUENCY`: Update frequency for point redistribution (int)
+  - **Purpose**: How often to redistribute collocation points
+  - **Default**: 1000 (every 1000 Adam iterations)
+  - **Range**: 500-2000 recommended
+  - **Effect**: Higher frequency = more responsive, but more computational overhead
+  - **0**: Disable adaptive updates
+
+- `ADAPTIVE_COLLOCATION_THRESHOLD_MODE`: Threshold strategy (str)
+  - **Purpose**: How to determine which points are "high error"
+  - **Options**: "percentile" (recommended) or "absolute"
+  - **Default**: "percentile"
+  - **Percentile mode**: Automatically adapts to residual scale (e.g., "top 25% worst residuals")
+  - **Absolute mode**: Uses fixed threshold values (requires manual tuning)
+  - **Effect**: Percentile mode is simpler and more robust across different problems
+
+### Percentile-Based Thresholds (Recommended)
+
+- `ADAPTIVE_COLLOCATION_PERCENTILE_INITIAL`: Initial percentile for high-error identification (float)
+  - **Purpose**: Starting percentile threshold (lenient, focuses on worst residuals)
+  - **Default**: 75.0 (identifies top 25% worst residuals as "high error")
+  - **Range**: 50.0-95.0 recommended
+  - **Guidance**:
+    - **90.0-95.0**: Very lenient (top 5-10% worst residuals)
+    - **75.0-85.0**: Lenient (top 15-25% worst residuals) - **RECOMMENDED START**
+    - **60.0-70.0**: Moderate (top 30-40% worst residuals)
+    - **50.0-60.0**: Strict (top 40-50% worst residuals)
+  - **Effect**: Higher percentile = more focused on extreme errors only
+
+- `ADAPTIVE_COLLOCATION_PERCENTILE_FINAL`: Final percentile for high-error identification (float)
+  - **Purpose**: Final percentile after progressive decay (strict, broader focus)
+  - **Default**: 50.0 (identifies top 50% worst residuals as "high error")
+  - **Range**: 30.0-70.0 recommended
+  - **Guidance**: Should be lower than initial to progressively broaden focus
+  - **Effect**: Lower percentile = more points identified as high-error in later training
+
+- `ADAPTIVE_COLLOCATION_PERCENTILE_DECAY_START`: Iteration to start percentile decay (int)
+  - **Purpose**: When to start making identification stricter
+  - **Default**: 400 (after basic physics learned)
+  - **Range**: 200-600 recommended
+  - **Effect**: Earlier start = faster transition to broader focus
+
+- `ADAPTIVE_COLLOCATION_PERCENTILE_DECAY_END`: Iteration to finish percentile decay (int)
+  - **Purpose**: When percentile reaches final value
+  - **Default**: 900 (gradual transition, completes before LBFGS)
+  - **Range**: 800-1200 recommended
+  - **Effect**: Longer decay = smoother transition
+
+### Absolute Thresholds (Advanced Users Only)
+
+- `ADAPTIVE_COLLOCATION_THRESHOLD_ABSOLUTE`: Initial absolute PDE residual threshold (float)
+  - **Purpose**: Starting threshold for identifying high-error regions (only used if MODE = "absolute")
+  - **Default**: 0.01
+  - **Units**: PDE residual magnitude (L2 norm of continuity + momentum equations)
+  - **Note**: Requires problem-specific tuning; percentile mode is easier
+
+- `ADAPTIVE_COLLOCATION_THRESHOLD_ABSOLUTE_FINAL`: Final absolute PDE residual threshold (float)
+  - **Purpose**: Final threshold after progressive decay
+  - **Default**: 0.001
+  - **Note**: Should be lower than initial for progressive refinement
+
+- `ADAPTIVE_COLLOCATION_RATIO_MODE`: Point redistribution strategy (str)
+  - **Purpose**: How to determine how many points to redistribute
+  - **Options**: "fixed" or "adaptive"
+  - **Default**: "adaptive"
+  - **"fixed"**: Use ADAPTIVE_COLLOCATION_FIXED_RATIO
+  - **"adaptive"**: Scale redistribution based on error distribution
+
+- `ADAPTIVE_COLLOCATION_FIXED_RATIO`: Fixed fraction of points to redistribute (float)
+  - **Purpose**: Fraction of points to redistribute in fixed mode
+  - **Default**: 0.3 (30%)
+  - **Range**: 0.1-0.5 recommended
+  - **Effect**: Higher ratio = more aggressive redistribution
+
+- `ADAPTIVE_COLLOCATION_MIN_POINTS`: Minimum points per region (int)
+  - **Purpose**: Prevent regions from being completely depopulated
+  - **Default**: 100
+  - **Range**: 50-200 recommended
+  - **Effect**: Ensures minimum coverage of all regions
+
+- `ADAPTIVE_COLLOCATION_MAX_POINTS`: Maximum points per region (int)
+  - **Purpose**: Prevent over-concentration in single regions
+  - **Default**: 5000
+  - **Range**: 1000-10000 recommended
+  - **Effect**: Prevents excessive point concentration
+
+- `ADAPTIVE_COLLOCATION_LBFGS_MODE`: LBFGS phase behavior (str)
+  - **Purpose**: How to handle collocation points during LBFGS phase
+  - **Options**: "uniform" or "adaptive"
+  - **Default**: "uniform"
+  - **"uniform"**: Redistribute points uniformly before LBFGS
+  - **"adaptive"**: Keep adaptive distribution during LBFGS
+
+- `ADAPTIVE_COLLOCATION_CAUSAL_COMPATIBLE`: Causal training compatibility (bool)
+  - **Purpose**: Ensure compatibility with causal training
+  - **Default**: True
+  - **Effect**: Filters adaptive points by time windows in causal training
+
+- `ADAPTIVE_COLLOCATION_RESIDUAL_BATCH_SIZE`: Batch size for residual computation (int)
+  - **Purpose**: Control memory usage during residual computation
+  - **Default**: 10000
+  - **Range**: 1000-20000 recommended
+  - **Effect**: Smaller batch = less memory, larger batch = faster computation
+  - **Memory Management**: Reduces GPU memory usage from ~24GB to manageable levels
+
+### **Debug Settings**
+
+- `ADAPTIVE_COLLOCATION_VERBOSE`: Enable detailed debug output for adaptive collocation troubleshooting (bool)
+  - **Purpose**: Control verbose debug output for adaptive collocation system
+  - **True**: Print detailed gradient flow, residual computation, and threshold information
+  - **False**: Print only essential information (recommended for normal use)
+  - **Default**: False
+  - **Debug Output Includes**:
+    - Gradient flow verification (requires_grad, is_leaf, torch.is_grad_enabled)
+    - Network output statistics (shape, range, gradient status)
+    - PDE residual statistics (min, max, mean for each equation)
+    - Manual gradient computation tests
+    - Batch-by-batch processing details
+  - **When to Enable**: When troubleshooting gradient issues, zero residuals, or unexpected behavior
+  - **Performance Impact**: Minimal (only affects print statements)
+
+### **How It Works**
+
+1. **FD Reference Generation**: 
+   - Generates FD solution using LAX solver on coarse grid
+   - Uses time step (ADAPTIVE_FD_TIME_STEP) to determine temporal resolution
+   - Creates interpolation functions for all fields (ρ, vx, vy, φ)
+   - Uses same grid resolution as power spectrum generation
+
+2. **Residual Monitoring**:
+   - Computes PINN-FD epsilon errors at current collocation points
+   - Uses same formula as plotting: ε = 200 * |PINN-FD| / (PINN+FD)
+   - Density: ε_ρ = 200 * |ρ_PINN - ρ_FD| / (ρ_PINN + ρ_FD)
+   - Velocity: ε_v = 200 * |v_PINN - v_FD| / (v_PINN + v_FD + 2)
+   - Combined: ε_total = 0.5*ε_ρ + 0.25*ε_vx + 0.25*ε_vy
+   - Identifies high-error regions using threshold
+   - Tracks epsilon error statistics over time
+
+3. **Point Redistribution**:
+   - Removes points from low-error regions
+   - Adds points near existing high-error points
+   - Maintains total point count
+   - Applies min/max point constraints
+
+4. **Integration with Training**:
+   - Updates points every N Adam iterations
+   - Prepares points for LBFGS phase
+   - Compatible with causal training windows
+
+### **Expected Benefits**
+
+- **Better Accuracy**: Focuses computational resources on difficult regions
+- **Efficient Training**: Reduces wasted computation on well-learned regions
+- **Automatic Adaptation**: No manual tuning of point distribution
+- **Problem-Agnostic**: Works for various types of physics problems
+
+### **Usage Examples**
+
+**Conservative Settings (for stable problems)**:
+```python
+USE_ADAPTIVE_COLLOCATION = True
+ADAPTIVE_FD_TIME_STEP = 0.2  # Coarser temporal resolution
+ADAPTIVE_COLLOCATION_FREQUENCY = 2000
+ADAPTIVE_COLLOCATION_THRESHOLD_MODE = "percentile"
+ADAPTIVE_COLLOCATION_PERCENTILE_INITIAL = 85.0  # Top 15% worst residuals
+ADAPTIVE_COLLOCATION_PERCENTILE_FINAL = 60.0    # Top 40% worst residuals
+ADAPTIVE_COLLOCATION_RATIO_MODE = "fixed"
+ADAPTIVE_COLLOCATION_FIXED_RATIO = 0.2
+ADAPTIVE_COLLOCATION_LBFGS_MODE = "uniform"
+```
+
+**Aggressive Settings (for difficult problems)**:
+```python
+USE_ADAPTIVE_COLLOCATION = True
+ADAPTIVE_FD_TIME_STEP = 0.05  # Finer temporal resolution
+ADAPTIVE_COLLOCATION_FREQUENCY = 500
+ADAPTIVE_COLLOCATION_THRESHOLD_MODE = "percentile"
+ADAPTIVE_COLLOCATION_PERCENTILE_INITIAL = 60.0  # Top 40% worst residuals
+ADAPTIVE_COLLOCATION_PERCENTILE_FINAL = 30.0    # Top 70% worst residuals
+ADAPTIVE_COLLOCATION_RATIO_MODE = "adaptive"
+ADAPTIVE_COLLOCATION_LBFGS_MODE = "adaptive"
+```
+
+**High Accuracy Settings (for critical applications)**:
+```python
+USE_ADAPTIVE_COLLOCATION = True
+ADAPTIVE_FD_TIME_STEP = 0.05  # Fine temporal resolution
+ADAPTIVE_COLLOCATION_FREQUENCY = 1000
+ADAPTIVE_COLLOCATION_THRESHOLD_MODE = "percentile"
+ADAPTIVE_COLLOCATION_PERCENTILE_INITIAL = 50.0  # Top 50% worst residuals
+ADAPTIVE_COLLOCATION_PERCENTILE_FINAL = 20.0    # Top 80% worst residuals
+ADAPTIVE_COLLOCATION_RATIO_MODE = "adaptive"
+ADAPTIVE_COLLOCATION_LBFGS_MODE = "adaptive"
+```
+
+**Disabled (for comparison)**:
+```python
+USE_ADAPTIVE_COLLOCATION = False
+```
+
+### **Compatibility Notes**
+
+- **Single PINN Only**: Not implemented for XPINN
+- **Causal Training**: Compatible with causal training windows
+- **Memory Usage**: FD solution generation requires additional memory
+- **Computational Overhead**: Initial FD generation + periodic updates
 Training Loss at 0 for Adam (batched) in 2D system = 1.45e-01
 ...
 ```
