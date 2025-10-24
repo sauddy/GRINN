@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from torch.autograd import Variable
-from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION
+from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, USE_LOG_DENSITY
 
 class Sin(nn.Module):
     def forward(self, input):
@@ -118,11 +118,20 @@ class PINN(nn.Module):
                 # For sinusoidal experiments, do not hard-constrain rho at t=0.
                 return outputs
             else:
-                rho_hat = outputs[:,0:1]
-                other = outputs[:,1:]
-                rho = rho_o + t * rho_hat
-                outputs_mod = torch.cat([rho, other], dim=1)
-                return outputs_mod
+                if USE_LOG_DENSITY:
+                    # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
+                    s_hat = outputs[:,0:1]
+                    other = outputs[:,1:]
+                    s = torch.log(torch.tensor(rho_o)) + t * s_hat
+                    outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
+                    return outputs_mod
+                else:
+                    # Original linear trick: ρ = ρ₀ + t × ρ̂
+                    rho_hat = outputs[:,0:1]
+                    other = outputs[:,1:]
+                    rho = rho_o + t * rho_hat
+                    outputs_mod = torch.cat([rho, other], dim=1)
+                    return outputs_mod
         
         elif len(X) == 3:
             if self.xmin is None or self.xmax is None or self.ymin is None or self.ymax is None:
@@ -136,11 +145,20 @@ class PINN(nn.Module):
             if str(PERTURBATION_TYPE).lower() == "sinusoidal":
                 return outputs
             else:
-                rho_hat = outputs[:,0:1]
-                other = outputs[:,1:]
-                rho = rho_o + t * rho_hat
-                outputs_mod = torch.cat([rho, other], dim=1)
-                return outputs_mod
+                if USE_LOG_DENSITY:
+                    # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
+                    s_hat = outputs[:,0:1]
+                    other = outputs[:,1:]
+                    s = torch.log(torch.tensor(rho_o)) + t * s_hat
+                    outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
+                    return outputs_mod
+                else:
+                    # Original linear trick: ρ = ρ₀ + t × ρ̂
+                    rho_hat = outputs[:,0:1]
+                    other = outputs[:,1:]
+                    rho = rho_o + t * rho_hat
+                    outputs_mod = torch.cat([rho, other], dim=1)
+                    return outputs_mod
         
         elif len(X) == 4:
             if (self.xmin is None or self.xmax is None or
@@ -159,11 +177,20 @@ class PINN(nn.Module):
             if str(PERTURBATION_TYPE).lower() == "sinusoidal":
                 return outputs
             else:
-                rho_hat = outputs[:,0:1]
-                other = outputs[:,1:]
-                rho = rho_o + t * rho_hat
-                outputs_mod = torch.cat([rho, other], dim=1)
-                return outputs_mod
+                if USE_LOG_DENSITY:
+                    # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
+                    s_hat = outputs[:,0:1]
+                    other = outputs[:,1:]
+                    s = torch.log(torch.tensor(rho_o)) + t * s_hat
+                    outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
+                    return outputs_mod
+                else:
+                    # Original linear trick: ρ = ρ₀ + t × ρ̂
+                    rho_hat = outputs[:,0:1]
+                    other = outputs[:,1:]
+                    rho = rho_o + t * rho_hat
+                    outputs_mod = torch.cat([rho, other], dim=1)
+                    return outputs_mod
         
         else:
             raise ValueError(f"Expected len(X) in [2, 3, 4] but got {len(X)}")

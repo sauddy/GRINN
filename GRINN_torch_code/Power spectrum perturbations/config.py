@@ -15,7 +15,7 @@ G = 1.0
 
 # Collocation point parameters
 N_0 = 10000  # Number of initial condition points
-N_r = 120000 # Number of residual/collocation points
+N_r = 80000 # Number of residual/collocation points
 DIMENSION = 2  # Spatial dimension
 
 # Number of collocation/IC points per mini-batch and
@@ -23,16 +23,16 @@ DIMENSION = 2  # Spatial dimension
 BATCH_SIZE = 60000
 NUM_BATCHES = 1
 
-a = 0.01
+a = 0.1
 
 tmin = 0.
-tmax = 5.0
+tmax = 3.0
 
 num_neurons = 64
 harmonics = 3
 num_layers = 5
 
-wave = 7.0
+wave = 5.0
 k = 2 * np.pi / wave
 
 iteration_adam_2D = 1001
@@ -46,7 +46,7 @@ SNAPSHOT_DIR = "/kaggle/working/"
 
 KX = k
 KY = 0
-TIMES_1D = [1.5, 3.0, 4.5] # 1D cross-section times to plot (used for sinusoidal panel plots
+TIMES_1D = [3.5, 7.0, 10.5] # 1D cross-section times to plot (used for sinusoidal panel plots
 FD_N_1D = 1000  # Grid points for 1D LAX (when used)
 FD_N_2D = 300  # Grid points per dimension for 2D LAX
 
@@ -60,7 +60,7 @@ DECAY_PORTION = 0.5 # Fraction of total training steps over which to fully decay
 
 # ==================== Causal Training Configuration ====================
 # Enable causal training with temporal curriculum + time-weighted residuals
-USE_CAUSAL_TRAINING = True
+USE_CAUSAL_TRAINING = False
 
 # Causal Weighting Mode
 CAUSAL_WEIGHTING_MODE = "adaptive"  # "static" or "adaptive"
@@ -69,7 +69,7 @@ CAUSAL_WEIGHTING_MODE = "adaptive"  # "static" or "adaptive"
 
 # Temporal Curriculum Settings
 USE_CAUSAL_CURRICULUM = False    # Enable temporal curriculum windows (recommended with adaptive, optional otherwise)
-CAUSAL_NUM_WINDOWS = 12          # Number of progressive time windows
+CAUSAL_NUM_WINDOWS = 8          # Number of progressive time windows
 CAUSAL_WINDOW_SCHEDULE = "linear"  # Time window schedule type (currently only "linear" supported)
 CAUSAL_USE_RESTARTS = False      # Use restart marching [t_k, t_{k+1}] instead of expanding windows [0, t_k]
 # Restart marching: train on non-overlapping time slabs with warm starts from previous slab
@@ -100,7 +100,7 @@ CAUSAL_EPSILON_MAX = 2.0     # Final epsilon value (large, strong causality enfo
 # This ensures monotonic increase: ε_k = MIN + (MAX-MIN) * (k / (NUM_WINDOWS-1))
 # Paper recommendation: Start small → increase gradually to strengthen causality enforcement
 
-CAUSAL_NUM_TIME_BINS = 20       # Number of time bins for tracking residuals within each window
+CAUSAL_NUM_TIME_BINS = 10       # Number of time bins for tracking residuals within each window
 # More bins = finer temporal resolution for adaptive weights
 
 # Iterations per Window (if None, splits total iterations equally)
@@ -152,7 +152,7 @@ ADAPTIVE_COLLOCATION_VERBOSE = False  # Print detailed debug output for adaptive
 
 # ==================== Log-Density Transformation ====================
 # Predict s = log(rho) instead of rho to handle exponential growth better
-USE_LOG_DENSITY = False  # Enable log-density prediction (only for single PINN, not XPINN)
+USE_LOG_DENSITY = True  # Enable log-density prediction (only for single PINN, not XPINN)
 # - Transforms continuity equation to: s_t + v·∇s + ∇·v = 0 (linear in s)
 # - Transforms momentum to: v_t + (v·∇)v = -cs²∇s + g (for isothermal EOS)
 # - Poisson remains: ∇²φ = 4πG·exp(s)
