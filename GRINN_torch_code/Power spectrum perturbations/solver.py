@@ -2,11 +2,12 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
 from losses import ASTPN, pde_residue
 from data_generator import diff
 from model_architecture import PINN
-from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED, CAUSAL_PRINT_DIAGNOSTICS, CAUSAL_PRINT_RESIDUAL_SCALES, USE_LOG_DENSITY, ADAPTIVE_COLLOCATION_LBFGS_MODE
+from config import cs, const, G, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED, CAUSAL_PRINT_DIAGNOSTICS, CAUSAL_PRINT_RESIDUAL_SCALES, USE_LOG_DENSITY, ADAPTIVE_COLLOCATION_LBFGS_MODE, USE_SPECTRAL_POISSON, SPECTRAL_POISSON_GRID_SIZE, SPECTRAL_POISSON_WEIGHT, SPECTRAL_POISSON_FREQUENCY, SPECTRAL_POISSON_TIMES, SPECTRAL_POISSON_WEIGHT_HIGH_K, SPECTRAL_POISSON_IN_LBFGS, USE_FFT_PHI, FFT_GRID_SIZE, FFT_PHI_SUPERVISE_WEIGHT, FFT_PHI_IN_LBFGS, FFT_PHI_MEMORY_CLEANUP
 
 class ResidualTracker:
     """
@@ -116,7 +117,7 @@ class ResidualTracker:
         past_residual_sum = cumsum_shifted[bin_idx_flat]
         
         # Apply exponential suppression with floor to prevent starving later times
-        weights = torch.exp(-self.epsilon * past_residual_sum).clamp_min(0.1)
+        weights = torch.exp(-self.epsilon * past_residual_sum).clamp_min(0.02)
         
         return weights.unsqueeze(-1) if weights.dim() == 1 else weights
     
@@ -261,6 +262,133 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
     _shared_vy_interp = vy_interp
     
     return vx_np, vy_np
+
+def compute_spectral_poisson_loss(net, xmin, xmax, ymin, ymax, device):
+    """
+    Compute spectral Poisson consistency loss using FFT-based global enforcement.
+    
+    This enforces Poisson's equation ∇²φ = const·(ρ - ρ₀) globally in Fourier space,
+    providing stronger gravitational coupling than pointwise residuals alone.
+    
+    Args:
+        net: Neural network
+        xmin, xmax, ymin, ymax: Domain boundaries
+        device: PyTorch device
+        
+    Returns:
+        Spectral Poisson loss (scalar tensor)
+    """
+    if not USE_SPECTRAL_POISSON:
+        return torch.tensor(0.0, device=device)
+    
+    M = SPECTRAL_POISSON_GRID_SIZE
+    
+    # Create regular grid
+    xg = torch.linspace(xmin, xmax, M, device=device)
+    yg = torch.linspace(ymin, ymax, M, device=device)
+    Xg, Yg = torch.meshgrid(xg, yg, indexing='ij')
+    
+    # Evaluate at multiple times for better coverage
+    total_loss = 0.0
+    for t_val in SPECTRAL_POISSON_TIMES:
+        tg = torch.full_like(Xg, t_val)
+        
+        # Get network outputs on grid
+        outg = net([Xg.flatten(), Yg.flatten(), tg.flatten()])
+        s = outg[:, 0:1].view(M, M)      # log-density
+        phi = outg[:, 3:4].view(M, M)     # predicted potential
+        
+        # Clamp and sanitize before exponentiation/FFT
+        s = torch.clamp(s, -20.0, 20.0)
+        s = torch.nan_to_num(s, nan=0.0)
+        phi = torch.clamp(phi, -1e6, 1e6)
+        phi = torch.nan_to_num(phi, nan=0.0)
+        
+        # Convert log-density to density
+        if USE_LOG_DENSITY:
+            rho = torch.exp(s)
+        else:
+            rho = s
+        
+        # Sanitize density
+        rho = torch.nan_to_num(rho, nan=1.0, posinf=1e6, neginf=0.0)
+        
+        # Take FFT of both sides of Poisson equation
+        rho_hat = torch.fft.rfftn(rho - rho_o)  # FFT of (ρ - ρ₀)
+        phi_hat = torch.fft.rfftn(phi)          # FFT of φ
+        
+        # Construct |k|² (wave number squared)
+        Lx = xmax - xmin
+        Ly = ymax - ymin
+        kx = 2*torch.pi*torch.fft.fftfreq(M, d=Lx/M).to(device).view(M, 1)
+        ky = 2*torch.pi*torch.fft.rfftfreq(M, d=Ly/M).to(device).view(1, M//2+1)
+        k2 = kx**2 + ky**2
+        k2[0, 0] = 1.0  # avoid division by zero (we ignore DC mode anyway)
+        
+        # Poisson equation in Fourier space: -k²φ̂ = const·(ρ̂ - ρ₀̂)
+        # So the residual is: -k²φ̂ - const·(ρ̂ - ρ₀̂)
+        res = (-(k2)*phi_hat - const*rho_hat)
+        
+        # Magnitude-squared with optional high-k downweight
+        res_mag2 = res.real.pow(2) + res.imag.pow(2)
+        if SPECTRAL_POISSON_WEIGHT_HIGH_K:
+            res_mag2 = res_mag2 / (1.0 + torch.sqrt(k2))**2
+        
+        # Stable mean
+        spec_loss = res_mag2.mean()
+        spec_loss = torch.nan_to_num(spec_loss, nan=0.0, posinf=1e6)
+        spec_loss = torch.clamp(spec_loss, 1e-12, 1e6)
+        total_loss += spec_loss
+    
+    return total_loss / len(SPECTRAL_POISSON_TIMES)
+
+
+def solve_poisson_fft(rho_grid, xmin, xmax, ymin, ymax, const_val, device):
+    """
+    Solve Poisson equation ∇²φ = const·(ρ - ρ₀) using FFT.
+    
+    Args:
+        rho_grid: Density field on regular grid [M, M]
+        xmin, xmax, ymin, ymax: Domain boundaries
+        const_val: Constant in Poisson equation (4πG for gravity)
+        device: PyTorch device
+    
+    Returns:
+        phi: Gravitational potential [M, M]
+        dphidx: ∂φ/∂x [M, M]
+        dphidy: ∂φ/∂y [M, M]
+    """
+    M = rho_grid.shape[0]
+    Lx = xmax - xmin
+    Ly = ymax - ymin
+    
+    # Take FFT of density perturbation
+    rho_hat = torch.fft.rfftn(rho_grid - rho_o)
+    
+    # Build wave number grid
+    kx = 2*torch.pi*torch.fft.fftfreq(M, d=Lx/M).to(device).view(M, 1)
+    ky = 2*torch.pi*torch.fft.rfftfreq(M, d=Ly/M).to(device).view(1, M//2+1)
+    k2 = kx**2 + ky**2
+    k2[0, 0] = 1.0  # Avoid division by zero at DC (will be set to 0 anyway)
+    
+    # Solve Poisson in Fourier space: φ̂ = -const·ρ̂ / k²
+    phi_hat = -const_val * rho_hat / k2
+    phi_hat[0, 0] = 0.0  # DC component (mean potential) = 0
+    
+    # Inverse FFT to get φ
+    phi = torch.fft.irfftn(phi_hat, s=(M, M))
+    
+    # Compute gradients in Fourier space: ∂φ/∂x ↔ i·kx·φ̂, ∂φ/∂y ↔ i·ky·φ̂
+    i = torch.complex(torch.tensor(0.0, device=device), torch.tensor(1.0, device=device))
+    dphidx_hat = i * kx * phi_hat
+    dphidy_hat = i * ky * phi_hat
+    
+    # Inverse FFT to get gradients
+    dphidx = torch.fft.irfftn(dphidx_hat, s=(M, M)).real
+    dphidy = torch.fft.irfftn(dphidy_hat, s=(M, M)).real
+    
+    return phi, dphidx, dphidy
+
 
 def generate_power_spectrum_field(lam, v_1, x, seed=None):
     '''Generate 2D Gaussian random field with power spectrum using shared fields if available'''
@@ -718,7 +846,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True))
 
         with torch.autograd.no_grad():
             # Adaptive collocation allocation update
@@ -771,7 +899,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
@@ -798,7 +926,7 @@ def _make_batch_tensors(tensors_list, indices):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True):
+                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None):
 
     def _causal_weight_static(t_values, gamma):
         """Compute static causal weights: w(t) = exp(-gamma * t)"""
@@ -958,6 +1086,124 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
             # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
             rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3, use_log_density=USE_LOG_DENSITY)
 
+        # FFT-based Poisson solver (optional replacement for φ head)
+        # Skip during LBFGS to avoid memory issues unless explicitly enabled
+        if USE_FFT_PHI and model.dimension == 2 and (use_fft_poisson is None or use_fft_poisson):
+            print(f"DEBUG: FFT Poisson ENABLED at iteration {iteration}")
+            # Compute φ and ∇φ via FFT Poisson solve
+            M = min(FFT_GRID_SIZE, 32)  # Cap at 32 for memory safety
+            device = loss.device if 'loss' in locals() else colloc_shifted[0].device
+            
+            # Build evaluation grid
+            xg = torch.linspace(net.xmin, net.xmax, M, device=device)
+            yg = torch.linspace(net.ymin, net.ymax, M, device=device)
+            Xg, Yg = torch.meshgrid(xg, yg, indexing='ij')
+            
+            # Get unique time values from batch (limit to 2 for memory)
+            t_dom_temp = colloc_shifted[2]
+            t_unique = torch.unique(t_dom_temp.flatten())
+            if t_unique.numel() > 2:
+                t_unique = torch.stack([t_unique.min(), t_unique.max()])
+            
+            # Helper to normalize coordinates to [-1, 1] for grid_sample
+            def to_grid_coords(vals, vmin, vmax):
+                return 2.0 * (vals - vmin) / (vmax - vmin) - 1.0
+            
+            # Process each time value
+            phi_fft_loss = torch.tensor(0.0, device=device)
+            for t_val in t_unique:
+                # Evaluate network on grid at this time
+                tg = torch.full_like(Xg, t_val.item())
+                outg = net([Xg.flatten(), Yg.flatten(), tg.flatten()])
+                s_grid = outg[:, 0:1].view(M, M)
+                phi_pred_grid = outg[:, 3:4].view(M, M)
+                
+                # Clamp and sanitize
+                s_grid = torch.clamp(s_grid, -20.0, 20.0)
+                s_grid = torch.nan_to_num(s_grid, nan=0.0)
+                
+                # Convert to density
+                if USE_LOG_DENSITY:
+                    rho_grid = torch.exp(s_grid)
+                else:
+                    rho_grid = s_grid
+                rho_grid = torch.nan_to_num(rho_grid, nan=1.0, posinf=1e6, neginf=0.0)
+                
+                # Solve Poisson via FFT
+                phi_fft, dphidx_fft, dphidy_fft = solve_poisson_fft(
+                    rho_grid, net.xmin, net.xmax, net.ymin, net.ymax, const, device
+                )
+                
+                # Optional: supervise φ head with FFT solution
+                if FFT_PHI_SUPERVISE_WEIGHT > 0:
+                    phi_fft_loss += torch.mean((phi_pred_grid - phi_fft.detach()) ** 2)
+                
+                # Sample FFT-computed gradients at collocation points with this time
+                # Mask points at this time value
+                time_mask = (t_dom_temp.flatten() - t_val.item()).abs() < 1e-6
+                if time_mask.any():
+                    x_pts = colloc_shifted[0][time_mask]
+                    y_pts = colloc_shifted[1][time_mask]
+                    
+                    # Prepare grids for sampling [1, 1, H, W]
+                    dphidx_4d = dphidx_fft.unsqueeze(0).unsqueeze(0)
+                    dphidy_4d = dphidy_fft.unsqueeze(0).unsqueeze(0)
+                    
+                    # Build sampling grid [1, N, 1, 2]
+                    grid_pts = torch.stack([
+                        to_grid_coords(x_pts, net.xmin, net.xmax),
+                        to_grid_coords(y_pts, net.ymin, net.ymax)
+                    ], dim=-1).view(1, -1, 1, 2)
+                    
+                    # Sample gradients
+                    dphidx_sampled = F.grid_sample(dphidx_4d, grid_pts, mode='bilinear', 
+                                                    align_corners=True, padding_mode='border').view(-1, 1)
+                    dphidy_sampled = F.grid_sample(dphidy_4d, grid_pts, mode='bilinear',
+                                                    align_corners=True, padding_mode='border').view(-1, 1)
+                    
+                    # Recompute momentum residuals with FFT-based gradients
+                    # For log-density: vx_r = vx_t + vx*vx_x + vy*vx_y + cs²*s_x + phi_x
+                    # We need to replace the phi_x, phi_y terms
+                    if USE_LOG_DENSITY:
+                        # Get network outputs and derivatives at these points
+                        x_m = colloc_shifted[0][time_mask].requires_grad_(True)
+                        y_m = colloc_shifted[1][time_mask].requires_grad_(True)
+                        t_m = colloc_shifted[2][time_mask].requires_grad_(True)
+                        
+                        out_m = net([x_m, y_m, t_m])
+                        s_m = out_m[:, 0:1]
+                        vx_m = out_m[:, 1:2]
+                        vy_m = out_m[:, 2:3]
+                        
+                        # Compute derivatives
+                        s_t = diff(s_m, t_m, order=1)
+                        s_x = diff(s_m, x_m, order=1)
+                        s_y = diff(s_m, y_m, order=1)
+                        vx_t = diff(vx_m, t_m, order=1)
+                        vy_t = diff(vy_m, t_m, order=1)
+                        vx_x = diff(vx_m, x_m, order=1)
+                        vx_y = diff(vx_m, y_m, order=1)
+                        vy_x = diff(vy_m, x_m, order=1)
+                        vy_y = diff(vy_m, y_m, order=1)
+                        
+                        # Recompute residuals with FFT gradients
+                        vx_r[time_mask] = vx_t + vx_m * vx_x + vy_m * vx_y + cs*cs * s_x + dphidx_sampled
+                        vy_r[time_mask] = vy_t + vx_m * vy_x + vy_m * vy_y + cs*cs * s_y + dphidy_sampled
+                
+                # Clear GPU cache after each time iteration
+                if FFT_PHI_MEMORY_CLEANUP and device.type == 'cuda':
+                    torch.cuda.empty_cache()
+            
+            # Disable phi residual loss entirely (FFT handles Poisson coupling)
+            phi_r = torch.zeros_like(phi_r)
+            
+            # Clear GPU cache if enabled
+            if FFT_PHI_MEMORY_CLEANUP and device.type == 'cuda':
+                torch.cuda.empty_cache()
+        else:
+            if USE_FFT_PHI and model.dimension == 2:
+                print(f"DEBUG: FFT Poisson DISABLED at iteration {iteration} (use_fft_poisson={use_fft_poisson})")
+
         # Extract time values from batch_dom
         if model.dimension == 1:
             t_dom = batch_dom[1]
@@ -1035,6 +1281,28 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
             base = mse_vx_ic + mse_vy_ic + mse_vz_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
+        # Add FFT phi supervision loss (if enabled)
+        if USE_FFT_PHI and model.dimension == 2 and FFT_PHI_SUPERVISE_WEIGHT > 0 and (use_fft_poisson is None or use_fft_poisson):
+            # phi_fft_loss is accumulated from the FFT block above
+            if 'phi_fft_loss' in locals() and phi_fft_loss.numel() > 0:
+                loss = loss + FFT_PHI_SUPERVISE_WEIGHT * (phi_fft_loss / max(1, t_unique.numel()))
+
+        # Add spectral Poisson consistency loss (2D, periodic evaluation)
+        if USE_SPECTRAL_POISSON and model.dimension == 2 and (use_fft_poisson is None or use_fft_poisson):
+            # Skip during LBFGS unless explicitly allowed
+            import torch.optim as _optim
+            is_lbfgs = isinstance(optimizer, _optim.LBFGS)
+            if (SPECTRAL_POISSON_IN_LBFGS or not is_lbfgs) and \
+               (SPECTRAL_POISSON_FREQUENCY == 0 or iteration % SPECTRAL_POISSON_FREQUENCY == 0):
+                # Get domain boundaries from model
+                xmin, xmax = net.xmin, net.xmax
+                ymin, ymax = net.ymin, net.ymax
+                device = loss.device
+                
+                # Compute spectral Poisson loss
+                spectral_loss = compute_spectral_poisson_loss(net, xmin, xmax, ymin, ymax, device)
+                loss = loss + SPECTRAL_POISSON_WEIGHT * spectral_loss
+
         # Update residual tracker AFTER computing loss (only during Adam)
         # This ensures the tracker uses only past history for weight computation
         if causal_mode == "adaptive" and residual_tracker is not None and update_tracker:
@@ -1052,6 +1320,10 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     optimizer.zero_grad()
     avg_loss = total_loss / max(1, num_effective_batches)
     avg_loss.backward(retain_graph=True)
+    
+    # Aggressive memory cleanup after backward pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # Create loss breakdown dictionary (averaged across batches)
     loss_breakdown = {}

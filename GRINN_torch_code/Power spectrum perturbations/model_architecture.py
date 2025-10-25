@@ -122,7 +122,7 @@ class PINN(nn.Module):
                     # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
                     s_hat = outputs[:,0:1]
                     other = outputs[:,1:]
-                    s = torch.log(torch.tensor(rho_o)) + t * s_hat
+                    s = t.new_tensor(rho_o).log() + t * s_hat
                     outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
                     return outputs_mod
                 else:
@@ -149,7 +149,7 @@ class PINN(nn.Module):
                     # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
                     s_hat = outputs[:,0:1]
                     other = outputs[:,1:]
-                    s = torch.log(torch.tensor(rho_o)) + t * s_hat
+                    s = t.new_tensor(rho_o).log() + t * s_hat
                     outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
                     return outputs_mod
                 else:
@@ -181,7 +181,7 @@ class PINN(nn.Module):
                     # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
                     s_hat = outputs[:,0:1]
                     other = outputs[:,1:]
-                    s = torch.log(torch.tensor(rho_o)) + t * s_hat
+                    s = t.new_tensor(rho_o).log() + t * s_hat
                     outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
                     return outputs_mod
                 else:

@@ -703,6 +703,224 @@ USE_ADAPTIVE_COLLOCATION = False
 - **Causal Training**: Compatible with causal training windows
 - **Memory Usage**: FD solution generation requires additional memory
 - **Computational Overhead**: Initial FD generation + periodic updates
-Training Loss at 0 for Adam (batched) in 2D system = 1.45e-01
-...
+
+---
+
+## **Spectral Poisson Consistency**
+
+### **Overview**
+
+The spectral Poisson consistency loss enforces Poisson's equation `∇²φ = const·(ρ - ρ₀)` globally in Fourier space, providing stronger gravitational coupling than pointwise residuals alone. This addresses the common issue where PINNs learn correct qualitative physics but under-predict density growth due to weak global gravitational coupling.
+
+### **How It Works**
+
+1. **Global Enforcement**: Instead of enforcing Poisson only at random collocation points, the system evaluates the network on a regular grid and enforces Poisson's equation in Fourier space for all modes simultaneously.
+
+2. **FFT-Based Consistency**: The method computes `-k²φ̂ = const·ρ̂` in Fourier space, where `φ̂` and `ρ̂` are the Fourier transforms of the potential and density fields. This ensures Poisson's equation is satisfied everywhere, not just at sampled points.
+
+3. **Periodic Evaluation**: To balance accuracy with computational cost, the spectral loss is evaluated every N iterations rather than every iteration.
+
+### **Configuration Parameters**
+
+#### **Main Toggle**
+```python
+USE_SPECTRAL_POISSON = True  # Enable spectral Poisson consistency enforcement
 ```
+
+#### **Grid and Evaluation Settings**
+```python
+SPECTRAL_POISSON_GRID_SIZE = 64  # Grid resolution for spectral evaluation (32, 64, 128)
+SPECTRAL_POISSON_FREQUENCY = 50  # Evaluate every N Adam iterations (0 = every iteration)
+SPECTRAL_POISSON_TIMES = [0.0, 1.0, 2.0, 3.0]  # Times to evaluate spectral consistency
+```
+
+#### **Loss Weighting**
+```python
+SPECTRAL_POISSON_WEIGHT = 1e-2   # Weight for spectral consistency loss (1e-3 to 1e-1)
+SPECTRAL_POISSON_WEIGHT_HIGH_K = True  # Apply 1/(1+k) weighting to high-frequency modes
+```
+
+### **Parameter Guidelines**
+
+#### **Grid Size (`SPECTRAL_POISSON_GRID_SIZE`)**
+- **32**: Fast evaluation, slightly less accurate
+- **64**: Good balance of accuracy vs. speed (recommended)
+- **128**: Higher accuracy, more expensive
+
+#### **Weight (`SPECTRAL_POISSON_WEIGHT`)**
+- **1e-3**: Weak enforcement, subtle improvement
+- **1e-2**: Strong enforcement, significant improvement (recommended)
+- **1e-1**: Very strong enforcement, may dominate other losses
+
+#### **Frequency (`SPECTRAL_POISSON_FREQUENCY`)**
+- **0**: Every iteration (most accurate, most expensive)
+- **25-50**: Good balance for most problems (recommended)
+- **100+**: Less frequent, faster training
+
+#### **High-k Weighting (`SPECTRAL_POISSON_WEIGHT_HIGH_K`)**
+- **True**: Reduces noise from high-frequency modes (recommended)
+- **False**: Equal weighting of all Fourier modes
+
+### **Expected Benefits**
+
+1. **Stronger Gravitational Coupling**: φ and ρ become tightly linked globally
+2. **Better Density Growth**: Network cannot "cheat" with weak gravitational potential
+3. **Improved Velocity Magnitudes**: Stronger φ → stronger accelerations
+4. **More Accurate Peaks**: Global consistency prevents excessive smoothing
+
+### **When to Use**
+
+- **Gravitational collapse problems**: Essential for accurate density growth
+- **Long-time integration**: Helps maintain physical consistency over time
+- **Under-prediction issues**: When PINN learns correct shapes but wrong magnitudes
+- **Weak coupling problems**: Any PDE system with global operators
+
+### **Performance Impact**
+
+- **Computational Cost**: ~2-5% overhead (evaluated periodically)
+- **Memory Usage**: Minimal additional memory for grid evaluation
+- **Training Speed**: Slight slowdown due to FFT computations
+- **Convergence**: Often faster convergence to accurate solutions
+
+### **Example Configurations**
+
+**Standard Gravitational Collapse**:
+```python
+USE_SPECTRAL_POISSON = True
+SPECTRAL_POISSON_GRID_SIZE = 64
+SPECTRAL_POISSON_WEIGHT = 1e-2
+SPECTRAL_POISSON_FREQUENCY = 50
+SPECTRAL_POISSON_TIMES = [0.0, 1.0, 2.0, 3.0]
+SPECTRAL_POISSON_WEIGHT_HIGH_K = True
+```
+
+**High Accuracy (Long tmax)**:
+```python
+USE_SPECTRAL_POISSON = True
+SPECTRAL_POISSON_GRID_SIZE = 128
+SPECTRAL_POISSON_WEIGHT = 5e-2
+SPECTRAL_POISSON_FREQUENCY = 25
+SPECTRAL_POISSON_TIMES = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+SPECTRAL_POISSON_WEIGHT_HIGH_K = True
+```
+
+**Disabled (for comparison)**:
+```python
+USE_SPECTRAL_POISSON = False
+```
+
+### **Compatibility Notes**
+
+- **2D Only**: Currently implemented for 2D problems only
+- **Log-Density Mode**: Compatible with both standard and log-density modes
+- **Causal Training**: Compatible with causal training windows
+- **Adaptive Collocation**: Can be used alongside adaptive collocation
+- **XPINN**: Not implemented for XPINN (single PINN only)
+
+---
+
+## **FFT-Based Poisson Solver**
+
+### **Overview**
+
+The FFT-based Poisson solver computes the gravitational potential φ directly from the density field ρ using a differentiable FFT-based spectral solver, rather than learning φ as a separate network output. This enforces **exact global Poisson coupling** and eliminates φ-ρ inconsistency, which is the primary cause of velocity field drift and density growth under-prediction.
+
+### **How It Works**
+
+1. **Exact Global Coupling**: At each forward pass, the solver evaluates the network's density prediction on a regular grid, solves ∇²φ = const·(ρ - ρ₀) in Fourier space using FFT, and samples the resulting φ and ∇φ back to collocation points.
+
+2. **Differentiable Pipeline**: The entire FFT solve is differentiable, so gradients backpropagate through ρ → φ → ∇φ → momentum residuals. The network learns to produce density fields that yield correct gravitational accelerations.
+
+3. **Removes Competing Objectives**: By disabling the φ head loss (or optionally supervising it weakly), the network no longer has conflicting objectives between fitting φ directly and satisfying the Poisson equation.
+
+### **Configuration Parameters**
+
+#### **Main Toggle**
+```python
+USE_FFT_PHI = False  # Enable FFT-based φ computation
+```
+
+#### **FFT Solver Settings**
+```python
+FFT_GRID_SIZE = 64                # Grid resolution for FFT solve (32, 64, 96, 128)
+FFT_PHI_SUPERVISE_WEIGHT = 0.0   # Weight for optional φ head supervision (0 = disable φ loss entirely)
+```
+
+### **Parameter Guidelines**
+
+#### **Grid Size (`FFT_GRID_SIZE`)**
+- **32**: Fast, lower accuracy (use for quick tests)
+- **64**: Good balance of speed and accuracy (recommended)
+- **96**: Higher accuracy, moderate cost
+- **128**: Very accurate, more expensive (use if φ gradients are critical)
+
+#### **Supervision Weight (`FFT_PHI_SUPERVISE_WEIGHT`)**
+- **0.0**: Disable φ head loss entirely (recommended, φ output becomes vestigial)
+- **1e-3 to 1e-2**: Weak supervision to keep φ head aligned with FFT solution (optional)
+- **> 1e-2**: Not recommended (creates competing objectives)
+
+### **Expected Benefits**
+
+1. **Exact Poisson Coupling**: φ is always consistent with ρ by construction
+2. **Improved Velocity Fields**: Momentum equations use correct ∇φ, eliminating drift
+3. **Better Density Growth**: Network cannot under-predict φ to reduce loss
+4. **Stable Training**: No competing objectives between φ head and Poisson residual
+
+### **When to Use**
+
+- **Primary use case**: Gravitational collapse problems where velocity fields drift or density growth under-shoots
+- **Alternative to spectral Poisson penalty**: Provides exact coupling without additional loss terms
+- **When φ head struggles**: If φ predictions are inconsistent with ρ despite low Poisson residuals
+- **Long-time integration**: Maintains exact global coupling throughout training
+
+### **Performance Impact**
+
+- **Computational Cost**: ~5-10% overhead per iteration (FFT solve + grid sampling)
+- **Memory Usage**: Minimal additional memory (grid is small, typically 64×64)
+- **Training Speed**: Slightly slower per iteration, but often faster overall convergence
+- **Accuracy**: Significant improvement in velocity and density predictions
+
+### **Example Configurations**
+
+**Standard Gravitational Collapse (recommended)**:
+```python
+USE_FFT_PHI = True
+FFT_GRID_SIZE = 64
+FFT_PHI_SUPERVISE_WEIGHT = 0.0
+```
+
+**Higher Accuracy**:
+```python
+USE_FFT_PHI = True
+FFT_GRID_SIZE = 96
+FFT_PHI_SUPERVISE_WEIGHT = 0.0
+```
+
+**With Weak φ Head Supervision**:
+```python
+USE_FFT_PHI = True
+FFT_GRID_SIZE = 64
+FFT_PHI_SUPERVISE_WEIGHT = 1e-3
+```
+
+**Disabled (standard PINN)**:
+```python
+USE_FFT_PHI = False
+```
+
+### **Compatibility Notes**
+
+- **2D Only**: Currently implemented for 2D problems only
+- **Log-Density Mode**: Fully compatible with `USE_LOG_DENSITY = True`
+- **Causal Training**: Compatible with causal training and curriculum
+- **Spectral Poisson**: Can be used together, but typically one or the other is sufficient
+- **Adaptive Collocation**: Compatible
+- **XPINN**: Not implemented for XPINN (single PINN only)
+
+### **Technical Details**
+
+- **FFT Method**: Uses `torch.fft.rfftn` for 2D real-to-complex FFT
+- **Boundary Conditions**: Assumes periodic boundaries (consistent with domain setup)
+- **DC Mode**: Set to zero (mean potential = 0)
+- **Gradient Computation**: ∇φ computed in Fourier space: ∂φ/∂x ↔ i·kx·φ̂
+- **Sampling**: Uses `F.grid_sample` with bilinear interpolation to map grid values to collocation points

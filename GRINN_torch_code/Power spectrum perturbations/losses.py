@@ -227,13 +227,25 @@ def pde_residue_log_density(colloc, net, dimension = 1):
     
     # Network outputs s = log(rho), vx, vy, phi
     s = net_outputs[:,0:1]  # log-density
+    
+    # Clamp and sanitize s before exp to prevent overflow
+    s = torch.clamp(s, -20.0, 20.0)
+    s = torch.nan_to_num(s, nan=0.0)
+    
     vx = net_outputs[:,1:2]
     
     # Recover density: rho = exp(s)
     rho = torch.exp(s)
+    
+    # Sanitize density after exp to prevent Inf/NaN
+    rho = torch.nan_to_num(rho, nan=1.0, posinf=1e6, neginf=0.0)
 
     if dimension == 1:
         phi = net_outputs[:,2:3]
+        
+        # Clamp and sanitize phi to prevent extreme values
+        phi = torch.clamp(phi, -1e6, 1e6)
+        phi = torch.nan_to_num(phi, nan=0.0)
 
         s_t = diff(s, t, order=1)
         s_x = diff(s, x, order=1)
@@ -258,6 +270,10 @@ def pde_residue_log_density(colloc, net, dimension = 1):
     elif dimension == 2:
         vy = net_outputs[:,2:3]
         phi = net_outputs[:,3:4]
+        
+        # Clamp and sanitize phi to prevent extreme values
+        phi = torch.clamp(phi, -1e6, 1e6)
+        phi = torch.nan_to_num(phi, nan=0.0)
 
         s_t = diff(s, t, order=1)
         s_x = diff(s, x, order=1)
@@ -294,6 +310,10 @@ def pde_residue_log_density(colloc, net, dimension = 1):
         vy = net_outputs[:,2:3]
         vz = net_outputs[:,3:4]
         phi = net_outputs[:,4:5]
+        
+        # Clamp and sanitize phi to prevent extreme values
+        phi = torch.clamp(phi, -1e6, 1e6)
+        phi = torch.nan_to_num(phi, nan=0.0)
 
         s_t = diff(s, t, order=1)
         s_x = diff(s, x, order=1)

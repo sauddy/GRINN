@@ -77,8 +77,9 @@ def generate_shared_velocity_field(nx, ny, Lx, Ly, power_index=-4.0, amplitude=0
     # Create interpolation functions for PINN
     from scipy.interpolate import RegularGridInterpolator
     
-    x_coords = np.linspace(0, Lx, nx)
-    y_coords = np.linspace(0, Ly, ny)
+    # Exclude right boundary for periodic domains to avoid double-counting
+    x_coords = np.linspace(0, Lx, nx, endpoint=False)
+    y_coords = np.linspace(0, Ly, ny, endpoint=False)
     
     vx_interp = RegularGridInterpolator((x_coords, y_coords), vx_np, method='linear', bounds_error=False, fill_value=0.0)
     vy_interp = RegularGridInterpolator((x_coords, y_coords), vy_np, method='linear', bounds_error=False, fill_value=0.0)
@@ -197,8 +198,9 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     # print("For dx = {} and dt = {} and time gridpoints n = {} ".format(dx,dt,n))  # Commented out to reduce output noise
     
     ########### Initializing the ARRAY #######################
-    x = np.linspace(0, Lx, Nx)
-    y = np.linspace(0, Ly, Ny)
+    # Exclude right boundary for periodic domains to avoid double-counting
+    x = np.linspace(0, Lx, Nx, endpoint=False)
+    y = np.linspace(0, Ly, Ny, endpoint=False)
     xx, yy  = np.meshgrid(x, y,indexing='ij') ## Mesh for the 2D domain
     rho0 = np.zeros((Nx,Ny))
     rho1 = np.zeros((Nx,Ny))
@@ -477,7 +479,8 @@ def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isp
     mu = dt / (2 * dx)
     n = int(time / dt)
 
-    x = np.linspace(0, L, nx)
+    # Exclude right boundary for periodic domains to avoid double-counting
+    x = np.linspace(0, L, nx, endpoint=False)
 
     rho0 = np.zeros(nx)
     phi0 = np.zeros(nx)

@@ -324,9 +324,11 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
         nets = [net]
         use_xpinn = False
     
-    Q = 100
-    xs = np.linspace(xmin, xmax, Q)
-    ys = np.linspace(ymin, ymax, Q)
+    # Use N_GRID for consistency with FD solver resolution
+    # Exclude right boundary for periodic domains to avoid double-counting
+    Q = N_GRID
+    xs = np.linspace(xmin, xmax, Q, endpoint=False)
+    ys = np.linspace(ymin, ymax, Q, endpoint=False)
     tau, phi = np.meshgrid(xs, ys) 
     Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
     t_00 = time * np.ones(Q**2).reshape(Q**2, 1)
@@ -430,9 +432,11 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
     
     # Get data for first frame to set up colorbar limits
-    Q = 100
-    xs = np.linspace(xmin, xmax, Q)
-    ys = np.linspace(ymin, ymax, Q)
+    # Use N_GRID for consistency with FD solver resolution
+    # Exclude right boundary for periodic domains to avoid double-counting
+    Q = N_GRID
+    xs = np.linspace(xmin, xmax, Q, endpoint=False)
+    ys = np.linspace(ymin, ymax, Q, endpoint=False)
     tau, phi = np.meshgrid(xs, ys) 
     Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
     t_00 = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)
@@ -457,9 +461,11 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     fixed_vmin = None
     fixed_vmax = None
     if which == "density" and fixed_colorbar:
-        Q = 100
-        xs = np.linspace(xmin, xmax, Q)
-        ys = np.linspace(ymin, ymax, Q)
+        # Use N_GRID for consistency with FD solver resolution
+        # Exclude right boundary for periodic domains to avoid double-counting
+        Q = N_GRID
+        xs = np.linspace(xmin, xmax, Q, endpoint=False)
+        ys = np.linspace(ymin, ymax, Q, endpoint=False)
         tau, phi = np.meshgrid(xs, ys)
         Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
         # First frame
@@ -982,10 +988,11 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
     pinn_max_list = []
     fd_max_list = []
 
-    # PINN grid sampling settings (match animation resolution)
-    Q = 100
-    xs = np.linspace(xmin, xmax, Q)
-    ys = np.linspace(ymin, ymax, Q)
+    # PINN grid sampling settings (use N_GRID for consistency with FD solver)
+    # Exclude right boundary for periodic domains to avoid double-counting
+    Q = N_GRID
+    xs = np.linspace(xmin, xmax, Q, endpoint=False)
+    ys = np.linspace(ymin, ymax, Q, endpoint=False)
     TAU, PHI = np.meshgrid(xs, ys)
     Xgrid = np.vstack([TAU.flatten(), PHI.flatten()]).T
 
@@ -1149,7 +1156,8 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         )
         
         # Extract 1D slice from 2D solution at y = y_fixed
-        y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1])
+        # Exclude right boundary for periodic domains to avoid double-counting
+        y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1], endpoint=False)
         y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
         
         # Extract the slice
@@ -1183,13 +1191,13 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
             ax_rho.legend(loc='upper right', fontsize=8)
 
         # Second row: epsilon for density using symmetric percent with absolute numerator
-        # ε = 200 * |G - R| / (G + R)
-        eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-12)
+        # ε = 200 * |G - R| / (G + R) with more robust denominator
+        eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-6)
         ax_eps_rho = fig.add_subplot(grid[1, c])
         ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
         # Only plot Linear Theory epsilon when KY == 0 and amplitude is small
         if np.isclose(KY, 0.0) and (a < 0.1):
-            eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-12)
+            eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-6)
             ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_rho.set_ylabel(r"$\varepsilon$")
         ax_eps_rho.grid(True)
@@ -1474,10 +1482,11 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
     for i, t in enumerate(time_points):
         # print(f"Collecting data for t = {t:.2f}")  # Commented out to reduce output noise
         
-        # Get PINN data - use same resolution as animation for consistency
-        Q = 100  # Same resolution as animation
-        xs = np.linspace(xmin, xmax, Q)
-        ys = np.linspace(ymin, ymax, Q)
+        # Get PINN data - use N_GRID for consistency with FD solver
+        # Exclude right boundary for periodic domains to avoid double-counting
+        Q = N_GRID
+        xs = np.linspace(xmin, xmax, Q, endpoint=False)
+        ys = np.linspace(ymin, ymax, Q, endpoint=False)
         tau, phi = np.meshgrid(xs, ys) 
         Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
@@ -1533,10 +1542,11 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
             )
         
         # Build y-array consistent with solver setup
+        # Exclude right boundary for periodic domains to avoid double-counting
         Lx = lam * num_of_waves
         Nx = x_fd.shape[0]
         Ny = rho_fd.shape[1]
-        y_fd = np.linspace(0.0, Lx, Ny)
+        y_fd = np.linspace(0.0, Lx, Ny, endpoint=False)
         
         # Create meshgrid for FD data
         X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
@@ -1546,46 +1556,39 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         else:  # velocity magnitude
             fd_field = np.sqrt(vx_fd**2 + vy_fd**2)
         
-        # Interpolate FD data to PINN grid for comparison using robust interpolation
-        from scipy.interpolate import griddata
+        # Interpolate FD data to PINN grid for comparison using single robust method
+        from scipy.interpolate import RegularGridInterpolator
         points_fd = np.column_stack([X_fd.ravel(), Y_fd.ravel()])
         points_pinn = np.column_stack([tau.ravel(), phi.ravel()])
         
-        # Use robust interpolation with proper fallback for Kaggle compatibility
-        try:
-            # Try cubic interpolation first
-            fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
-            # Check for NaN values that might indicate interpolation failure
-            if np.any(np.isnan(fd_field_interp)):
-                raise ValueError("Cubic interpolation produced NaN values")
-        except:
-            try:
-                # Fallback to linear interpolation with extrapolation
-                fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='linear', fill_value='extrapolate')
-                # Check for NaN values
-                if np.any(np.isnan(fd_field_interp)):
-                    raise ValueError("Linear interpolation produced NaN values")
-            except:
-                # Final fallback: use nearest neighbor interpolation
-                fd_field_interp = griddata(points_fd, fd_field.ravel(), points_pinn, method='nearest', fill_value=np.mean(fd_field))
+        # Use RegularGridInterpolator for robust interpolation with proper boundary handling
+        # This avoids the interpolation cascade issues and provides consistent results
+        interpolator = RegularGridInterpolator(
+            (x_fd, y_fd), fd_field, 
+            method='linear', 
+            bounds_error=False, 
+            fill_value=None  # extrapolate
+        )
+        fd_field_interp = interpolator(points_pinn)
         
         fd_field_interp = fd_field_interp.reshape(Q, Q)
         
-        # Interpolate FD velocity components for vector plots (both density and velocity plots)
-        try:
-            fd_vx_interp = griddata(points_fd, vx_fd.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
-            fd_vy_interp = griddata(points_fd, vy_fd.ravel(), points_pinn, method='cubic', fill_value='extrapolate')
-            if np.any(np.isnan(fd_vx_interp)) or np.any(np.isnan(fd_vy_interp)):
-                raise ValueError("Cubic interpolation produced NaN values")
-        except:
-            try:
-                fd_vx_interp = griddata(points_fd, vx_fd.ravel(), points_pinn, method='linear', fill_value='extrapolate')
-                fd_vy_interp = griddata(points_fd, vy_fd.ravel(), points_pinn, method='linear', fill_value='extrapolate')
-                if np.any(np.isnan(fd_vx_interp)) or np.any(np.isnan(fd_vy_interp)):
-                    raise ValueError("Linear interpolation produced NaN values")
-            except:
-                fd_vx_interp = griddata(points_fd, vx_fd.ravel(), points_pinn, method='nearest', fill_value=np.mean(vx_fd))
-                fd_vy_interp = griddata(points_fd, vy_fd.ravel(), points_pinn, method='nearest', fill_value=np.mean(vy_fd))
+        # Interpolate FD velocity components for vector plots using single robust method
+        vx_interpolator = RegularGridInterpolator(
+            (x_fd, y_fd), vx_fd, 
+            method='linear', 
+            bounds_error=False, 
+            fill_value=None  # extrapolate
+        )
+        fd_vx_interp = vx_interpolator(points_pinn)
+        
+        vy_interpolator = RegularGridInterpolator(
+            (x_fd, y_fd), vy_fd, 
+            method='linear', 
+            bounds_error=False, 
+            fill_value=None  # extrapolate
+        )
+        fd_vy_interp = vy_interpolator(points_pinn)
         
         fd_vx_interp = fd_vx_interp.reshape(Q, Q)
         fd_vy_interp = fd_vy_interp.reshape(Q, Q)
@@ -1610,7 +1613,8 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         fd_vx, fd_vy = fd_velocity_data[i]
         
         # Calculate epsilon metric: ε = 2 * |PINN - FD| / (PINN + FD) * 100
-        eps = 1e-12
+        # Use a more robust denominator to reduce sensitivity to small values
+        eps = 1e-6  # Increased from 1e-12 to reduce sensitivity
         epsilon_metric = 200.0 * np.abs(pinn_field - fd_field) / (pinn_field + fd_field + eps)
         
         # Column 1: PINN - use individual color limits like animation
