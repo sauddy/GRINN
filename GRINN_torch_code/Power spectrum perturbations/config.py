@@ -20,7 +20,7 @@ DIMENSION = 2  # Spatial dimension
 
 # Number of collocation/IC points per mini-batch and
 # how many such mini-batches to aggregate in a single optimizer step
-BATCH_SIZE = 100000
+BATCH_SIZE = 40000
 NUM_BATCHES = 1
 
 a = 0.1
@@ -35,8 +35,8 @@ num_layers = 5
 wave = 7.0
 k = 2 * np.pi / wave
 
-iteration_adam_2D = 1001
-iteration_lbgfs_2D = 201
+iteration_adam_2D = 2002
+iteration_lbgfs_2D = 402
 
 # Output/snapshot controls
 SAVE_STATIC_SNAPSHOTS = False
@@ -60,36 +60,38 @@ DECAY_PORTION = 0.5 # Fraction of total training steps over which to fully decay
 
 # ==================== Causal Training Configuration ====================
 # Enable causal training with temporal curriculum + time-weighted residuals
-USE_CAUSAL_TRAINING = False
+USE_CAUSAL_TRAINING = True
 
 # Causal Weighting Mode
-CAUSAL_WEIGHTING_MODE = "adaptive"  # "static" or "adaptive"
+CAUSAL_WEIGHTING_MODE = "static"  # "static" or "adaptive"
 # - "static": Simple exp(-gamma*t) weighting
 # - "adaptive": Residual-based weighting w_i = exp(-epsilon * Σ L_r(t_k)) (paper's full method)
 
 # Temporal Curriculum Settings
-USE_CAUSAL_CURRICULUM = False    # Enable temporal curriculum windows (recommended with adaptive, optional otherwise)
-CAUSAL_NUM_WINDOWS = 12          # Number of progressive time windows
-CAUSAL_WINDOW_SCHEDULE = "linear"  # Time window schedule type (currently only "linear" supported)
+USE_CAUSAL_CURRICULUM = True    # Enable temporal curriculum windows (recommended with adaptive, optional otherwise)
+CAUSAL_NUM_WINDOWS = 2          # Number of progressive time windows
+CAUSAL_WINDOW_SCHEDULE = "custom"  # Time window schedule type: "linear" (automatic) or "custom" (user-specified)
 CAUSAL_USE_RESTARTS = False      # Use restart marching [t_k, t_{k+1}] instead of expanding windows [0, t_k]
 # Restart marching: train on non-overlapping time slabs with warm starts from previous slab
-# More stable for stiff/long-time dynamics but doesn't reinforce early-time learning
+
+# Custom Window Settings (only used when CAUSAL_WINDOW_SCHEDULE = "custom")
+CAUSAL_CUSTOM_WINDOWS = [[STARTUP_DT, 2.0], [2.0, 3.0]]  # List of [t_min, t_max] pairs for each window
 
 # Static Weighting Settings (only used when CAUSAL_WEIGHTING_MODE = "static")
-CAUSAL_GAMMA_MAX = 1.5          # Maximum gamma for exp(-gamma*t) weighting (applied in early windows)
+CAUSAL_GAMMA_MAX = 0.0          # Maximum gamma for exp(-gamma*t) weighting (applied in early windows)
 CAUSAL_GAMMA_MIN = 0.0          # Minimum gamma (applied in final window, 0 = uniform weighting)
 # Gamma decays linearly across windows: gamma_k = GAMMA_MAX * (1 - k / NUM_WINDOWS)
 
 # Adaptive Weighting Settings (only used when CAUSAL_WEIGHTING_MODE = "adaptive")
-CAUSAL_EPSILON = 0.8           # Causality parameter epsilon for adaptive weighting
+CAUSAL_EPSILON = 0.0           # Causality parameter epsilon for adaptive weighting
 # Controls how strongly past residuals suppress future time weights
 # Recommended range: 0.1-2.0 (higher = stronger suppression, lower for longer tmax)
-CAUSAL_EPSILON_FLOOR = 0.15    # Minimum epsilon value (prevents weights from becoming flat)
+CAUSAL_EPSILON_FLOOR = 0.0    # Minimum epsilon value (prevents weights from becoming flat)
 # Keep causality active in late windows by maintaining minimum epsilon
 # Recommended range: 0.1-0.3 (0.0 = no floor, weights can become uniform)
 
 # Epsilon Annealing Strategy (from "Respecting Causality is all you need for PINNs")
-USE_EPSILON_ANNEALING = True  # Use automatic epsilon interpolation instead of linear decay
+USE_EPSILON_ANNEALING = False  # Use automatic epsilon interpolation instead of linear decay
 # If True, interpolates between EPSILON_MIN and EPSILON_MAX across all windows
 # If False, uses linear decay from CAUSAL_EPSILON to CAUSAL_EPSILON_FLOOR
 
@@ -112,28 +114,28 @@ CAUSAL_LBFGS_PER_WINDOW = None  # LBFGS iterations per window (None = auto-split
 USE_ADAPTIVE_COLLOCATION = False
 
 # Adaptive Allocation Parameters
-ADAPTIVE_COLLOCATION_FREQUENCY = 200  # Update every N Adam iterations (0 = disable)
+ADAPTIVE_COLLOCATION_FREQUENCY = 100  # Update every N Adam iterations (0 = disable)
 
 # Threshold Strategy: "percentile" (recommended) or "absolute"
 ADAPTIVE_COLLOCATION_THRESHOLD_MODE = "percentile"
 
 # Percentile-based thresholds (simpler, automatically adapts to residual scale)
-ADAPTIVE_COLLOCATION_PERCENTILE_INITIAL = 75.0  # Initial: focus on top 25% worst residuals (lenient)
-ADAPTIVE_COLLOCATION_PERCENTILE_FINAL = 50.0    # Final: focus on top 50% worst residuals (strict)
-ADAPTIVE_COLLOCATION_PERCENTILE_DECAY_START = 400  # Start decaying percentile after this many iterations
-ADAPTIVE_COLLOCATION_PERCENTILE_DECAY_END = 900    # Finish decaying percentile at this iteration
+ADAPTIVE_COLLOCATION_PERCENTILE_INITIAL = 85.0  # Initial: focus on top 25% worst residuals (lenient)
+ADAPTIVE_COLLOCATION_PERCENTILE_FINAL = 70.0    # Final: focus on top 50% worst residuals (strict)
+ADAPTIVE_COLLOCATION_PERCENTILE_DECAY_START = 300  # Start decaying percentile after this many iterations
+ADAPTIVE_COLLOCATION_PERCENTILE_DECAY_END = 1200    # Finish decaying percentile at this iteration
 
 # Absolute thresholds (only used if THRESHOLD_MODE = "absolute")
 ADAPTIVE_COLLOCATION_THRESHOLD_ABSOLUTE = 0.01        # Initial absolute threshold
 ADAPTIVE_COLLOCATION_THRESHOLD_ABSOLUTE_FINAL = 0.001 # Final absolute threshold
 
-ADAPTIVE_COLLOCATION_RATIO_MODE = "adaptive"  # "fixed" or "adaptive" point redistribution
-ADAPTIVE_COLLOCATION_FIXED_RATIO = 0.3       # Fraction of points to redistribute (fixed mode)
-ADAPTIVE_COLLOCATION_MIN_POINTS = 300         # Minimum points per region
-ADAPTIVE_COLLOCATION_MAX_POINTS = 6000       # Maximum points per region
+ADAPTIVE_COLLOCATION_RATIO_MODE = "fixed"  # "fixed" or "adaptive" point redistribution
+ADAPTIVE_COLLOCATION_FIXED_RATIO = 0.15       # Fraction of points to redistribute (fixed mode)
+ADAPTIVE_COLLOCATION_MIN_POINTS = 500         # Minimum points per region
+ADAPTIVE_COLLOCATION_MAX_POINTS = 8000       # Maximum points per region
 
 # LBFGS Behavior
-ADAPTIVE_COLLOCATION_LBFGS_MODE = "uniform"    # "uniform" or "adaptive" for LBFGS phase
+ADAPTIVE_COLLOCATION_LBFGS_MODE = "adaptive"    # "uniform" or "adaptive" for LBFGS phase
 # If "uniform": redistribute points uniformly before LBFGS
 # If "adaptive": keep adaptive distribution during LBFGS
 

@@ -155,10 +155,11 @@ Causal training improves long-time predictions by using temporal curriculum lear
   - **Example**: With tmax=0.5 and 5 windows: [0.01,0.108], [0.01,0.206], [0.01,0.304], [0.01,0.402], [0.01,0.500]
 
 - `CAUSAL_WINDOW_SCHEDULE`: Time window progression schedule (string)
-  - **Options**: "linear" (currently only supported option)
-  - **Linear**: Each window covers 1/NUM_WINDOWS of the total time range
+  - **Options**: "linear" (automatic), "custom" (user-specified)
+  - **"linear"**: Each window covers 1/NUM_WINDOWS of the total time range
+    - Automatically generates windows like [0.01, 0.25], [0.01, 0.50], ..., [0.01, 3.00]
+  - **"custom"**: Use user-specified time windows (see `CAUSAL_CUSTOM_WINDOWS`)
   - **Default**: "linear"
-  - **Future**: Could support "exponential", "custom" schedules
 
 - `CAUSAL_USE_RESTARTS`: Use restart marching instead of expanding windows (bool)
   - **False** (default): Expanding windows - train on [0, t₁], [0, t₂], ..., [0, tₘₐₓ]
@@ -171,6 +172,23 @@ Causal training improves long-time predictions by using temporal curriculum lear
     - Each window has internal early→late resolution
   - **Default**: False
   - **Recommendation**: Use True for stiff PDEs with rapid late-time growth (a=0.1, tmax≥3.0)
+
+- `CAUSAL_CUSTOM_WINDOWS`: User-specified time windows for custom scheduling (list or None)
+  - **Purpose**: Define exact time windows when `CAUSAL_WINDOW_SCHEDULE = "custom"`
+  - **Format**: List of `[t_min, t_max]` pairs, e.g., `[[0, 2], [2, 3]]`
+  - **Number of windows**: Must match `CAUSAL_NUM_WINDOWS`
+  - **Default**: None (uses automatic linear schedule)
+  - **Important**: When using custom windows, `CAUSAL_USE_RESTARTS` is **ignored** - you have full control
+  - **Examples**:
+    - Two non-overlapping windows: `[[0, 2], [2, 3]]` - no retraining on early times
+    - Three expanding windows: `[[0.01, 1.0], [0.01, 2.0], [0.01, 3.0]]` - retrain from beginning each time
+    - Mixed strategy: `[[0, 1.0], [0, 2.0], [2.0, 3.0]]` - expanding early, then restart late
+    - Fine-grained early times: `[[0, 0.5], [0, 1.0], [0.5, 3.0]]` - intensive early training
+  - **Validation**:
+    - Must provide `CAUSAL_CUSTOM_WINDOWS` when using custom schedule
+    - Each entry must be `[t_min, t_max]` with `t_max > t_min`
+    - Number of entries must equal `CAUSAL_NUM_WINDOWS`
+    - Last window's `t_max` must equal `tmax` (validation enforces this)
 
 ### Static Weighting Settings (CAUSAL_WEIGHTING_MODE = "static")
 - `CAUSAL_GAMMA_MAX`: Maximum gamma for exponential time-weighting (float)
@@ -412,6 +430,46 @@ USE_CAUSAL_CURRICULUM = True
 CAUSAL_NUM_WINDOWS = 5
 CAUSAL_GAMMA_MAX = 2.0
 CAUSAL_GAMMA_MIN = 0.0
+```
+
+**Custom Window Schedule** (user-defined time windows):
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "static"  # or "adaptive"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 2
+CAUSAL_WINDOW_SCHEDULE = "custom"
+CAUSAL_CUSTOM_WINDOWS = [[0, 2], [2, 3]]  # Two windows: [0, 2] and [2, 3]
+CAUSAL_USE_RESTARTS = True  # Use exact custom windows
+CAUSAL_GAMMA_MAX = 0.0  # No causal weighting, just curriculum
+CAUSAL_GAMMA_MIN = 0.0
+```
+
+**Expanding Windows with Custom Schedule**:
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "adaptive"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 3
+CAUSAL_WINDOW_SCHEDULE = "custom"
+CAUSAL_CUSTOM_WINDOWS = [[0.01, 1.0], [0.01, 2.0], [0.01, 3.0]]  # All windows retrain from t=0.01
+CAUSAL_USE_RESTARTS = False  # Ignored when using custom windows
+CAUSAL_EPSILON_MIN = 0.1
+CAUSAL_EPSILON_MAX = 1.0
+```
+
+**Mixed Strategy with Custom Windows** (expanding early, restart late):
+```python
+USE_CAUSAL_TRAINING = True
+CAUSAL_WEIGHTING_MODE = "adaptive"
+USE_CAUSAL_CURRICULUM = True
+CAUSAL_NUM_WINDOWS = 3
+CAUSAL_WINDOW_SCHEDULE = "custom"
+# First two windows retrain from beginning, third starts fresh at t=2.0
+CAUSAL_CUSTOM_WINDOWS = [[0.01, 1.0], [0.01, 2.0], [2.0, 3.0]]
+CAUSAL_USE_RESTARTS = False  # Ignored with custom windows
+CAUSAL_EPSILON_MIN = 0.1
+CAUSAL_EPSILON_MAX = 1.0
 ```
 
 **Disable Causal Training**:

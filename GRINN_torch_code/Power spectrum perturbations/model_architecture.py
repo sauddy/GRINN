@@ -97,9 +97,14 @@ class PINN(nn.Module):
         L = umax - umin
         theta = 2*np.pi*(u - umin)/L
         features = []
+
         for k in range(1, self.n_harmonics+1):
-            features.append(torch.sin(k*theta))
-            features.append(torch.cos(k*theta))
+            
+            scale = 1.0 / np.sqrt(k)
+
+            features.append(scale * torch.sin(k*theta))
+            features.append(scale * torch.cos(k*theta))
+
         return torch.cat(features, dim=1) if len(features) > 0 else u
 
     def forward(self,X):

@@ -10,6 +10,7 @@ from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, DEFAULT_ACTIVA
 from config import N_INTERFACE, XPINN_OPTIMIZER_STRATEGY, USE_MULTI_GPU, CACHE_IC_VALUES, STARTUP_DT
 from config import USE_CAUSAL_TRAINING, CAUSAL_WEIGHTING_MODE, USE_CAUSAL_CURRICULUM
 from config import CAUSAL_NUM_WINDOWS, CAUSAL_WINDOW_SCHEDULE, CAUSAL_USE_RESTARTS
+from config import CAUSAL_CUSTOM_WINDOWS
 from config import CAUSAL_GAMMA_MAX, CAUSAL_GAMMA_MIN
 from config import CAUSAL_EPSILON, CAUSAL_EPSILON_FLOOR, CAUSAL_NUM_TIME_BINS
 from config import USE_EPSILON_ANNEALING, CAUSAL_EPSILON_MIN, CAUSAL_EPSILON_MAX
@@ -172,24 +173,53 @@ if not USE_XPINN:
             t_start = max(tmin, STARTUP_DT)
             t_range = tmax - t_start
             
+            # Validate custom windows if specified
+            if CAUSAL_WINDOW_SCHEDULE == "custom":
+                if CAUSAL_CUSTOM_WINDOWS is None:
+                    raise ValueError("CAUSAL_CUSTOM_WINDOWS must be provided when CAUSAL_WINDOW_SCHEDULE='custom'")
+                if not isinstance(CAUSAL_CUSTOM_WINDOWS, (list, tuple)):
+                    raise ValueError("CAUSAL_CUSTOM_WINDOWS must be a list or tuple")
+                if len(CAUSAL_CUSTOM_WINDOWS) != CAUSAL_NUM_WINDOWS:
+                    raise ValueError(f"CAUSAL_CUSTOM_WINDOWS must have {CAUSAL_NUM_WINDOWS} entries, got {len(CAUSAL_CUSTOM_WINDOWS)}")
+                for i, window in enumerate(CAUSAL_CUSTOM_WINDOWS):
+                    if not isinstance(window, (list, tuple)) or len(window) != 2:
+                        raise ValueError(f"CAUSAL_CUSTOM_WINDOWS[{i}] must be a [t_min, t_max] pair")
+                    if window[1] <= window[0]:
+                        raise ValueError(f"CAUSAL_CUSTOM_WINDOWS[{i}]: t_max ({window[1]}) must be > t_min ({window[0]})")
+                
+                # Check that the final window's maximum time equals tmax
+                final_window = CAUSAL_CUSTOM_WINDOWS[-1]
+                final_t_max = final_window[1]
+                if abs(final_t_max - tmax) > 1e-10:  # Use small epsilon for floating point comparison
+                    raise ValueError(
+                        f"Custom windows must end at tmax ({tmax}), but final window ends at {final_t_max}. "
+                        f"Ensure the last window's t_max equals tmax."
+                    )
+                
+                print(f"Using custom windows: {CAUSAL_CUSTOM_WINDOWS}")
+            
             for window_idx in range(CAUSAL_NUM_WINDOWS):
                 # Compute time window bounds
-                if CAUSAL_WINDOW_SCHEDULE == "linear":
+                if CAUSAL_WINDOW_SCHEDULE == "custom":
+                    # Use user-provided custom windows
+                    t_window_min, t_window_max = CAUSAL_CUSTOM_WINDOWS[window_idx]
+                    # Note: With custom windows, CAUSAL_USE_RESTARTS is ignored - custom windows control everything
+                elif CAUSAL_WINDOW_SCHEDULE == "linear":
                     t_window_max = t_start + t_range * (window_idx + 1) / CAUSAL_NUM_WINDOWS
+                    
+                    # For restart marching: compute window minimum (previous window's max)
+                    if CAUSAL_USE_RESTARTS:
+                        # Start first window from STARTUP_DT, subsequent windows from previous t_window_max
+                        if window_idx == 0:
+                            t_window_min = t_start  # t_start is already max(tmin, STARTUP_DT)
+                        else:
+                            # Previous window's max becomes current window's min
+                            t_window_min = t_start + t_range * window_idx / CAUSAL_NUM_WINDOWS
+                    else:
+                        # Expanding windows: always start from STARTUP_DT (t_start)
+                        t_window_min = t_start
                 else:
                     raise ValueError(f"Unknown CAUSAL_WINDOW_SCHEDULE: {CAUSAL_WINDOW_SCHEDULE}")
-                
-                # For restart marching: compute window minimum (previous window's max)
-                if CAUSAL_USE_RESTARTS:
-                    # Start first window from STARTUP_DT, subsequent windows from previous t_window_max
-                    if window_idx == 0:
-                        t_window_min = t_start  # t_start is already max(tmin, STARTUP_DT)
-                    else:
-                        # Previous window's max becomes current window's min
-                        t_window_min = t_start + t_range * window_idx / CAUSAL_NUM_WINDOWS
-                else:
-                    # Expanding windows: always start from STARTUP_DT (t_start)
-                    t_window_min = t_start
                 
                 # Compute causal gamma for static mode (decays linearly to 0)
                 if CAUSAL_WEIGHTING_MODE == "static":

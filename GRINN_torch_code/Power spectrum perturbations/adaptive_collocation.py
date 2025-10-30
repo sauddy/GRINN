@@ -276,18 +276,19 @@ class AdaptiveCollocationAllocator:
         return threshold
     
     def redistribute_points(self, residuals, ratio_mode=None, fixed_ratio=None, iteration=None):
-        """
+        '''
         Redistribute collocation points based on residuals.
-        
+        FIXED VERSION: Preserves temporal coverage via stratified removal.
+
         Args:
             residuals: Residual magnitudes
             ratio_mode: "fixed" or "adaptive" (default: ADAPTIVE_COLLOCATION_RATIO_MODE)
             fixed_ratio: Fixed ratio for redistribution (default: ADAPTIVE_COLLOCATION_FIXED_RATIO)
             iteration: Current training iteration (for progressive threshold)
-            
+
         Returns:
             Tensor: New collocation points
-        """
+        '''
         if ratio_mode is None:
             ratio_mode = ADAPTIVE_COLLOCATION_RATIO_MODE
         if fixed_ratio is None:
@@ -342,42 +343,104 @@ class AdaptiveCollocationAllocator:
         n_redistribute = int(self.total_points * redistribution_ratio)
         print(f"  Redistributing {n_redistribute} points ({redistribution_ratio*100:.1f}%)")
         
-        # Remove points from low-error regions
+        # ============================================================================
+        # CRITICAL FIX: TEMPORAL STRATIFICATION
+        # Preserve temporal coverage by removing points proportionally from each time bin
+        # ============================================================================
+        
+        NUM_TIME_BINS = 5  # Divide temporal domain into 5 bins
+        points_per_bin = n_redistribute // NUM_TIME_BINS
+        
         low_error_mask = ~high_error_mask
         low_error_indices = torch.where(low_error_mask)[0]
         
-        if len(low_error_indices) > 0:
-            # Randomly select points to remove from low-error regions
-            n_remove = min(n_redistribute, len(low_error_indices))
-            remove_indices = low_error_indices[torch.randperm(len(low_error_indices))[:n_remove]]
+        if len(low_error_indices) == 0:
+            print("  WARNING: No low-error points available for redistribution!")
+            return self.current_points
+        
+        # Extract time coordinates (assuming time is the 3rd column, index 2)
+        t_vals = self.current_points[:, 2]
+        
+        # Stratified removal across time bins
+        remove_indices_list = []
+        
+        for i in range(NUM_TIME_BINS):
+            # Define time bin boundaries
+            t_low = self.tmin + i * (self.tmax - self.tmin) / NUM_TIME_BINS
+            t_high = self.tmin + (i + 1) * (self.tmax - self.tmin) / NUM_TIME_BINS
             
-            # Create new points in high-error regions
-            n_add = n_remove
+            # Find low-error points in this time bin
+            in_bin = (t_vals >= t_low) & (t_vals < t_high)
+            bin_low_error_mask = in_bin & low_error_mask
+            bin_low_error_indices = torch.where(bin_low_error_mask)[0]
             
-            # Generate new points in high-error regions
-            high_error_points = self.current_points[high_error_mask]
-            high_error_residuals = residuals[high_error_mask]
-            
-            if len(high_error_points) > 0:
-                # Focus on the highest error points
-                if len(high_error_points) > n_add:
-                    # Select the highest error points
-                    _, top_error_indices = torch.topk(high_error_residuals, n_add)
-                    top_error_points = high_error_points[top_error_indices]
-                    new_points = self._generate_points_near_existing(top_error_points, n_add)
-                else:
-                    # Use all high-error points
-                    new_points = self._generate_points_near_existing(high_error_points, n_add)
+            if len(bin_low_error_indices) > 0:
+                # Remove proportionally from each bin
+                n_remove_bin = min(points_per_bin, len(bin_low_error_indices))
+                
+                # Randomly select points to remove from this bin
+                selected_indices = bin_low_error_indices[torch.randperm(len(bin_low_error_indices))[:n_remove_bin]]
+                remove_indices_list.append(selected_indices)
+                
+                print(f"    Time bin {i+1} [{t_low:.2f}, {t_high:.2f}]: Removing {n_remove_bin}/{len(bin_low_error_indices)} points")
             else:
-                # Fallback: generate random points
-                new_points = self._generate_random_points(n_add)
-            
-            # Update point distribution
-            new_current_points = self.current_points.clone()
-            new_current_points[remove_indices] = new_points
-            self.current_points = new_current_points
-            
-            print(f"  Redistributed {n_remove} points from low-error to high-error regions")
+                print(f"    Time bin {i+1} [{t_low:.2f}, {t_high:.2f}]: No low-error points to remove")
+        
+        if len(remove_indices_list) == 0:
+            print("  WARNING: No points could be removed from any time bin!")
+            return self.current_points
+        
+        # Combine all removal indices
+        remove_indices = torch.cat(remove_indices_list)
+        n_remove = len(remove_indices)
+        
+        print(f"  Total points marked for removal: {n_remove}")
+        
+        # ============================================================================
+        # Generate new points near high-error regions
+        # ============================================================================
+        
+        high_error_points = self.current_points[high_error_mask]
+        high_error_residuals = residuals[high_error_mask]
+        
+        if len(high_error_points) > 0 and n_remove > 0:
+            # Focus on the highest error points
+            if len(high_error_points) > n_remove:
+                # Select the top highest-error points
+                _, top_error_indices = torch.topk(high_error_residuals, n_remove)
+                top_error_points = high_error_points[top_error_indices]
+                new_points = self._generate_points_near_existing(top_error_points, n_remove)
+            else:
+                # Use all high-error points as seeds
+                new_points = self._generate_points_near_existing(high_error_points, n_remove)
+        else:
+            # Fallback: generate random points if no high-error regions
+            print("  WARNING: No high-error points found, generating random points")
+            new_points = self._generate_random_points(n_remove)
+        
+        # ============================================================================
+        # Update point distribution
+        # ============================================================================
+        
+        new_current_points = self.current_points.clone()
+        new_current_points[remove_indices] = new_points
+        self.current_points = new_current_points
+        
+        print(f"  [OK] Redistributed {n_remove} points with temporal stratification preserved")
+        
+        # ============================================================================
+        # DIAGNOSTIC: Verify temporal coverage is maintained
+        # ============================================================================
+        
+        if ADAPTIVE_COLLOCATION_VERBOSE:
+            print("  Temporal coverage after redistribution:")
+            t_vals_new = self.current_points[:, 2].cpu().numpy()
+            for i in range(NUM_TIME_BINS):
+                t_low = self.tmin + i * (self.tmax - self.tmin) / NUM_TIME_BINS
+                t_high = self.tmin + (i + 1) * (self.tmax - self.tmin) / NUM_TIME_BINS
+                count = np.sum((t_vals_new >= t_low) & (t_vals_new < t_high))
+                percentage = count / self.total_points * 100
+                print(f"    Bin {i+1} [{t_low:.2f}, {t_high:.2f}]: {count} points ({percentage:.1f}%)")
         
         return self.current_points
     
