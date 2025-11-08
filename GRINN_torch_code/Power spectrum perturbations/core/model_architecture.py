@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from torch.autograd import Variable
-from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, USE_LOG_DENSITY
+from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION
 
 class Sin(nn.Module):
     def forward(self, input):
@@ -107,98 +107,98 @@ class PINN(nn.Module):
 
         return torch.cat(features, dim=1) if len(features) > 0 else u
 
-    def forward(self,X):
-        x, t = X[0],X[-1]
+    def _prepare_coordinate_features(self, X):
+        """
+        Prepare periodic features for all spatial coordinates.
+        
+        Args:
+            X: List of coordinates [x, ...spatial..., t]
+        
+        Returns:
+            Tuple (features, t_tensor, dimension)
+        """
+        x, t = X[0], X[-1]
         x = x.unsqueeze(-1) if x.dim() == 1 else x
         t = t.unsqueeze(-1) if t.dim() == 1 else t
-
-        if len(X) == 2:
+        dimension = len(X)
+        
+        if dimension == 2:
             if self.xmin is None or self.xmax is None:
                 raise RuntimeError("Domain not set: call net.set_domain for dimension=1")
             x_feat = self._periodic_features(x, self.xmin, self.xmax)
-            inputs = torch.cat([x_feat, t], dim=1)
-            outputs = self.branch_1d(inputs)
-            # Hard-enforce uniform density at t=0 without in-place ops
-            if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-                # For sinusoidal experiments, do not hard-constrain rho at t=0.
-                return outputs
-            else:
-                if USE_LOG_DENSITY:
-                    # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
-                    s_hat = outputs[:,0:1]
-                    other = outputs[:,1:]
-                    s = t.new_tensor(rho_o).log() + t * s_hat
-                    outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
-                    return outputs_mod
-                else:
-                    # Original linear trick: ρ = ρ₀ + t × ρ̂
-                    rho_hat = outputs[:,0:1]
-                    other = outputs[:,1:]
-                    rho = rho_o + t * rho_hat
-                    outputs_mod = torch.cat([rho, other], dim=1)
-                    return outputs_mod
+            features = torch.cat([x_feat, t], dim=1)
         
-        elif len(X) == 3:
+        elif dimension == 3:
             if self.xmin is None or self.xmax is None or self.ymin is None or self.ymax is None:
                 raise RuntimeError("Domain not set: call net.set_domain for dimension=2")
-            y = X[1]
-            y = y.unsqueeze(-1) if y.dim() == 1 else y
+            y = X[1].unsqueeze(-1) if X[1].dim() == 1 else X[1]
             x_feat = self._periodic_features(x, self.xmin, self.xmax)
             y_feat = self._periodic_features(y, self.ymin, self.ymax)
-            inputs = torch.cat([x_feat, y_feat, t], dim=1)
-            outputs = self.branch_2d(inputs)
-            if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-                return outputs
-            else:
-                if USE_LOG_DENSITY:
-                    # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
-                    s_hat = outputs[:,0:1]
-                    other = outputs[:,1:]
-                    s = t.new_tensor(rho_o).log() + t * s_hat
-                    outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
-                    return outputs_mod
-                else:
-                    # Original linear trick: ρ = ρ₀ + t × ρ̂
-                    rho_hat = outputs[:,0:1]
-                    other = outputs[:,1:]
-                    rho = rho_o + t * rho_hat
-                    outputs_mod = torch.cat([rho, other], dim=1)
-                    return outputs_mod
+            features = torch.cat([x_feat, y_feat, t], dim=1)
         
-        elif len(X) == 4:
+        elif dimension == 4:
             if (self.xmin is None or self.xmax is None or
                 self.ymin is None or self.ymax is None or
                 self.zmin is None or self.zmax is None):
                 raise RuntimeError("Domain not set: call net.set_domain for dimension=3")
-            y = X[1]
-            z = X[2]
-            y = y.unsqueeze(-1) if y.dim() == 1 else y
-            z = z.unsqueeze(-1) if z.dim() == 1 else z
+            y = X[1].unsqueeze(-1) if X[1].dim() == 1 else X[1]
+            z = X[2].unsqueeze(-1) if X[2].dim() == 1 else X[2]
             x_feat = self._periodic_features(x, self.xmin, self.xmax)
             y_feat = self._periodic_features(y, self.ymin, self.ymax)
             z_feat = self._periodic_features(z, self.zmin, self.zmax)
-            inputs = torch.cat([x_feat, y_feat, z_feat, t], dim=1)
-            outputs = self.branch_3d(inputs)
-            if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-                return outputs
-            else:
-                if USE_LOG_DENSITY:
-                    # For log-density: s = log(ρ₀) + t × ŝ, so ρ = ρ₀ × exp(t × ŝ)
-                    s_hat = outputs[:,0:1]
-                    other = outputs[:,1:]
-                    s = t.new_tensor(rho_o).log() + t * s_hat
-                    outputs_mod = torch.cat([s, other], dim=1)  # Output s, not ρ
-                    return outputs_mod
-                else:
-                    # Original linear trick: ρ = ρ₀ + t × ρ̂
-                    rho_hat = outputs[:,0:1]
-                    other = outputs[:,1:]
-                    rho = rho_o + t * rho_hat
-                    outputs_mod = torch.cat([rho, other], dim=1)
-                    return outputs_mod
+            features = torch.cat([x_feat, y_feat, z_feat, t], dim=1)
         
         else:
-            raise ValueError(f"Expected len(X) in [2, 3, 4] but got {len(X)}")
+            raise ValueError(f"Expected len(X) in [2, 3, 4] but got {dimension}")
+        
+        return features, t, dimension
+    
+    def _apply_density_constraint(self, outputs, t):
+        """
+        Apply hard density constraint for power spectrum perturbations.
+        
+        For non-sinusoidal cases, enforce ρ(t=0) = ρ₀ using linear trick:
+        ρ = ρ₀ + t × ρ̂, where network predicts ρ̂.
+        
+        Args:
+            outputs: Raw network outputs
+            t: Time tensor
+        
+        Returns:
+            Modified outputs with density constraint applied
+        """
+        if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+            return outputs
+        
+        # Linear trick: ρ = ρ₀ + t × ρ̂
+        rho_hat = outputs[:, 0:1]
+        other = outputs[:, 1:]
+        rho = rho_o + t * rho_hat
+        return torch.cat([rho, other], dim=1)
+    
+    def forward(self, X):
+        """
+        Forward pass of PINN.
+        
+        Args:
+            X: List of coordinates [x, ...spatial..., t]
+        
+        Returns:
+            Network predictions [rho, vx, vy?, vz?, phi]
+        """
+        features, t, dimension = self._prepare_coordinate_features(X)
+        
+        # Select appropriate branch based on dimension
+        if dimension == 2:
+            outputs = self.branch_1d(features)
+        elif dimension == 3:
+            outputs = self.branch_2d(features)
+        elif dimension == 4:
+            outputs = self.branch_3d(features)
+        else:
+            raise ValueError(f"Unexpected dimension: {dimension}")
+        
+        return self._apply_density_constraint(outputs, t)
         
 def init_weights(m):
     if isinstance(m, nn.Linear):

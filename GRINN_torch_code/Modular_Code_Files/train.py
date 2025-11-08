@@ -11,7 +11,7 @@ has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
 device = "mps" if torch.backends.mps.is_built() else "cuda:0" if torch.cuda.is_available() else "cpu"
 
-lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(7.0, 0.03, 2, 1.5, 2000, 2000, 20000)
+lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r = input_taker(7.0, 0.03, 2, 6.0, 2000, 2000, 20000)
 
 jeans, alpha = req_consts_calc(lam, rho_1)
 v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam))

@@ -1,0 +1,61 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch model checkpoints
+*.pth
+*.pt
+checkpoints/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Training outputs
+diagnostics/
+*.png
+*.jpg
+*.gif
+*.mp4
+*.avi
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data files (optional - uncomment if you don't want to track large data files)
+# *.npy
+# *.npz
+# *.h5
+# *.hdf5
+

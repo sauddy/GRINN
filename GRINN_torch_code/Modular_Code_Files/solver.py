@@ -177,7 +177,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
 
         with torch.autograd.no_grad():
             
-            if i % 250 == 0:
+            if i % 100 == 0:
                 print(f"Training Loss at {i} for Adam in 1D system = {loss.item():.2e}", flush=True)
 
     for i in range(iterationL):
@@ -188,5 +188,5 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
 
         with torch.autograd.no_grad():
             
-            if i % 250 == 0:
+            if i % 50 == 0:
                 print(f"Training Loss at {i} for LBGFS in 1D system = {loss.item():.2e}", flush=True)

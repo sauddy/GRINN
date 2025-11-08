@@ -6,10 +6,10 @@ from torch.autograd import Variable
 import torch
 import scipy
 import os
-from LAX_2D import lax_solution, lax_solution_with_shared_velocity
-from LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
+from numerical_solvers.LAX_2D import lax_solution, lax_solution_with_shared_velocity
+from numerical_solvers.LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
-from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED, USE_LOG_DENSITY
+from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED
 
 # Global variable to store shared velocity fields for plotting
 _shared_vx_np = None
@@ -20,26 +20,6 @@ def set_shared_velocity_fields(vx_np, vy_np):
     global _shared_vx_np, _shared_vy_np
     _shared_vx_np = vx_np
     _shared_vy_np = vy_np
-
-def convert_log_density_to_density(log_density):
-    """
-    Convert log-density back to density if USE_LOG_DENSITY is enabled.
-    Only applies for power spectrum perturbations with single PINN (not XPINN).
-    
-    Args:
-        log_density: numpy array of log-density values (s = log(rho))
-    
-    Returns:
-        numpy array of density values (rho = exp(s))
-    """
-    # Only convert if:
-    # 1. USE_LOG_DENSITY is True
-    # 2. Not using XPINN (USE_XPINN is False)
-    # 3. Using power spectrum perturbations
-    if USE_LOG_DENSITY and not USE_XPINN and str(PERTURBATION_TYPE).lower() == "power_spectrum":
-        return np.exp(log_density)
-    else:
-        return log_density
 
 def get_fd_default_params():
     """
@@ -76,7 +56,7 @@ def predict_xpinn(nets, x, y, t, xmin, xmax, ymin, ymax):
     Returns:
         Combined predictions from all subdomains [N, 4] (rho, vx, vy, phi)
     """
-    import xpinn_decomposition as xpinn_utils
+    import methods.xpinn_decomposition as xpinn_utils
     
     N = x.shape[0]
     device = x.device
@@ -237,7 +217,7 @@ def plot_function(net, time_array, initial_params, velocity=False, isplot=False,
         else:
             output_0 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
-        rho_pred0 = convert_log_density_to_density(output_0[:, 0:1].data.cpu().numpy())
+        rho_pred0 = output_0[:, 0:1].data.cpu().numpy()
         v_pred_x0 = output_0[:, 1:2].data.cpu().numpy()
         v_pred_y0 = output_0[:, 2:3].data.cpu().numpy()
         phi_pred0 = output_0[:, 3:4].data.cpu().numpy()
@@ -344,7 +324,7 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     else:
         output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
     
-    rho = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
+    rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
     U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
     V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
 
@@ -451,7 +431,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
     else:
         output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
-    rho_first = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
+    rho_first = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
     U_first = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
     V_first = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
     
@@ -475,17 +455,17 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         pt_t = Variable(torch.from_numpy(t_first).float(), requires_grad=True).to(device)
         if use_xpinn:
             pred_first = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
-            rho_first = convert_log_density_to_density(pred_first[:, 0].data.cpu().numpy().reshape(Q, Q))
+            rho_first = pred_first[:, 0].data.cpu().numpy().reshape(Q, Q)
         else:
-            rho_first = convert_log_density_to_density(nets[0]([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q))
+            rho_first = nets[0]([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q)
         # Last frame
         t_last = time_points[-1] * np.ones(Q**2).reshape(Q**2, 1)
         pt_t_last = Variable(torch.from_numpy(t_last).float(), requires_grad=True).to(device)
         if use_xpinn:
             pred_last = predict_xpinn(nets, pt_x, pt_y, pt_t_last, xmin, xmax, ymin, ymax)
-            rho_last = convert_log_density_to_density(pred_last[:, 0].data.cpu().numpy().reshape(Q, Q))
+            rho_last = pred_last[:, 0].data.cpu().numpy().reshape(Q, Q)
         else:
-            rho_last = convert_log_density_to_density(nets[0]([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q))
+            rho_last = nets[0]([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q)
         fixed_vmin = min(np.min(rho_first), np.min(rho_last))
         fixed_vmax = max(np.max(rho_first), np.max(rho_last))
         if fixed_vmin == fixed_vmax:
@@ -545,7 +525,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         else:
             output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
-        rho = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
+        rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
         U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
         V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
         
@@ -760,6 +740,9 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     axes = axes.flatten()
 
+    # Collect all velocity data to determine appropriate y-axis limits
+    all_velocity_data = []
+    
     for i, time in enumerate(time_array_1d):
         print(f"Creating 1D comparison plots at t = {time}")
         
@@ -784,6 +767,12 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         v_FD_interp = interp1d(x, v[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
         phi_FD_interp = interp1d(x, phi[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
         
+        # Collect velocity data for limit calculation
+        all_velocity_data.append(v_pred_x0)
+        all_velocity_data.append(v_FD_interp)
+        if (np.isclose(KY, 0.0)) and (a < 0.1):
+            all_velocity_data.append(v_LT_interp)
+        
         # Density comparison plots
         axes[i*3].plot(X, rho_pred0, color='c', linewidth=3, label="PINN")
         # Only plot Linear Theory when KY == 0 and amplitude is small
@@ -795,7 +784,7 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         axes[i*3].set_ylabel(r"$\rho$")
         axes[i*3].grid(True)
         axes[i*3].legend()
-        axes[i*3].set_ylim(0.8*rho_o, 1.2*rho_o)
+        axes[i*3].set_ylim(0.5*rho_o, 1.5*rho_o)
         
         # Velocity comparison plots
         axes[i*3+1].plot(X, v_pred_x0, color='c', linewidth=3, label="PINN")
@@ -818,6 +807,38 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         axes[i*3+2].set_xlabel("x")
         axes[i*3+2].grid(True)
         axes[i*3+2].legend()
+
+    # Set velocity y-axis limits based on amplitude (same logic as create_1d_cross_sections_sinusoidal)
+    # Calculate limits from all collected velocity data and apply consistently to all velocity plots
+    if a < 0.1:
+        # Default limits for small amplitude cases
+        v_limu_default = 0.055
+        v_liml_default = -0.055
+    else:
+        # Default limits for large amplitude cases
+        v_limu_default = 0.6
+        v_liml_default = -0.6
+    
+    # Calculate actual data range across all velocity data with padding
+    if all_velocity_data:
+        v_min = np.min([np.min(v_data) for v_data in all_velocity_data])
+        v_max = np.max([np.max(v_data) for v_data in all_velocity_data])
+        v_range = v_max - v_min
+        # Add 10% padding to ensure all data stays within limits
+        padding = max(0.01, 0.1 * v_range)
+        v_liml_actual = v_min - padding
+        v_limu_actual = v_max + padding
+        
+        # Ensure limits are at least as wide as default, but expand if data exceeds them
+        v_liml_actual = min(v_liml_actual, v_liml_default)
+        v_limu_actual = max(v_limu_actual, v_limu_default)
+    else:
+        v_liml_actual = v_liml_default
+        v_limu_actual = v_limu_default
+    
+    # Apply consistent limits to all velocity plots
+    for i in range(len(time_array_1d)):
+        axes[i*3+1].set_ylim(v_liml_actual, v_limu_actual)
 
     plt.tight_layout()
     
@@ -951,12 +972,26 @@ def create_all_plots(net, initial_params, include_growth=False,
     # Display all created figures so they appear when called from train.py
     plt.show()
 
-    return {
+    result = {
         "pinn_density": (fig_den, axes_den),
         "pinn_velocity": (fig_vel, axes_vel),
         "fd_density": (fig_fd_den, axes_fd_den),
         "fd_velocity": (fig_fd_vel, axes_fd_vel),
     }
+    
+    # Add spectral analysis plots if enabled
+    if USE_SPECTRAL_ANALYSIS:
+        print("\n" + "="*60)
+        print("GENERATING SPECTRAL ANALYSIS PLOTS")
+        print("="*60)
+        spectral_figs = create_all_spectral_plots(
+            net, initial_params, N=FD_N_2D, nu=0.5,
+            use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
+            vel_rms=fd_vel_rms, random_seed=fd_random_seed
+        )
+        result["spectral"] = spectral_figs
+    
+    return result
 
 
 def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
@@ -1006,7 +1041,7 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
             out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
         else:
             out = nets[0]([pt_x, pt_y, pt_t])
-        rho_pinn = convert_log_density_to_density(out[:, 0].data.cpu().numpy().reshape(Q, Q))
+        rho_pinn = out[:, 0].data.cpu().numpy().reshape(Q, Q)
         pinn_max_list.append(np.max(rho_pinn))
 
         # LAX/FD evaluation; use shared velocity fields when available
@@ -1134,7 +1169,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
             out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
         else:
             out = nets[0]([pt_x, pt_y, pt_t])
-        rho_pinn = convert_log_density_to_density(out[:, 0:1].data.cpu().numpy().reshape(-1))
+        rho_pinn = out[:, 0:1].data.cpu().numpy().reshape(-1)
         vx_pinn = out[:, 1:2].data.cpu().numpy().reshape(-1)
         # potential not used in cross-section plots
 
@@ -1501,7 +1536,7 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
             output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
         
         if which == "density":
-            pinn_field = convert_log_density_to_density(output_00[:, 0].data.cpu().numpy().reshape(Q, Q))
+            pinn_field = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
             # Extract velocity components for density plots too
             U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
             V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
@@ -1699,3 +1734,537 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
     
     plt.show()
     return fig, axes
+
+
+# ==================== Spectral Analysis Plotting Functions ====================
+
+def plot_spectrum_initial_comparison(net, initial_params, N=200, nu=0.5,
+                                     use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+    """
+    Plot initial velocity power spectrum comparison between PINN and FD at t=0.
+    
+    Args:
+        net: Trained neural network or list of networks (for XPINN)
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        N: Grid resolution for FD solver
+        nu: Courant number for FD solver
+        use_velocity_ps: Whether to use velocity power spectrum for FD
+        ps_index: Power spectrum index for FD
+        vel_rms: Velocity RMS for FD
+        random_seed: Random seed for FD
+    
+    Returns:
+        fig, axes: Figure and axes objects
+    """
+    from spectral_analysis import compute_isotropic_spectrum, sample_pinn_velocity, sample_fd_velocity
+    
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
+    # Use config defaults if not specified
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    # Grid resolution
+    M = SPECTRAL_ANALYSIS_GRID_SIZE if SPECTRAL_ANALYSIS_GRID_SIZE is not None else N_GRID
+    
+    print("Computing initial velocity power spectra...")
+    
+    # Sample PINN velocity at t=0
+    vx_pinn, vy_pinn, xs_pinn, ys_pinn = sample_pinn_velocity(
+        nets[0] if not use_xpinn else nets, 0.0, xmin, xmax, ymin, ymax, M=M, use_xpinn=use_xpinn
+    )
+    Lx = xmax - xmin
+    Ly = ymax - ymin
+    
+    # Compute PINN spectrum
+    k_pinn, E_pinn, _ = compute_isotropic_spectrum(
+        vx_pinn, vy_pinn, Lx, Ly, bins=SPECTRAL_ANALYSIS_BINS, remove_dc=SPECTRAL_ANALYSIS_REMOVE_DC
+    )
+    
+    # Sample FD velocity at t=0
+    num_of_waves = (xmax - xmin) / lam
+    vx_fd, vy_fd, xs_fd, ys_fd = sample_fd_velocity(
+        0.0, N, nu, lam, num_of_waves, rho_1,
+        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+    )
+    Lx_fd = xs_fd[-1] - xs_fd[0] + (xs_fd[1] - xs_fd[0]) if len(xs_fd) > 1 else Lx
+    Ly_fd = ys_fd[-1] - ys_fd[0] + (ys_fd[1] - ys_fd[0]) if len(ys_fd) > 1 else Ly
+    
+    # Compute FD spectrum
+    k_fd, E_fd, _ = compute_isotropic_spectrum(
+        vx_fd, vy_fd, Lx_fd, Ly_fd, bins=SPECTRAL_ANALYSIS_BINS, remove_dc=SPECTRAL_ANALYSIS_REMOVE_DC
+    )
+    
+    # Create plot
+    fig, ax = plt.subplots(1, 1, figsize=(10, 7))
+    
+    if SPECTRAL_PLOT_LOGLOG:
+        ax.loglog(k_pinn, E_pinn, 'b-', label='PINN', linewidth=2)
+        ax.loglog(k_fd, E_fd, 'r--', label='FD', linewidth=2)
+        
+        # Add reference line for initial power spectrum slope
+        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+            # Find overlap region
+            k_min = max(np.min(k_pinn), np.min(k_fd))
+            k_max = min(np.max(k_pinn), np.max(k_fd))
+            k_ref = np.logspace(np.log10(k_min), np.log10(k_max), 50)
+            # Expected spectrum: E(k) ~ k^n for power spectrum velocity
+            # Convention: Velocity power spectrum P_v(k) = |v̂(k)|² ~ k^(ps_index)
+            # For POWER_EXPONENT = -4: P_v(k) ~ k^(-4)
+            # The energy spectrum E(k) after radial binning follows: E(k) ~ k^(ps_index + 2)
+            # This gives E(k) ~ k^(-4 + 2) = k^(-2) for ps_index = -4
+            # The +2 factor comes from shell area normalization in 2D isotropic spectra
+            n_expected = ps_index + 2
+            E_ref = k_ref**(n_expected)
+            # Normalize to match at a reference point
+            k_ref_norm = k_ref[np.argmin(np.abs(k_ref - k_pinn[len(k_pinn)//4]))]
+            E_ref_norm = E_ref[np.argmin(np.abs(k_ref - k_ref_norm))]
+            E_pinn_norm = E_pinn[np.argmin(np.abs(k_pinn - k_ref_norm))]
+            E_ref = E_ref * (E_pinn_norm / E_ref_norm)
+            ax.loglog(k_ref, E_ref, 'k:', label=f'k^{n_expected:.1f} (expected)', linewidth=1.5, alpha=0.7)
+    else:
+        ax.plot(k_pinn, E_pinn, 'b-', label='PINN', linewidth=2)
+        ax.plot(k_fd, E_fd, 'r--', label='FD', linewidth=2)
+    
+    ax.set_xlabel('Wavenumber k', fontsize=14)
+    ax.set_ylabel('Energy Spectrum E(k)', fontsize=14)
+    ax.set_title('Initial Velocity Power Spectrum (t=0)', fontsize=16)
+    ax.legend(fontsize=12)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "spectral_initial_comparison.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved initial spectrum comparison to {save_path}")
+    
+    plt.show()
+    return fig, ax
+
+
+def plot_spectrum_evolution(net, initial_params, times=None, N=200, nu=0.5,
+                           use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+    """
+    Plot velocity power spectrum evolution over time for PINN and FD.
+    
+    Args:
+        net: Trained neural network or list of networks (for XPINN)
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        times: Array of time values (defaults to SPECTRAL_ANALYSIS_TIMES)
+        N: Grid resolution for FD solver
+        nu: Courant number for FD solver
+        use_velocity_ps: Whether to use velocity power spectrum for FD
+        ps_index: Power spectrum index for FD
+        vel_rms: Velocity RMS for FD
+        random_seed: Random seed for FD
+    
+    Returns:
+        fig, axes: Figure and axes objects
+    """
+    from spectral_analysis import compute_spectra_over_time
+    
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
+    # Use config defaults if not specified
+    if times is None:
+        times = SPECTRAL_ANALYSIS_TIMES
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    # Grid resolution
+    M = SPECTRAL_ANALYSIS_GRID_SIZE if SPECTRAL_ANALYSIS_GRID_SIZE is not None else N_GRID
+    
+    print(f"Computing power spectra at {len(times)} time points...")
+    
+    # Compute PINN spectra
+    num_of_waves = (xmax - xmin) / lam
+    print("  Computing PINN spectra...")
+    pinn_spectra = compute_spectra_over_time(
+        nets[0] if not use_xpinn else nets, times, xmin, xmax, ymin, ymax,
+        source_type='pinn', bins=SPECTRAL_ANALYSIS_BINS,
+        use_xpinn=use_xpinn, M=M
+    )
+    
+    # Compute FD spectra
+    print("  Computing FD spectra...")
+    fd_spectra = compute_spectra_over_time(
+        None, times, xmin, xmax, ymin, ymax,
+        source_type='fd', bins=SPECTRAL_ANALYSIS_BINS,
+        N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+    )
+    
+    # Create subplots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # Color map for different times
+    colors = plt.cm.viridis(np.linspace(0, 1, len(times)))
+    
+    # Plot PINN evolution
+    ax_pinn = axes[0]
+    for i, (t, k, E, _) in enumerate(pinn_spectra):
+        label = f't={t:.2f}' if i % max(1, len(times)//5) == 0 or i == len(times)-1 else None
+        if SPECTRAL_PLOT_LOGLOG:
+            ax_pinn.loglog(k, E, color=colors[i], linewidth=2, label=label, alpha=0.8)
+        else:
+            ax_pinn.plot(k, E, color=colors[i], linewidth=2, label=label, alpha=0.8)
+    
+    ax_pinn.set_xlabel('Wavenumber k', fontsize=14)
+    ax_pinn.set_ylabel('Energy Spectrum E(k)', fontsize=14)
+    ax_pinn.set_title('PINN Velocity Power Spectrum Evolution', fontsize=16)
+    ax_pinn.legend(fontsize=10, loc='best')
+    ax_pinn.grid(True, alpha=0.3)
+    
+    # Plot FD evolution
+    ax_fd = axes[1]
+    for i, (t, k, E, _) in enumerate(fd_spectra):
+        label = f't={t:.2f}' if i % max(1, len(times)//5) == 0 or i == len(times)-1 else None
+        if SPECTRAL_PLOT_LOGLOG:
+            ax_fd.loglog(k, E, color=colors[i], linewidth=2, label=label, alpha=0.8)
+        else:
+            ax_fd.plot(k, E, color=colors[i], linewidth=2, label=label, alpha=0.8)
+    
+    ax_fd.set_xlabel('Wavenumber k', fontsize=14)
+    ax_fd.set_ylabel('Energy Spectrum E(k)', fontsize=14)
+    ax_fd.set_title('FD Velocity Power Spectrum Evolution', fontsize=16)
+    ax_fd.legend(fontsize=10, loc='best')
+    ax_fd.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "spectral_evolution.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved spectrum evolution to {save_path}")
+    
+    plt.show()
+    return fig, axes
+
+
+def plot_spectrum_ratio(net, initial_params, times=None, N=200, nu=0.5,
+                       use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+    """
+    Plot ratio of PINN to FD power spectra to assess agreement.
+    
+    Args:
+        net: Trained neural network or list of networks (for XPINN)
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        times: Array of time values (defaults to SPECTRAL_ANALYSIS_TIMES)
+        N: Grid resolution for FD solver
+        nu: Courant number for FD solver
+        use_velocity_ps: Whether to use velocity power spectrum for FD
+        ps_index: Power spectrum index for FD
+        vel_rms: Velocity RMS for FD
+        random_seed: Random seed for FD
+    
+    Returns:
+        fig, axes: Figure and axes objects
+    """
+    from spectral_analysis import compute_spectra_over_time
+    
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
+    # Use config defaults if not specified
+    if times is None:
+        times = SPECTRAL_ANALYSIS_TIMES
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    # Grid resolution
+    M = SPECTRAL_ANALYSIS_GRID_SIZE if SPECTRAL_ANALYSIS_GRID_SIZE is not None else N_GRID
+    
+    print(f"Computing power spectra for ratio plot at {len(times)} time points...")
+    
+    # Compute PINN spectra
+    num_of_waves = (xmax - xmin) / lam
+    pinn_spectra = compute_spectra_over_time(
+        nets[0] if not use_xpinn else nets, times, xmin, xmax, ymin, ymax,
+        source_type='pinn', bins=SPECTRAL_ANALYSIS_BINS,
+        use_xpinn=use_xpinn, M=M
+    )
+    
+    # Compute FD spectra
+    fd_spectra = compute_spectra_over_time(
+        None, times, xmin, xmax, ymin, ymax,
+        source_type='fd', bins=SPECTRAL_ANALYSIS_BINS,
+        N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+    )
+    
+    # Create plot
+    fig, ax = plt.subplots(1, 1, figsize=(12, 7))
+    
+    colors = plt.cm.viridis(np.linspace(0, 1, len(times)))
+    
+    for i, ((t_pinn, k_pinn, E_pinn, _), (t_fd, k_fd, E_fd, _)) in enumerate(zip(pinn_spectra, fd_spectra)):
+        # Interpolate FD spectrum onto PINN k-grid for comparison
+        from scipy.interpolate import interp1d
+        
+        # Find overlap region
+        k_min = max(np.min(k_pinn), np.min(k_fd))
+        k_max = min(np.max(k_pinn), np.max(k_fd))
+        k_overlap = k_pinn[(k_pinn >= k_min) & (k_pinn <= k_max)]
+        
+        if len(k_overlap) > 0:
+            # Interpolate FD onto PINN grid
+            E_fd_interp = interp1d(k_fd, E_fd, kind='linear', bounds_error=False, fill_value=np.nan)(k_overlap)
+            E_pinn_overlap = E_pinn[(k_pinn >= k_min) & (k_pinn <= k_max)]
+            
+            # Compute ratio
+            ratio = E_pinn_overlap / (E_fd_interp + 1e-12)  # Avoid division by zero
+            
+            label = f't={t_pinn:.2f}' if i % max(1, len(times)//5) == 0 or i == len(times)-1 else None
+            if SPECTRAL_PLOT_LOGLOG:
+                ax.semilogx(k_overlap, ratio, color=colors[i], linewidth=2, label=label, alpha=0.8)
+            else:
+                ax.plot(k_overlap, ratio, color=colors[i], linewidth=2, label=label, alpha=0.8)
+    
+    ax.axhline(y=1.0, color='k', linestyle='--', linewidth=1.5, alpha=0.7, label='Perfect agreement')
+    ax.set_xlabel('Wavenumber k', fontsize=14)
+    ax.set_ylabel('Ratio E_PINN(k) / E_FD(k)', fontsize=14)
+    ax.set_title('PINN/FD Power Spectrum Ratio', fontsize=16)
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "spectral_ratio.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved spectrum ratio plot to {save_path}")
+    
+    plt.show()
+    return fig, ax
+
+
+def plot_spectral_diagnostics(net, initial_params, times=None, N=200, nu=0.5,
+                              use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+    """
+    Plot diagnostic quantities from power spectra: total KE, peak k, mean k.
+    
+    Args:
+        net: Trained neural network or list of networks (for XPINN)
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        times: Array of time values (defaults to SPECTRAL_ANALYSIS_TIMES)
+        N: Grid resolution for FD solver
+        nu: Courant number for FD solver
+        use_velocity_ps: Whether to use velocity power spectrum for FD
+        ps_index: Power spectrum index for FD
+        vel_rms: Velocity RMS for FD
+        random_seed: Random seed for FD
+    
+    Returns:
+        fig, axes: Figure and axes objects
+    """
+    from spectral_analysis import compute_spectra_over_time, compute_spectral_diagnostics
+    
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
+    # Use config defaults if not specified
+    if times is None:
+        times = SPECTRAL_ANALYSIS_TIMES
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    # Grid resolution
+    M = SPECTRAL_ANALYSIS_GRID_SIZE if SPECTRAL_ANALYSIS_GRID_SIZE is not None else N_GRID
+    
+    print(f"Computing spectral diagnostics at {len(times)} time points...")
+    
+    # Compute PINN spectra
+    num_of_waves = (xmax - xmin) / lam
+    pinn_spectra = compute_spectra_over_time(
+        nets[0] if not use_xpinn else nets, times, xmin, xmax, ymin, ymax,
+        source_type='pinn', bins=SPECTRAL_ANALYSIS_BINS,
+        use_xpinn=use_xpinn, M=M
+    )
+    
+    # Compute FD spectra
+    fd_spectra = compute_spectra_over_time(
+        None, times, xmin, xmax, ymin, ymax,
+        source_type='fd', bins=SPECTRAL_ANALYSIS_BINS,
+        N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+    )
+    
+    # Compute diagnostics
+    pinn_diag = compute_spectral_diagnostics(pinn_spectra)
+    fd_diag = compute_spectral_diagnostics(fd_spectra)
+    
+    # Create subplots
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+    
+    # Total kinetic energy
+    axes[0].plot(pinn_diag['times'], pinn_diag['total_kinetic_energy'], 'b-o', label='PINN', linewidth=2, markersize=6)
+    axes[0].plot(fd_diag['times'], fd_diag['total_kinetic_energy'], 'r--s', label='FD', linewidth=2, markersize=6)
+    axes[0].set_xlabel('Time', fontsize=14)
+    axes[0].set_ylabel('Total Kinetic Energy', fontsize=14)
+    axes[0].set_title('Total Kinetic Energy Evolution', fontsize=16)
+    axes[0].legend(fontsize=12)
+    axes[0].grid(True, alpha=0.3)
+    
+    # Peak wavenumber
+    axes[1].plot(pinn_diag['times'], pinn_diag['peak_wavenumber'], 'b-o', label='PINN', linewidth=2, markersize=6)
+    axes[1].plot(fd_diag['times'], fd_diag['peak_wavenumber'], 'r--s', label='FD', linewidth=2, markersize=6)
+    axes[1].set_xlabel('Time', fontsize=14)
+    axes[1].set_ylabel('Peak Wavenumber k_peak', fontsize=14)
+    axes[1].set_title('Peak Wavenumber Evolution', fontsize=16)
+    axes[1].legend(fontsize=12)
+    axes[1].grid(True, alpha=0.3)
+    
+    # Mean wavenumber
+    axes[2].plot(pinn_diag['times'], pinn_diag['mean_wavenumber'], 'b-o', label='PINN', linewidth=2, markersize=6)
+    axes[2].plot(fd_diag['times'], fd_diag['mean_wavenumber'], 'r--s', label='FD', linewidth=2, markersize=6)
+    axes[2].set_xlabel('Time', fontsize=14)
+    axes[2].set_ylabel('Mean Wavenumber ⟨k⟩', fontsize=14)
+    axes[2].set_title('Mean Wavenumber Evolution', fontsize=16)
+    axes[2].legend(fontsize=12)
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "spectral_diagnostics.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved spectral diagnostics to {save_path}")
+    
+    plt.show()
+    return fig, axes
+
+
+def create_all_spectral_plots(net, initial_params, N=200, nu=0.5,
+                              use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+    """
+    Create all spectral analysis plots according to configuration settings.
+    
+    Args:
+        net: Trained neural network or list of networks (for XPINN)
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        N: Grid resolution for FD solver
+        nu: Courant number for FD solver
+        use_velocity_ps: Whether to use velocity power spectrum for FD
+        ps_index: Power spectrum index for FD
+        vel_rms: Velocity RMS for FD
+        random_seed: Random seed for FD
+    
+    Returns:
+        figs: List of figure objects created
+    """
+    if not USE_SPECTRAL_ANALYSIS:
+        print("Spectral analysis is disabled in config. Set USE_SPECTRAL_ANALYSIS=True to enable.")
+        return []
+    
+    figs = []
+    
+    print("\n" + "="*60)
+    print("Generating Spectral Analysis Plots")
+    print("="*60)
+    
+    times = SPECTRAL_ANALYSIS_TIMES
+    
+    # Initial spectrum comparison
+    if SPECTRAL_PLOT_SHOW_INITIAL:
+        print("\n1. Initial spectrum comparison...")
+        fig, _ = plot_spectrum_initial_comparison(
+            net, initial_params, N=N, nu=nu,
+            use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+        )
+        figs.append(fig)
+    
+    # Evolution plots
+    if SPECTRAL_PLOT_SHOW_EVOLUTION:
+        print("\n2. Spectrum evolution...")
+        fig, _ = plot_spectrum_evolution(
+            net, initial_params, times=times, N=N, nu=nu,
+            use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+        )
+        figs.append(fig)
+    
+    # Ratio plot
+    if SPECTRAL_PLOT_SHOW_RATIO:
+        print("\n3. PINN/FD ratio...")
+        fig, _ = plot_spectrum_ratio(
+            net, initial_params, times=times, N=N, nu=nu,
+            use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+        )
+        figs.append(fig)
+    
+    # Diagnostics
+    if SPECTRAL_PLOT_SHOW_DIAGNOSTICS:
+        print("\n4. Spectral diagnostics...")
+        fig, _ = plot_spectral_diagnostics(
+            net, initial_params, times=times, N=N, nu=nu,
+            use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+        )
+        figs.append(fig)
+    
+    print("\n" + "="*60)
+    print("Spectral analysis complete!")
+    print("="*60 + "\n")
+    
+    return figs

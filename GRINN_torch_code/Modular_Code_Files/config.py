@@ -10,8 +10,8 @@ const = 1
 G = 1
 
 
-iteration_adam_1D = 200
-iteration_lbgfs_1D = 100
+iteration_adam_1D = 1001
+iteration_lbgfs_1D = 201
 
 iteration_adam_2D = 1000
 iteration_lbgfs_2D = 400

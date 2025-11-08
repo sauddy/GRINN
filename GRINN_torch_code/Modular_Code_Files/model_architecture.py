@@ -9,13 +9,17 @@ class Sin(nn.Module):
         return torch.sin(input)
 
 class PINN(nn.Module):
-    def __init__(self, num_neurons=32):
+    def __init__(self, num_neurons=64):
         super(PINN, self).__init__()
         self.num_neurons = num_neurons
     
     # 1D branch (x, t)
         self.branch_1d = nn.Sequential(
             nn.Linear(2, num_neurons),
+            Sin(),
+            nn.Linear(num_neurons, num_neurons),
+            Sin(),
+            nn.Linear(num_neurons, num_neurons),
             Sin(),
             nn.Linear(num_neurons, num_neurons),
             Sin(),

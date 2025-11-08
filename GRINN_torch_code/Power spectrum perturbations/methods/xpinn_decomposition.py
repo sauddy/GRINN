@@ -279,3 +279,191 @@ def get_exterior_boundary_info(subdomain_idx, nx_sub, ny_sub, xmin, xmax, ymin, 
     
     return boundary_info
 
+
+# ==================== XPINN Setup and Initialization ====================
+
+def setup_xpinn_devices(num_subdomains, device, use_multi_gpu=False):
+    """
+    Setup device assignment for XPINN subdomains.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        device: Default device
+        use_multi_gpu: Whether to use multi-GPU setup
+    
+    Returns:
+        Tuple (subdomain_devices, num_gpus)
+    """
+    if use_multi_gpu and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"Multi-GPU enabled: {num_gpus} GPUs available")
+        devices = [f"cuda:{i}" for i in range(num_gpus)]
+        subdomain_devices = [devices[i % len(devices)] for i in range(num_subdomains)]
+    else:
+        num_gpus = 1
+        subdomain_devices = [device] * num_subdomains
+    
+    return subdomain_devices, num_gpus
+
+
+def setup_xpinn_networks(num_subdomains, subdomain_devices, xmin, xmax, ymin, ymax, 
+                         dimension, num_neurons, num_layers, harmonics, 
+                         default_activation, nx_sub, ny_sub):
+    """
+    Initialize XPINN subdomain networks.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        subdomain_devices: List of device assignments per subdomain
+        xmin, xmax, ymin, ymax: Global domain bounds
+        dimension: Spatial dimension
+        num_neurons: Default number of neurons per layer
+        num_layers: Default number of hidden layers
+        harmonics: Default number of Fourier harmonics
+        default_activation: Default activation function type
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        List of initialized neural networks
+    """
+    from config import SUBDOMAIN_CONFIGS
+    from core.model_architecture import PINN
+    
+    # Validate subdomain configs
+    subdomain_configs = None
+    if SUBDOMAIN_CONFIGS and len(SUBDOMAIN_CONFIGS) != num_subdomains:
+        print(f"WARNING: SUBDOMAIN_CONFIGS has {len(SUBDOMAIN_CONFIGS)} entries but {num_subdomains} subdomains expected.")
+        print(f"         Using global defaults for all subdomains.")
+    elif SUBDOMAIN_CONFIGS:
+        subdomain_configs = SUBDOMAIN_CONFIGS
+    
+    nets = []
+    for i in range(num_subdomains):
+        # Get subdomain-specific configuration or use defaults
+        if subdomain_configs and i < len(subdomain_configs):
+            config = subdomain_configs[i]
+            sub_neurons = config.get('num_neurons', num_neurons)
+            sub_layers = config.get('num_layers', num_layers)
+            sub_harmonics = config.get('n_harmonics', harmonics)
+            sub_activation = config.get('activation', default_activation)
+        else:
+            sub_neurons = num_neurons
+            sub_layers = num_layers
+            sub_harmonics = harmonics
+            sub_activation = default_activation
+        
+        # Create network
+        net = PINN(num_neurons=sub_neurons, num_layers=sub_layers, 
+                  n_harmonics=sub_harmonics, activation_type=sub_activation)
+        
+        # Use GLOBAL domain for periodic embeddings
+        net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=dimension)
+        net = net.to(subdomain_devices[i])
+        nets.append(net)
+        
+        # Print configuration
+        subdomain_bounds = get_subdomain_bounds(i, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
+        print(f"  Subdomain {i}: bounds={subdomain_bounds}")
+        print(f"    Architecture: neurons={sub_neurons}, layers={sub_layers}, harmonics={sub_harmonics}, activation={sub_activation}, device={subdomain_devices[i]}")
+    
+    return nets
+
+
+def setup_xpinn_collocation(num_subdomains, subdomain_devices, xmin, xmax, ymin, ymax, 
+                            tmin, tmax, n_r, n_0, startup_dt, nx_sub, ny_sub):
+    """
+    Generate collocation points for XPINN subdomains.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        subdomain_devices: Device assignment per subdomain
+        xmin, xmax, ymin, ymax: Domain bounds
+        tmin, tmax: Time bounds
+        n_r: Total residual collocation points
+        n_0: Total IC collocation points
+        startup_dt: Time offset for PDE enforcement
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        Tuple (subdomain_collocs, subdomain_ic_collocs)
+    """
+    from core.data_generator import distribute_collocation_points
+    
+    # Distribute points
+    n_r_per_subdomain = distribute_collocation_points(n_r, num_subdomains)
+    n_0_per_subdomain = distribute_collocation_points(n_0, num_subdomains)
+    
+    subdomain_collocs = []
+    subdomain_ic_collocs = []
+    
+    for i in range(num_subdomains):
+        subdomain_bounds = get_subdomain_bounds(i, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
+        colloc_domain, colloc_ic = generate_subdomain_collocation(
+            subdomain_bounds, n_r_per_subdomain[i], n_0_per_subdomain[i],
+            tmin, tmax, startup_dt, device=subdomain_devices[i]
+        )
+        subdomain_collocs.append(colloc_domain)
+        subdomain_ic_collocs.append(colloc_ic)
+    
+    return subdomain_collocs, subdomain_ic_collocs
+
+
+def setup_xpinn_interfaces(subdomain_devices, xmin, xmax, ymin, ymax, tmin, tmax, 
+                           n_interface, nx_sub, ny_sub):
+    """
+    Generate interface collocation points for XPINN.
+    
+    Args:
+        subdomain_devices: Device assignment per subdomain
+        xmin, xmax, ymin, ymax: Domain bounds
+        tmin, tmax: Time bounds
+        n_interface: Number of interface collocation points
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        Tuple (interfaces, interface_collocs)
+    """
+    interfaces = get_interfaces(nx_sub, ny_sub)
+    
+    interface_collocs = {}
+    for interface in interfaces:
+        subdomain_i, subdomain_j, _, _ = interface
+        interface_device = subdomain_devices[subdomain_i]
+        interface_points = generate_interface_points(
+            interface, xmin, xmax, ymin, ymax, tmin, tmax, n_interface, device=interface_device
+        )
+        interface_collocs[(subdomain_i, subdomain_j)] = interface_points
+    
+    return interfaces, interface_collocs
+
+
+def cache_xpinn_initial_conditions(num_subdomains, subdomain_ic_collocs, ic_functions):
+    """
+    Pre-compute and cache initial condition values for all subdomains.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        subdomain_ic_collocs: IC collocation points per subdomain
+        ic_functions: Dictionary of IC functions
+    
+    Returns:
+        List of cached IC dictionaries per subdomain
+    """
+    print("Caching IC values for all subdomains...")
+    cached_ic_values = []
+    
+    for i in range(num_subdomains):
+        colloc_ic = subdomain_ic_collocs[i]
+        ic_cache = {
+            'rho': ic_functions['rho'](colloc_ic),
+            'vx': ic_functions['vx'](colloc_ic),
+            'vy': ic_functions['vy'](colloc_ic),
+            'phi': ic_functions['phi'](colloc_ic)
+        }
+        cached_ic_values.append(ic_cache)
+    
+    print("IC values cached successfully!")
+    return cached_ic_values
