@@ -34,29 +34,67 @@ np.random.seed(RANDOM_SEED)
 def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amplitude=0.02, random_seed=None):
     """
     Generate 2D velocity components (vx, vy) with an isotropic power-law spectrum P(k) ~ k^{power_index}.
-    The fields are created by filtering white noise in Fourier space and normalized to the requested RMS amplitude.
+    
+    This function generates resolution-independent initial conditions by:
+    1. Synthesizing at fixed high resolution (1024x1024)
+    2. Applying power-law filter with sharp cutoff at target Nyquist frequency
+    3. Downsampling to target resolution via interpolation
+    
+    This ensures that N=300 and N=400 runs start with the same physical velocity field,
+    just sampled at different resolutions, making convergence studies meaningful.
     """
+    # Use a fixed, high-resolution grid for synthesis to ensure resolution independence
+    hires_nx, hires_ny = 1024, 1024
+    
     if random_seed is not None:
         rng = np.random.default_rng(random_seed)
     else:
         rng = np.random.default_rng()
 
     def synthesize_component():
-        field = rng.standard_normal((nx, ny))
+        # 1. Generate random field at high resolution
+        field = rng.standard_normal((hires_nx, hires_ny))
         F = fft2(field)
-        kx = 2 * np.pi * np.fft.fftfreq(nx, d=Lx / nx)
-        ky = 2 * np.pi * np.fft.fftfreq(ny, d=Ly / ny)
+        
+        # 2. Construct k-space grid at high resolution
+        kx = 2 * np.pi * np.fft.fftfreq(hires_nx, d=Lx / hires_nx)
+        ky = 2 * np.pi * np.fft.fftfreq(hires_ny, d=Ly / hires_ny)
         kxg, kyg = np.meshgrid(kx, ky, indexing='ij')
         kk = np.sqrt(kxg**2 + kyg**2)
-        kk[0, 0] = 1.0
+        kk[0, 0] = 1.0  # Avoid division by zero
+        
+        # 3. Apply power-law filter
         filt = (kk) ** (power_index / 2.0)
         filt[kk == 0] = 0.0
+        
+        # 4. KEY: Apply sharp cutoff at target Nyquist frequency to prevent aliasing
+        k_nyquist = np.pi * nx / Lx  # Target grid's Nyquist frequency
+        filt[kk > k_nyquist] = 0.0   # Remove unresolvable modes
+        
         F_filtered = F * filt
-        comp = np.real(ifft2(F_filtered))
-        comp -= np.mean(comp)
-        std = np.std(comp)
+        
+        # 5. Transform back to real space at high resolution
+        comp_hires = np.real(ifft2(F_filtered))
+        
+        # 6. Normalize the high-resolution field
+        comp_hires -= np.mean(comp_hires)
+        std = np.std(comp_hires)
         if std > 0:
-            comp = comp * (amplitude / std)
+            comp_hires = comp_hires * (amplitude / std)
+        
+        # 7. Downsample to target resolution via interpolation
+        from scipy.interpolate import RegularGridInterpolator
+        
+        x_hires = np.linspace(0, Lx, hires_nx, endpoint=False)
+        y_hires = np.linspace(0, Ly, hires_ny, endpoint=False)
+        x_lores = np.linspace(0, Lx, nx, endpoint=False)
+        y_lores = np.linspace(0, Ly, ny, endpoint=False)
+        
+        interp = RegularGridInterpolator((x_hires, y_hires), comp_hires, 
+                                        method='linear', bounds_error=False, fill_value=0.0)
+        X_lores, Y_lores = np.meshgrid(x_lores, y_lores, indexing='ij')
+        comp = interp((X_lores, Y_lores))
+        
         return comp
 
     vx0 = synthesize_component()
@@ -187,15 +225,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     dx = float(Lx/Nx)      # length spacing          
     ### Grid X-T 
     Ny = Nx               # The grid resolution values2d:N =(10,50,100,500)
-    dy = float(Ly/Ny)      # length spacing       
-    dt = nu*dx/c_s       # time grid spacing
- 
-
-    ## For simplification
-    mux = dt/(2*dx)      # is the coefficient in the central differencing Eqs above 
-    muy = dt/(2*dy)      # is the coefficient in the central differencing Eqs above
-    n = int(time/dt)     # grid points in time
-    # print("For dx = {} and dt = {} and time gridpoints n = {} ".format(dx,dt,n))  # Commented out to reduce output noise
+    dy = float(Ly/Ny)      # length spacing
     
     ########### Initializing the ARRAY #######################
     # Exclude right boundary for periodic domains to avoid double-counting
@@ -320,7 +350,21 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     Py0=rho0*vy0
     
     #################################FINITE DIFFERENCE #######################
-    for k in range(1,n): ## Looping over time
+    # --- CORRECTED TIME-STEPPING LOOP ---
+    # Use while loop to ensure simulation runs for fixed physical time, not fixed number of steps
+    t = 0.0
+    k = 0
+    # Initial dt for the first step
+    vmax_initial = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)), c_s)
+    dt = nu * dx / vmax_initial
+
+    while t < time:
+        # Ensure the last step doesn't overshoot the final time
+        if t + dt > time:
+            dt = time - t
+
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
 
         rho1 =  (1/4)*(np.roll(rho0, -1, axis=0)+ np.roll(rho0, 1, axis=0)\
                         +np.roll(rho0, -1, axis=1)+ np.roll(rho0, 1, axis=1))\
@@ -358,7 +402,8 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
 
         vx1 = Px1/rho1 ## 2-D velocity vx 
         vy1 = Py1/rho1 ## 2-D velocity vy
-               ## memory tranfer to overwrite "1" in the next time step
+        
+        # Update state for next iteration
         rho0 = rho1
         vx0 = vx1
         vy0 = vy1
@@ -366,27 +411,28 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
         Px0 = Px1
         Py0 = Py1
         
-        phi0= phi1
+        if gravity:
+            phi0 = phi1
         
-        ## Updating dt based on the highest signal speed in the code
-        dt1 = nu*dx/np.max([abs(vx1),abs(vy1)])
-        dt2 = nu*dx/c_s
-        
-        
-        dt = np.min([dt1,dt2])
-        mux = dt/(2*dx)      # is the coefficient in the central differencing Eqs above 
-        muy = dt/(2*dy)      # is the coefficient in the central differencing Eqs above
-      
-    
-        n = int(time/dt)     # grid points in time updated dynamically
-    rho_max = np.max(rho1)   ## Maximum density from the FD calculation 
+        # Increment time and step counter
+        t += dt
+        k += 1
+
+        # Calculate dt for the *next* step
+        vmax = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)))
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+
+    n = k
+    rho_max = np.max(rho0)   ## Maximum density from the FD calculation 
     
     # print(ro1)
 # #     ################################# PLOTTING #######################
  
     if isplot : 
         plt.figure(1,figsize=(6,4))
-        plt.plot(x,rho0[:,1]-rho_o,linewidth=1,label="FD at t={}".format(round(time,2)))
+        plt.plot(x,rho0[:,1]-rho_o,linewidth=1,label="FD at t={}".format(round(t,2)))
         plt.legend(numpoints=1,loc='upper right',fancybox=True,shadow=True)
         plt.xlabel(r"$\mathbf{x}$")
         # plt.text(.6,.15,r"dt=%f"%(dt),fontsize=12)
@@ -399,7 +445,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
             #plt.savefig(output_folder+'/LAX_density'+str(lam)+'_'+str(num_of_waves)+'_'+str(t)+'.png', dpi=300)
 
         plt.figure(2,figsize=(6,4))
-        plt.plot(x,vx1[:,1],'--',markersize=2,label="t={}".format(round(time,2)))
+        plt.plot(x,vx0[:,1],'--',markersize=2,label="t={}".format(round(t,2)))
         plt.legend(numpoints=1,loc='upper right',fancybox=True,shadow=True)
         plt.xlabel(r"$\mathbf{x}$")
         plt.title(r"Lax Solution Velocity For $\rho_1$ = {}".format(rho_1))
@@ -411,7 +457,7 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
             #plt.savefig(output_folder+'/LAX_velocity'+str(lam)+'_'+str(num_of_waves)+'_'+str(t)+'.png', dpi=300)
             
         plt.figure(3,figsize=(6,4))
-        plt.plot(y,vy1[1,:],'--',markersize=2,label="t={}".format(round(time,2)))
+        plt.plot(y,vy0[1,:],'--',markersize=2,label="t={}".format(round(t,2)))
         plt.legend(numpoints=1,loc='upper right',fancybox=True,shadow=True)
         plt.xlabel(r"$\mathbf{y}$")
         plt.title(r"Lax Solution Velocity For $\rho_1$ = {}".format(rho_1))
@@ -451,14 +497,14 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
     else:
         if gravity:
             if comparison:
-                return x,rho1,vx1,phi1,n,rho_LT,rho_LT_max,rho_max,vx_LT
+                return x,rho0,vx0,phi0,n,rho_LT,rho_LT_max,rho_max,vx_LT
             else:
-                return x,rho1,vx1,vy1,phi1,n,rho_max
+                return x,rho0,vx0,vy0,phi0,n,rho_max
         else:
             if comparison:
-                return rho1,vx1,rho_LT,rho_LT_max,rho_max,vx_LT
+                return rho0,vx0,rho_LT,rho_LT_max,rho_max,vx_LT
             else:
-                return rho1,vx1,rho_max
+                return rho0,vx0,rho_max
 
 
 def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None):

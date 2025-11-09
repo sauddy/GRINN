@@ -303,7 +303,7 @@ def input_taker(lam, rho_1, num_of_waves, tmax, N_0, N_b, N_r):
     """
     lam = float(lam)
     rho_1 = float(rho_1)
-    num_of_waves = int(num_of_waves)
+    num_of_waves = float(num_of_waves)  # Allow fractional values for flexible domain sizing
     tmax = float(tmax)
     N_0 = int(N_0)
     N_r = int(N_r)

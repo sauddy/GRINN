@@ -1,13 +1,13 @@
 import numpy as np
 
 # Random seed for reproducibility across all functions
-RANDOM_SEED = 100
+RANDOM_SEED = 92
 
 # Perturbation selection: "power_spectrum" or "sinusoidal"
 PERTURBATION_TYPE = "power_spectrum"
 
-xmin = 0.
-ymin = 0.
+xmin = 0.0
+ymin = 0.0
 cs = 1.0
 rho_o = 1.0
 const = 1.0
@@ -26,7 +26,7 @@ NUM_BATCHES = 1
 a = 0.1
 
 tmin = 0.
-tmax = 3.0
+tmax = 3.5
 
 num_neurons = 64
 harmonics = 3
@@ -34,9 +34,10 @@ num_layers = 5
 
 wave = 7.0
 k = 2 * np.pi / wave
+num_of_waves = 2.0
 
-iteration_adam_2D = 1001
-iteration_lbgfs_2D = 201
+iteration_adam_2D = 801
+iteration_lbgfs_2D = 251
 
 IC_WEIGHT = 1.0
 
@@ -56,7 +57,7 @@ FD_N_1D = 300  # Grid points for 1D LAX (when used)
 FD_N_2D = 300  # Grid points per dimension for 2D LAX
 
 # Power spectrum parameters
-N_GRID = 300  # Grid resolution for power spectrum generation
+N_GRID = 400  # Grid resolution for power spectrum generation
 POWER_EXPONENT = -4  # Power spectrum exponent
 FILTER_SCALE = 0  # Filter scale (Rf)
 STARTUP_DT = 0.01 # Time offset after which PDE is enforced (ICs remain at t=0)

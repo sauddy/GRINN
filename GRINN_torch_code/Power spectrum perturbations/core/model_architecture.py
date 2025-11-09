@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from torch.autograd import Variable
-from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION
+from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, STARTUP_DT
 
 class Sin(nn.Module):
     def forward(self, input):
@@ -155,10 +155,16 @@ class PINN(nn.Module):
     
     def _apply_density_constraint(self, outputs, t):
         """
-        Apply hard density constraint for power spectrum perturbations.
+        Apply hard density constraint with causality enforcement for power spectrum perturbations.
         
-        For non-sinusoidal cases, enforce ρ(t=0) = ρ₀ using linear trick:
-        ρ = ρ₀ + t × ρ̂, where network predicts ρ̂.
+        For power spectrum (non-sinusoidal):
+        - For t < STARTUP_DT: Density is frozen at ρ₀ (causality - information hasn't propagated)
+        - For t >= STARTUP_DT: Density evolves via ρ = ρ₀ + (t - STARTUP_DT) × ρ̂
+        
+        This enforces that density remains at initial conditions until information has had time
+        to propagate across the domain (finite signal speed).
+        
+        For sinusoidal: No constraint (returns as-is).
         
         Args:
             outputs: Raw network outputs
@@ -170,10 +176,21 @@ class PINN(nn.Module):
         if str(PERTURBATION_TYPE).lower() == "sinusoidal":
             return outputs
         
-        # Linear trick: ρ = ρ₀ + t × ρ̂
+        # Causality constraint for power spectrum:
+        # Density frozen at ρ₀ for t < STARTUP_DT (information propagation delay)
+        # Density evolves after t >= STARTUP_DT
         rho_hat = outputs[:, 0:1]
         other = outputs[:, 1:]
-        rho = rho_o + t * rho_hat
+        
+        # Effective time: zero for t < STARTUP_DT, (t - STARTUP_DT) for t >= STARTUP_DT
+        # This ensures continuity at t = STARTUP_DT: ρ(STARTUP_DT) = ρ₀
+        t_effective = torch.clamp(t - STARTUP_DT, min=0.0)
+        
+        # Density evolution: ρ = ρ₀ + t_effective × ρ̂
+        # For t < STARTUP_DT: t_effective = 0, so ρ = ρ₀ (frozen)
+        # For t >= STARTUP_DT: t_effective = t - STARTUP_DT, so ρ evolves
+        rho = rho_o + t_effective * rho_hat
+        
         return torch.cat([rho, other], dim=1)
     
     def forward(self, X):

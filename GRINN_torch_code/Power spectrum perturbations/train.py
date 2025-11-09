@@ -11,7 +11,7 @@ from training.trainer import train, train_xpinn
 from core.initial_conditions import initialize_shared_velocity_fields
 from config import BATCH_SIZE, NUM_BATCHES, N_0, N_r, DIMENSION
 from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o
-from config import num_neurons, num_layers
+from config import num_neurons, num_layers, num_of_waves
 from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, DEFAULT_ACTIVATION, RANDOM_SEED
 from config import N_INTERFACE, XPINN_OPTIMIZER_STRATEGY, USE_MULTI_GPU, CACHE_IC_VALUES, STARTUP_DT
 from config import USE_CAUSAL_TRAINING, CAUSAL_WEIGHTING_MODE, USE_CAUSAL_CURRICULUM
@@ -85,7 +85,7 @@ if device.startswith('cuda'):
     torch.cuda.empty_cache()
 
 
-lam, rho_1, num_of_waves, tmax, _, _, _ = input_taker(wave, a, 2, TMAX_CFG, N_0, 0, N_r)
+lam, rho_1, num_of_waves, tmax, _, _, _ = input_taker(wave, a, num_of_waves, TMAX_CFG, N_0, 0, N_r)
 
 jeans, alpha = req_consts_calc(lam, rho_1)
 # Set initial velocity amplitude per perturbation type

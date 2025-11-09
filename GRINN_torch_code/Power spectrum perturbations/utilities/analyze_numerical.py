@@ -14,32 +14,41 @@ Modify the configuration section below to explore different parameter values.
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import sys
 from tqdm import tqdm
-from numerical_solvers.LAX_2D import lax_solution, generate_velocity_field_power_spectrum
-from config import RANDOM_SEED, POWER_EXPONENT
+
+# Add parent directory to path for imports when running from utilities directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from numerical_solvers.LAX_2D import lax_solution as lax_solution_cpu, generate_velocity_field_power_spectrum
+from numerical_solvers.LAX_2D_torch import lax_solution_torch
+from config import (
+    RANDOM_SEED, POWER_EXPONENT, num_of_waves as NUM_OF_WAVES_CONFIG,
+    xmin, ymin, cs, rho_o, const, G, a, wave
+)
 
 # =============================================================================
 # CONFIGURATION SECTION - MODIFY THESE PARAMETERS FOR ANALYSIS
 # =============================================================================
 
 # Grid & Domain Parameters
-N = 300                    # Grid resolution (Nx = Ny)
-nu = 0.5                   # Courant number for stability (typically 0.1-0.9)
-lam = 7.0                  # Wavelength
-num_of_waves = 2.0         # Number of wavelengths in domain
-time_points = [3.0, 3.5, 4.0]  # Times to plot
+N = 400                    # Grid resolution (Nx = Ny)
+nu = 0.25                   # Courant number for stability (typically 0.1-0.9)
+lam = wave                  # Wavelength (from config.py)
+num_of_waves = NUM_OF_WAVES_CONFIG  # Number of wavelengths in domain (from config.py)
+time_points = [3.5, 4.0, 4.5]  # Times to plot
 
-# Physical Constants
-cs = 1.0                   # Sound speed
-rho_o = 1.0                # Background density
-G = 1.0                    # Gravitational constant
-const = 1.0                # Constant multiplier
-a = 0.1                   # Amplitude parameter (same as in config.py)
+# Physical Constants (all from config.py)
+# cs, rho_o, const, G, a, xmin, ymin are imported from config.py above
 
 # Power Spectrum Parameters
 power_index = POWER_EXPONENT  # Power spectrum exponent (matches config.py for consistency)
 vel_rms = a * cs          # RMS velocity amplitude (consistent with train.py)
 random_seed = RANDOM_SEED         # Seed for reproducibility (from config.py)
+
+# Solver backend selection: "cpu" uses numerical_solvers.LAX_2D (reference implementation),
+# "torch" uses numerical_solvers.LAX_2D_torch (experimental GPU version)
+SOLVER_BACKEND = "torch"      # Options: "cpu" or "torch"
 
 # Output Settings
 output_dir = "lax_analysis_output"  # Directory to save plots
@@ -66,11 +75,16 @@ collapse_dt = 0.1          # Time step for collapse search (used by full_lax met
 def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity, 
                    power_index, vel_rms, random_seed):
     """
-    Run LAX solver with power spectrum velocity initial conditions.
+    Dispatch helper that runs the chosen LAX solver backend and
+    returns a unified tuple.
     
     Returns:
         x, y, rho, vx, vy, phi, rho_max
     """
+    backend = SOLVER_BACKEND.lower().strip()
+    if backend not in {"cpu", "torch"}:
+        raise ValueError(f"Unsupported SOLVER_BACKEND='{SOLVER_BACKEND}'. Use 'cpu' or 'torch'.")
+    
     # Use RANDOM_SEED directly when power_index matches POWER_EXPONENT from config
     if abs(power_index - POWER_EXPONENT) < 1e-6:
         unique_seed = random_seed
@@ -81,30 +95,65 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
     original_state = np.random.get_state()
     np.random.seed(unique_seed)
     
-    # Run LAX solver
-    result = lax_solution(
-        time=time,
-        N=N,
-        nu=nu,
-        lam=lam,
-        num_of_waves=num_of_waves,
-        rho_1=a,
-        gravity=gravity,
-        isplot=False,
-        comparison=False,
-        animation=True,
-        use_velocity_ps=True,
-        ps_index=power_index,
-        vel_rms=vel_rms,
-        random_seed=unique_seed
-    )
+    # Calculate domain boundaries from config
+    xmax = xmin + lam * num_of_waves
+    ymax = ymin + lam * num_of_waves
+    Lx = xmax - xmin
+    Ly = ymax - ymin
     
-    # Extract results
-    x, rho, vx, vy, phi, n, rho_max = result
+    if backend == "torch":
+        # Run PyTorch (GPU) solver
+        result = lax_solution_torch(
+            time_val=time,
+            N=N,
+            nu=nu,
+            lam=lam,
+            num_of_waves=num_of_waves,
+            rho_1=a,
+            gravity=gravity,
+            use_velocity_ps=True,
+            ps_index=power_index,
+            vel_rms=vel_rms,
+            random_seed=unique_seed
+        )
+        
+        x, rho, vx, vy, phi, n, rho_max = result
+        # LAX solver returns x starting from 0, so offset by xmin
+        x = x + xmin
+        
+    else:  # CPU reference solver
+        # Run CPU solver
+        result = lax_solution_cpu(
+            time=time,
+            N=N,
+            nu=nu,
+            lam=lam,
+            num_of_waves=num_of_waves,
+            rho_1=a,
+            gravity=gravity,
+            isplot=False,
+            comparison=False,
+            animation=True,
+            use_velocity_ps=True,
+            ps_index=power_index,
+            vel_rms=vel_rms,
+            random_seed=unique_seed
+        )
+        
+        if gravity:
+            x, rho, vx, vy, phi, n, rho_max = result
+            # LAX solver returns x starting from 0, so offset by xmin
+            x = x + xmin
+        else:
+            rho, vx, rho_max = result
+            x = np.linspace(xmin, xmax, rho.shape[0], endpoint=False)
+            vy = np.zeros_like(rho)
+            phi = None
+            n = None
     
     # Create y-coordinates (LAX solver uses square domain)
-    Lx = lam * num_of_waves
-    y = np.linspace(0, Lx, rho.shape[1])
+    # LAX solver creates y starting from 0, so we create it with ymin offset
+    y = np.linspace(ymin, ymax, rho.shape[1])
     
     # Restore original random state
     np.random.set_state(original_state)
@@ -149,11 +198,83 @@ def create_2d_surface_plot(x, y, field, title, cmap='viridis',
     plt.tight_layout()
     return fig, ax
 
+def find_collapse_time_search():
+    """
+    Search for the time when density reaches target_density_ratio * rho_o.
+    
+    Returns:
+        collapse_time: Time when target density is reached, or None if not found
+    """
+    target_density = target_density_ratio * rho_o
+    print(f"\nSearching for collapse time (target density: {target_density:.2f})...")
+    print(f"Method: {collapse_method}")
+    print(f"Searching from t={collapse_dt} to t={max_search_time} with dt={collapse_dt}")
+    
+    if collapse_method == "full_lax":
+        # Search by running full LAX solver at each time step
+        # Start from a small time to avoid checking initial conditions
+        current_time = collapse_dt
+        last_rho_max = rho_o
+        num_checks = 0
+        
+        with tqdm(total=int(max_search_time / collapse_dt), desc="Searching for collapse", unit="step") as pbar:
+            while current_time <= max_search_time:
+                # Run solver at current time
+                x, y, rho, vx, vy, phi, rho_max = run_lax_solver(
+                    current_time, N, nu, lam, num_of_waves, a, gravity,
+                    power_index, vel_rms, random_seed
+                )
+                
+                max_density = np.max(rho)
+                num_checks += 1
+                
+                # Check if target is reached
+                if max_density >= target_density:
+                    print(f"\n✓ Collapse found at t = {current_time:.3f}")
+                    print(f"  Max density: {max_density:.2f} (target: {target_density:.2f})")
+                    print(f"  Searched {num_checks} time steps")
+                    return current_time
+                
+                # Check if density is decreasing (might indicate numerical issues or wrong direction)
+                if max_density < last_rho_max and current_time > 0.5:
+                    print(f"\n  Warning: Density decreased from {last_rho_max:.2f} to {max_density:.2f} at t={current_time:.3f}")
+                
+                last_rho_max = max_density
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    't': f'{current_time:.2f}',
+                    'max_rho': f'{max_density:.2f}',
+                    'target': f'{target_density:.2f}'
+                })
+                pbar.update(1)
+                
+                current_time += collapse_dt
+        
+        print(f"\n✗ Collapse not found within t={max_search_time}")
+        print(f"  Final max density: {last_rho_max:.2f} (target: {target_density:.2f})")
+        return None
+    
+    else:
+        raise ValueError(f"Unknown collapse_method: {collapse_method}. Use 'full_lax'.")
+
 def generate_analysis_plots():
     """Generate all analysis plots for the configured parameters."""
     # Create output directory
     if save_plots:
         os.makedirs(output_dir, exist_ok=True)
+    
+    # Find collapse time if requested
+    collapse_time = None
+    if find_collapse_time:
+        collapse_time = find_collapse_time_search()
+        if collapse_time is not None:
+            print(f"\nCollapse time: {collapse_time:.3f}")
+            # Optionally add collapse time to time_points for plotting
+            if collapse_time not in time_points:
+                print(f"Note: Collapse time {collapse_time:.3f} is not in time_points list.")
+        else:
+            print(f"\nNo collapse found within max_search_time={max_search_time}")
     
     # Storage for statistics
     stats = {
@@ -256,6 +377,7 @@ def main():
     print("=" * 40)
     print("Modify the configuration section at the top of this script")
     print("to explore different parameter values.")
+    print(f"Solver backend: {SOLVER_BACKEND.upper()}")
     print("=" * 40)
     
     try:
