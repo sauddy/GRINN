@@ -561,7 +561,7 @@ def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
     Fallback power spectrum generation when shared fields are not available.
     
     Args:
-        lam: Wavelength
+        lam: Wavelength (unused for domain sizing in fallback)
         v_1: Velocity amplitude
         x: Collocation coordinates
         seed: Random seed
@@ -572,12 +572,30 @@ def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
     if seed is None:
         seed = RANDOM_SEED
     
-    Lx = lam * 2  # Domain size
+    # Infer domain extents directly from the collocation coordinates to support arbitrary num_of_waves
+    # Use conservative defaults if tensors are degenerate (e.g., single point during a unit test)
+    x_coords = x[0].detach()
+    y_coords = x[1].detach() if len(x) > 1 else x[0].detach()
+
+    xmin_val = torch.min(x_coords).item() if x_coords.numel() > 0 else 0.0
+    xmax_val = torch.max(x_coords).item() if x_coords.numel() > 0 else float(lam * 2.0)
+    ymin_val = torch.min(y_coords).item() if y_coords.numel() > 0 else 0.0
+    ymax_val = torch.max(y_coords).item() if y_coords.numel() > 0 else float(lam * 2.0)
+
+    # Ensure positive lengths; fall back to 2*lam if bounds collapse
+    Lx = float(max(xmax_val - xmin_val, 1e-6))
+    Ly = float(max(ymax_val - ymin_val, 1e-6))
+    if not torch.isfinite(torch.tensor(Lx)) or Lx < 1e-6:
+        Lx = float(lam * 2.0)
+    if not torch.isfinite(torch.tensor(Ly)) or Ly < 1e-6:
+        Ly = float(lam * 2.0)
+
     dx = Lx / N_GRID
+    dy = Ly / N_GRID
     
     # Calculate wave numbers
     kx = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
-    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
+    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dy, device=x[0].device)
     KX_grid, KY_grid = torch.meshgrid(kx, ky, indexing='ij')
     
     # Calculate magnitude of wave number
@@ -606,8 +624,12 @@ def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
     field_real = field_real / torch.std(field_real) * v_1
     
     # Interpolate to the actual collocation points
-    x_norm = torch.clamp((x[0] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
-    y_norm = torch.clamp((x[1] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
+    x_norm = torch.clamp(((x[0] - xmin_val) / Lx) * (N_GRID - 1), 0, N_GRID - 1)
+    if len(x) > 1:
+        y_norm = torch.clamp(((x[1] - ymin_val) / Ly) * (N_GRID - 1), 0, N_GRID - 1)
+    else:
+        # 1D fallback: mirror x for y to preserve shape
+        y_norm = x_norm.clone()
     
     x_idx = torch.round(x_norm).long()
     y_idx = torch.round(y_norm).long()
@@ -3048,6 +3070,310 @@ def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isp
                 return rho1, v1, rho_max
 _register_module('numerical_solvers.LAX_2D', ['fft_solver', 'generate_shared_velocity_field', 'generate_velocity_field_power_spectrum', 'lax_solution', 'lax_solution1D_sinusoidal', 'lax_solution_with_shared_velocity'])
 
+# ==== Module: numerical_solvers.LAX_2D_torch (numerical_solvers/LAX_2D_torch.py) ====
+import numpy as np
+import torch
+from config import cs, rho_o, const, G, KX, KY
+
+# Device setup - check at module import
+has_gpu = torch.cuda.is_available()
+device = torch.device("cuda:0" if has_gpu else "cpu")
+dtype = torch.float64
+if has_gpu:
+    print(f"LAX_2D_torch: GPU available, using device: {device}")
+    print(f"  GPU name: {torch.cuda.get_device_name(0)}")
+else:
+    print(f"LAX_2D_torch: No GPU available, using device: {device}")
+
+def fft_solver_torch(rho, Lx, nx, Ly, ny):
+    """
+    PyTorch FFT solver for Poisson equation (gravitational potential).
+    """
+    dx = Lx / nx
+    dy = Ly / ny
+    
+    # Calculate the Fourier modes of the gas density
+    rhohat = torch.fft.fft2(rho)
+    
+    # Calculate the wave numbers in x and y directions
+    kx = 2 * np.pi * torch.fft.fftfreq(nx, d=dx).to(device)
+    ky = 2 * np.pi * torch.fft.fftfreq(ny, d=dy).to(device)
+    
+    # Construct the Laplacian operator in Fourier space
+    # Match NumPy exactly: default meshgrid uses 'xy' which gives (ny, nx)
+    # But we need to transpose to match FFT2 output (nx, ny)
+    kx2, ky2 = torch.meshgrid(kx**2, ky**2, indexing='xy')
+    # NumPy meshgrid('xy') creates (ny, nx), but FFT2 output is (nx, ny)
+    # So we transpose to match the FFT layout
+    laplace = -(kx2.T + ky2.T)
+    
+    # Handle zero mode (k=0) - set to small value to avoid division by zero
+    laplace = torch.where(laplace == 0, torch.tensor(1e-9, device=device, dtype=dtype), laplace)
+    
+    # Solve for the potential in Fourier space
+    phihat = rhohat / laplace
+    
+    # Transform back to real space
+    phi = torch.real(torch.fft.ifft2(phihat))
+    
+    return phi
+
+def generate_velocity_field_power_spectrum_torch(nx, ny, Lx, Ly, power_index=-3.0, amplitude=0.02, random_seed=None):
+    """
+    PyTorch implementation for generating a 2D velocity field with a power-law spectrum.
+    
+    This function generates resolution-independent initial conditions by:
+    1. Synthesizing at fixed high resolution (1024x1024)
+    2. Applying power-law filter with sharp cutoff at target Nyquist frequency
+    3. Downsampling to target resolution via interpolation
+    
+    This ensures that N=300 and N=400 runs start with the same physical velocity field,
+    just sampled at different resolutions, making convergence studies meaningful.
+    """
+    # Use a fixed, high-resolution grid for synthesis to ensure resolution independence
+    hires_nx, hires_ny = 1024, 1024
+    
+    # Use NumPy's random generator for consistency with CPU solver
+    if random_seed is not None:
+        rng = np.random.default_rng(random_seed)
+    else:
+        rng = np.random.default_rng()
+
+    def synthesize_component():
+        # 1. Generate random field at high resolution using NumPy (for consistency)
+        field_np = rng.standard_normal((hires_nx, hires_ny))
+        field = torch.from_numpy(field_np).to(device=device, dtype=dtype)
+        F = torch.fft.fft2(field)
+        
+        # 2. Construct k-space grid at high resolution
+        kx = 2 * np.pi * torch.fft.fftfreq(hires_nx, d=Lx / hires_nx).to(device)
+        ky = 2 * np.pi * torch.fft.fftfreq(hires_ny, d=Ly / hires_ny).to(device)
+        kxg, kyg = torch.meshgrid(kx, ky, indexing='ij')
+        
+        kk = torch.sqrt(kxg**2 + kyg**2)
+        kk[0, 0] = 1.0  # Avoid division by zero
+        
+        # 3. Apply power-law filter
+        filt = kk**(power_index / 2.0)
+        filt[kk == 0] = 0.0
+        
+        # 4. KEY: Apply sharp cutoff at target Nyquist frequency to prevent aliasing
+        k_nyquist = np.pi * nx / Lx  # Target grid's Nyquist frequency
+        filt[kk > k_nyquist] = 0.0   # Remove unresolvable modes
+        
+        F_filtered = F * filt
+        
+        # 5. Transform back to real space at high resolution
+        comp_hires = torch.real(torch.fft.ifft2(F_filtered))
+        
+        # 6. Normalize the high-resolution field
+        comp_hires -= torch.mean(comp_hires)
+        std = torch.std(comp_hires)
+        if std > 0:
+            comp_hires = comp_hires * (amplitude / std)
+        
+        # 7. Downsample to target resolution via interpolation
+        # Convert to NumPy for interpolation (scipy doesn't work with torch tensors)
+        comp_hires_np = comp_hires.cpu().numpy()
+        
+        from scipy.interpolate import RegularGridInterpolator
+        x_hires = np.linspace(0, Lx, hires_nx, endpoint=False)
+        y_hires = np.linspace(0, Ly, hires_ny, endpoint=False)
+        x_lores = np.linspace(0, Lx, nx, endpoint=False)
+        y_lores = np.linspace(0, Ly, ny, endpoint=False)
+        
+        interp = RegularGridInterpolator((x_hires, y_hires), comp_hires_np, 
+                                        method='linear', bounds_error=False, fill_value=0.0)
+        X_lores, Y_lores = np.meshgrid(x_lores, y_lores, indexing='ij')
+        comp_np = interp((X_lores, Y_lores))
+        
+        # Convert back to torch tensor
+        comp = torch.from_numpy(comp_np).to(device=device, dtype=dtype)
+        
+        return comp
+
+    vx0 = synthesize_component()
+    vy0 = synthesize_component()
+    return vx0, vy0
+
+def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False, use_velocity_ps=False, 
+                         ps_index=-3.0, vel_rms=0.02, random_seed=None):
+    """
+    PyTorch implementation of the LAX method for solving hydrodynamic equations.
+    This version is designed to run on a GPU for accelerated computation.
+    """
+    # Verify device is still correct (in case CUDA becomes available after import)
+    current_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if current_device != device:
+        print(f"Warning: Device changed from {device} to {current_device}")
+    
+    # Grid and Domain Parameters
+    Lx = Ly = lam * num_of_waves
+    c_s = cs
+
+    # Grid setup
+    Nx = Ny = N
+    dx = dy = float(Lx / Nx)
+
+    # Tensors Initialization
+    # Use linspace and slice to match NumPy's endpoint=False behavior
+    x = torch.linspace(0, Lx, Nx+1, device=device, dtype=dtype)[:-1]
+    y = torch.linspace(0, Ly, Ny+1, device=device, dtype=dtype)[:-1]
+    xx, yy = torch.meshgrid(x, y, indexing='ij')
+
+    rho0 = torch.zeros((Nx, Ny), device=device, dtype=dtype)
+    vx0 = torch.zeros((Nx, Ny), device=device, dtype=dtype)
+    vy0 = torch.zeros((Nx, Ny), device=device, dtype=dtype)
+    
+    # Initial Conditions
+    if use_velocity_ps:
+        rho0 = rho_o * torch.ones((Nx, Ny), device=device, dtype=dtype)
+        vx0, vy0 = generate_velocity_field_power_spectrum_torch(Nx, Ny, Lx, Ly, 
+                                                              power_index=ps_index, 
+                                                              amplitude=vel_rms, 
+                                                              random_seed=random_seed)
+    else:
+        # Sinusoidal perturbations: Use 2D wave pattern: cos(KX*x + KY*y)
+        KX_tensor = torch.tensor(KX, device=device, dtype=dtype)
+        KY_tensor = torch.tensor(KY, device=device, dtype=dtype)
+        rho0 = rho_o + rho_1 * torch.cos(KX_tensor * xx + KY_tensor * yy)
+    
+    # Copy initial conditions to rho1, vx1, vy1 for t=0 case
+    rho1 = rho0.clone()
+    vx1 = vx0.clone()
+    vy1 = vy0.clone()
+
+    # Set velocity initial conditions for sinusoidal perturbations
+    if not use_velocity_ps:
+        if not gravity:
+            # No gravity case
+            v_1 = (c_s * rho_1) / rho_o  # velocity perturbation
+            k_magnitude = torch.sqrt(KX_tensor**2 + KY_tensor**2)
+            if k_magnitude > 0:
+                vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KX_tensor / k_magnitude)
+                vy0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KY_tensor / k_magnitude)
+            else:
+                vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy)
+                vy0 = torch.zeros_like(xx)
+        else:
+            # Gravity case: need to check Jeans length
+            jeans = torch.sqrt(torch.tensor(4 * np.pi**2 * c_s**2 / (const * G * rho_o), device=device, dtype=dtype))
+            
+            if lam >= jeans.item():
+                # Gravitational instability case
+                alpha = torch.sqrt(torch.tensor(const * G * rho_o - c_s**2 * (2 * np.pi / lam)**2, device=device, dtype=dtype))
+                v_1 = (rho_1 / rho_o) * (alpha / (2 * np.pi / lam))
+                k_magnitude = torch.sqrt(KX_tensor**2 + KY_tensor**2)
+                if k_magnitude > 0:
+                    vx0 = -v_1 * torch.sin(KX_tensor * xx + KY_tensor * yy) * (KX_tensor / k_magnitude)
+                    vy0 = -v_1 * torch.sin(KX_tensor * xx + KY_tensor * yy) * (KY_tensor / k_magnitude)
+                else:
+                    vx0 = -v_1 * torch.sin(KX_tensor * xx + KY_tensor * yy)
+                    vy0 = torch.zeros_like(xx)
+            else:
+                # Oscillatory regime
+                alpha = torch.sqrt(torch.tensor(c_s**2 * (2 * np.pi / lam)**2 - const * G * rho_o, device=device, dtype=dtype))
+                v_1 = (rho_1 / rho_o) * (alpha / (2 * np.pi / lam))
+                k_magnitude = torch.sqrt(KX_tensor**2 + KY_tensor**2)
+                if k_magnitude > 0:
+                    vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KX_tensor / k_magnitude)
+                    vy0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KY_tensor / k_magnitude)
+                else:
+                    vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy)
+                    vy0 = torch.zeros_like(xx)
+        
+        # Update vx1 and vy1 after setting initial velocities
+        vx1 = vx0.clone()
+        vy1 = vy0.clone()
+
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    
+    # Initialize gravitational potential if needed
+    phi0 = torch.zeros((Nx, Ny), device=device, dtype=dtype)
+    phi1 = torch.zeros((Nx, Ny), device=device, dtype=dtype)
+    
+    if gravity:
+        # Calculate initial potential using FFT solver
+        phi0 = fft_solver_torch(const * (rho0 - rho_o), Lx, Nx, Ly, Ny)
+
+    # --- CORRECTED TIME-STEPPING LOOP ---
+    t = 0.0
+    k = 0
+    # Initial dt for the first step
+    vmax_initial = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item(), c_s)
+    dt = nu * dx / vmax_initial
+
+    while t < time_val:
+        # Ensure the last step doesn't overshoot the final time
+        if t + dt > time_val:
+            dt = time_val - t
+
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+
+        # Evolve one step
+        rho1 = (0.25) * (torch.roll(rho0, -1, dims=0) + torch.roll(rho0, 1, dims=0) +
+                         torch.roll(rho0, -1, dims=1) + torch.roll(rho0, 1, dims=1)) \
+            - (mux * (torch.roll(rho0, -1, dims=0) * torch.roll(vx0, -1, dims=0) - torch.roll(rho0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) \
+            - (muy * (torch.roll(rho0, -1, dims=1) * torch.roll(vy0, -1, dims=1) - torch.roll(rho0, 1, dims=1) * torch.roll(vy0, 1, dims=1)))
+
+        if not gravity:
+            Px1 = (0.25) * (torch.roll(Px0, -1, dims=0) + torch.roll(Px0, 1, dims=0) +
+                            torch.roll(Px0, -1, dims=1) + torch.roll(Px0, 1, dims=1)) \
+                - (mux * (torch.roll(Px0, -1, dims=0) * torch.roll(vx0, -1, dims=0) - torch.roll(Px0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) \
+                - (muy * (torch.roll(Px0, -1, dims=1) * torch.roll(vy0, -1, dims=1) - torch.roll(Px0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) \
+                - ((c_s**2) * mux * (torch.roll(rho0, -1, dims=0) - torch.roll(rho0, 1, dims=0)))
+
+            Py1 = (0.25) * (torch.roll(Py0, -1, dims=0) + torch.roll(Py0, 1, dims=0) +
+                            torch.roll(Py0, -1, dims=1) + torch.roll(Py0, 1, dims=1)) \
+                - (muy * (torch.roll(Py0, -1, dims=1) * torch.roll(vy0, -1, dims=1) - torch.roll(Py0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) \
+                - (mux * (torch.roll(Py0, -1, dims=0) * torch.roll(vx0, -1, dims=0) - torch.roll(Py0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) \
+                - ((c_s**2) * muy * (torch.roll(rho0, -1, dims=1) - torch.roll(rho0, 1, dims=1)))
+        else:
+            # With self-gravity
+            Px1 = (0.25) * (torch.roll(Px0, -1, dims=0) + torch.roll(Px0, 1, dims=0) +
+                            torch.roll(Px0, -1, dims=1) + torch.roll(Px0, 1, dims=1)) \
+                - (mux * (torch.roll(Px0, -1, dims=0) * torch.roll(vx0, -1, dims=0) - torch.roll(Px0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) \
+                - (muy * (torch.roll(Px0, -1, dims=1) * torch.roll(vy0, -1, dims=1) - torch.roll(Px0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) \
+                - ((c_s**2) * mux * (torch.roll(rho0, -1, dims=0) - torch.roll(rho0, 1, dims=0))) \
+                - (mux * rho0 * (torch.roll(phi0, -1, dims=0) - torch.roll(phi0, 1, dims=0)))
+
+            Py1 = (0.25) * (torch.roll(Py0, -1, dims=0) + torch.roll(Py0, 1, dims=0) +
+                            torch.roll(Py0, -1, dims=1) + torch.roll(Py0, 1, dims=1)) \
+                - (muy * (torch.roll(Py0, -1, dims=1) * torch.roll(vy0, -1, dims=1) - torch.roll(Py0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) \
+                - (mux * (torch.roll(Py0, -1, dims=0) * torch.roll(vx0, -1, dims=0) - torch.roll(Py0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) \
+                - ((c_s**2) * muy * (torch.roll(rho0, -1, dims=1) - torch.roll(rho0, 1, dims=1))) \
+                - (muy * rho0 * (torch.roll(phi0, -1, dims=1) - torch.roll(phi0, 1, dims=1)))
+            
+            # Update gravitational potential
+            phi1 = fft_solver_torch(const * (rho1 - rho_o), Lx, Nx, Ly, Ny)
+
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        
+        # Update state for next iteration
+        rho0, vx0, vy0 = rho1, vx1, vy1
+        Px0, Py0 = Px1, Py1
+        if gravity:
+            phi0 = phi1
+        
+        # Increment time and step counter
+        t += dt
+        k += 1
+
+        # Calculate dt for the *next* step
+        vmax = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item())
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+
+    n = k
+    rho_max = torch.max(rho0).item()
+    
+    return x.cpu().numpy(), rho0.cpu().numpy(), vx0.cpu().numpy(), vy0.cpu().numpy(), None, n, rho_max
+_register_module('numerical_solvers.LAX_2D_torch', ['device', 'dtype', 'fft_solver_torch', 'generate_velocity_field_power_spectrum_torch', 'has_gpu', 'lax_solution_torch'])
+
 # ==== Module: utilities.training_diagnostics (utilities/training_diagnostics.py) ====
 import os
 import numpy as np
@@ -4313,8 +4639,9 @@ import scipy
 import os
 from numerical_solvers.LAX_2D import lax_solution, lax_solution_with_shared_velocity
 from numerical_solvers.LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
+from numerical_solvers.LAX_2D_torch import lax_solution_torch
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
-from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED
+from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED, SHOW_LINEAR_THEORY
 
 # Global variable to store shared velocity fields for plotting
 _shared_vx_np = None
@@ -5337,27 +5664,39 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
         rho_pinn = out[:, 0].data.cpu().numpy().reshape(Q, Q)
         pinn_max_list.append(np.max(rho_pinn))
 
-        # LAX/FD evaluation; use shared velocity fields when available
-        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-            if _shared_vx_np is not None and _shared_vy_np is not None:
-                # Use the native resolution of the shared velocity fields to avoid shape mismatch
-                n_fd_use = int(_shared_vx_np.shape[0])
-                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
-                    t, n_fd_use, 0.5, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
-                    gravity=True, isplot=False, comparison=False, animation=True
-                )
-            else:
-                # Fallback: when shared fields absent, still use N_GRID for power spectrum LAX
-                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                    t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
-                )
-        else:
-            # Sinusoidal case (keep defaults)
-            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                use_velocity_ps=False
+        # LAX/FD evaluation; prefer GPU when available for faster computation
+        if torch.cuda.is_available():
+            # Use GPU-accelerated torch solver (supports both power_spectrum and sinusoidal)
+            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+            if idx == 0:
+                print(f"Using GPU solver for density growth plot (CUDA available)")
+            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
+                time_val=t, N=N_GRID, nu=0.5, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
+                vel_rms=a*cs, random_seed=RANDOM_SEED
             )
+        else:
+            # Fallback to CPU solver when GPU not available
+            if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                if _shared_vx_np is not None and _shared_vy_np is not None:
+                    # Use the native resolution of the shared velocity fields to avoid shape mismatch
+                    n_fd_use = int(_shared_vx_np.shape[0])
+                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
+                        t, n_fd_use, 0.5, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                        gravity=True, isplot=False, comparison=False, animation=True
+                    )
+                else:
+                    # Fallback: when shared fields absent, still use N_GRID for power spectrum LAX
+                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                        t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                    )
+            else:
+                # Sinusoidal case (keep defaults)
+                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                    t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                    use_velocity_ps=False
+                )
 
         fd_max_list.append(np.max(rho_fd))
 
@@ -5501,20 +5840,33 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Top row: density
         ax_rho = fig.add_subplot(grid[0, c])
         ax_rho.plot(X[:, 0], rho_pinn, label="GRINN", color='c', linewidth=2)
-        # Only plot Linear Theory when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_rho.plot(X[:, 0], rho_fd_interp, label="FD", color='k', linewidth=1)
         ax_rho.set_title(f"t={t:.1f}")
         ax_rho.set_ylabel(r"$\rho$")
         ax_rho.grid(True)
-        if a < 0.1:
-            limu = 1.2*rho_o
-            liml = .8*rho_o
-        else:
-            limu = 3.0*rho_o
-            liml = -1.0*rho_o
-        ax_rho.set_ylim(liml,limu)
+        # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
+        # Collect all density values that are plotted
+        rho_all = [rho_pinn, rho_fd_interp]
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+            rho_all.append(rho_lt)
+        rho_min = min(np.min(rho) for rho in rho_all)
+        rho_max = max(np.max(rho) for rho in rho_all)
+        # Add padding: ~10% of the data range on each side (similar to t=3.0 example)
+        rho_range = rho_max - rho_min
+        padding = max(0.1 * rho_range, 0.05)  # At least 0.05 units of padding
+        liml = rho_min - padding
+        limu = rho_max + padding
+        # Commented out hardcoded limits:
+        # if a < 0.1:
+        #     limu = 1.2*rho_o
+        #     liml = .8*rho_o
+        # else:
+        #     limu = 3.0*rho_o
+        #     liml = -1.0*rho_o
+        ax_rho.set_ylim(liml, limu)
         if c == 0:
             ax_rho.legend(loc='upper right', fontsize=8)
 
@@ -5523,8 +5875,8 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-6)
         ax_eps_rho = fig.add_subplot(grid[1, c])
         ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
-        # Only plot Linear Theory epsilon when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-6)
             ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_rho.set_ylabel(r"$\varepsilon$")
@@ -5535,19 +5887,32 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Third row: velocity
         ax_v = fig.add_subplot(grid[2, c])
         ax_v.plot(X[:, 0], vx_pinn, label="GRINN", color='c', linewidth=2)
-        # Only plot Linear Theory when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_v.plot(X[:, 0], v_fd_interp, label="FD", color='k', linewidth=1)
         ax_v.set_ylabel(r"$v$")
         ax_v.grid(True)
-        if a < 0.1:
-            limu = 0.055
-            liml = -0.055
-        else:
-            limu = 0.6
-            liml = -0.6
-        ax_v.set_ylim(liml,limu)
+        # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
+        # Collect all velocity values that are plotted
+        v_all = [vx_pinn, v_fd_interp]
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+            v_all.append(vx_lt)
+        v_min = min(np.min(v) for v in v_all)
+        v_max = max(np.max(v) for v in v_all)
+        # Add padding: ~10% of the data range on each side (similar to t=3.0 example)
+        v_range = v_max - v_min
+        padding = max(0.1 * v_range, 0.005)  # At least 0.005 units of padding
+        liml = v_min - padding
+        limu = v_max + padding
+        # Commented out hardcoded limits:
+        # if a < 0.1:
+        #     limu = 0.055
+        #     liml = -0.055
+        # else:
+        #     limu = 0.6
+        #     liml = -0.6
+        ax_v.set_ylim(liml, limu)
         if c == 0:
             ax_v.legend(loc='upper right', fontsize=8)
 
@@ -5558,8 +5923,8 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         eps_v = 200.0 * np.abs(v_pred - v_ref) / (v_pred + v_ref + 2.0)
         ax_eps_v = fig.add_subplot(grid[3, c])
         ax_eps_v.plot(X[:, 0], eps_v, color='k', linewidth=1, label='FD')
-        # Only plot Linear Theory epsilon when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
             ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_v.set_xlabel("x")

@@ -1,14 +1,16 @@
 """
-LAX Analysis Script for Power Spectrum Perturbations
+LAX Analysis Script for Power Spectrum and Sinusoidal Perturbations
 
 This script generates 2D surface plots using the LAX finite difference solver
-with power spectrum velocity initial conditions. It provides easy configuration
-of all relevant parameters for analysis purposes.
+with either power spectrum or sinusoidal velocity initial conditions. 
+The perturbation type is automatically determined from config.py (PERTURBATION_TYPE).
+It provides easy configuration of all relevant parameters for analysis purposes.
 
 Usage:
     python analyze_numerical.py
 
 Modify the configuration section below to explore different parameter values.
+The perturbation type is read from config.py (PERTURBATION_TYPE).
 """
 
 import numpy as np
@@ -24,7 +26,7 @@ from numerical_solvers.LAX_2D import lax_solution as lax_solution_cpu, generate_
 from numerical_solvers.LAX_2D_torch import lax_solution_torch
 from config import (
     RANDOM_SEED, POWER_EXPONENT, num_of_waves as NUM_OF_WAVES_CONFIG,
-    xmin, ymin, cs, rho_o, const, G, a, wave
+    xmin, ymin, cs, rho_o, const, G, a, wave, PERTURBATION_TYPE, KX, KY
 )
 
 # =============================================================================
@@ -32,22 +34,27 @@ from config import (
 # =============================================================================
 
 # Grid & Domain Parameters
-N = 400                    # Grid resolution (Nx = Ny)
+N = 800                    # Grid resolution (Nx = Ny)
 nu = 0.25                   # Courant number for stability (typically 0.1-0.9)
 lam = wave                  # Wavelength (from config.py)
 num_of_waves = NUM_OF_WAVES_CONFIG  # Number of wavelengths in domain (from config.py)
-time_points = [3.5, 4.0, 4.5]  # Times to plot
+time_points = [3.0, 4.0]  # Times to plot
 
 # Physical Constants (all from config.py)
 # cs, rho_o, const, G, a, xmin, ymin are imported from config.py above
 
-# Power Spectrum Parameters
-power_index = POWER_EXPONENT  # Power spectrum exponent (matches config.py for consistency)
-vel_rms = a * cs          # RMS velocity amplitude (consistent with train.py)
+# Perturbation Parameters (from config.py)
+# Note: The perturbation type is automatically determined from config.py
+# Set PERTURBATION_TYPE in config.py to "power_spectrum" or "sinusoidal"
+perturbation_type = PERTURBATION_TYPE  # "power_spectrum" or "sinusoidal" (from config.py)
+power_index = POWER_EXPONENT  # Power spectrum exponent (only used for power_spectrum perturbations)
+vel_rms = a * cs          # RMS velocity amplitude (only used for power_spectrum perturbations)
 random_seed = RANDOM_SEED         # Seed for reproducibility (from config.py)
+kx = KX  # Wave vector x-component for sinusoidal perturbations (only used for sinusoidal perturbations)
+ky = KY  # Wave vector y-component for sinusoidal perturbations (only used for sinusoidal perturbations)
 
 # Solver backend selection: "cpu" uses numerical_solvers.LAX_2D (reference implementation),
-# "torch" uses numerical_solvers.LAX_2D_torch (experimental GPU version)
+# "torch" uses numerical_solvers.LAX_2D_torch (GPU version, supports both power spectrum and sinusoidal)
 SOLVER_BACKEND = "torch"      # Options: "cpu" or "torch"
 
 # Output Settings
@@ -56,7 +63,7 @@ gravity = True              # Whether to include self-gravity
 
 # Plot Settings
 plot_density = True        # Generate density plots
-plot_velocity = False       # Generate velocity magnitude plots
+plot_velocity = True       # Generate velocity magnitude plots
 show_vectors = True         # Show velocity vectors on plots
 save_plots = True          # Save plots to files
 show_plots = False          # Display plots on screen
@@ -85,11 +92,17 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
     if backend not in {"cpu", "torch"}:
         raise ValueError(f"Unsupported SOLVER_BACKEND='{SOLVER_BACKEND}'. Use 'cpu' or 'torch'.")
     
+    # Determine perturbation type from config
+    use_velocity_ps = (str(perturbation_type).lower() == "power_spectrum")
+    
     # Use RANDOM_SEED directly when power_index matches POWER_EXPONENT from config
-    if abs(power_index - POWER_EXPONENT) < 1e-6:
+    # For sinusoidal perturbations, always use the base seed
+    if use_velocity_ps and abs(power_index - POWER_EXPONENT) < 1e-6:
         unique_seed = random_seed
-    else:
+    elif use_velocity_ps:
         unique_seed = random_seed + int(abs(power_index) * 1000)
+    else:
+        unique_seed = random_seed
     
     # Save current random state and set unique seed
     original_state = np.random.get_state()
@@ -111,7 +124,7 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
             num_of_waves=num_of_waves,
             rho_1=a,
             gravity=gravity,
-            use_velocity_ps=True,
+            use_velocity_ps=use_velocity_ps,
             ps_index=power_index,
             vel_rms=vel_rms,
             random_seed=unique_seed
@@ -122,6 +135,9 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
         x = x + xmin
         
     else:  # CPU reference solver
+        # Import KX and KY for sinusoidal perturbations
+        # Note: The CPU solver uses global KX, KY from config, but we need to ensure they're available
+        # For sinusoidal, the solver uses KX and KY from the global namespace
         # Run CPU solver
         result = lax_solution_cpu(
             time=time,
@@ -134,7 +150,7 @@ def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity,
             isplot=False,
             comparison=False,
             animation=True,
-            use_velocity_ps=True,
+            use_velocity_ps=use_velocity_ps,
             ps_index=power_index,
             vel_rms=vel_rms,
             random_seed=unique_seed
@@ -184,7 +200,12 @@ def create_2d_surface_plot(x, y, field, title, cmap='viridis',
     
     # Formatting
     ax.set_title(title, fontsize=14)
-    ax.text(0.02, 0.96, f"a={a}, power_index={power_index}",
+    # Display appropriate parameters based on perturbation type
+    if str(perturbation_type).lower() == "power_spectrum":
+        param_text = f"a={a}, power_index={power_index}"
+    else:
+        param_text = f"a={a}, KX={kx:.3f}, KY={ky:.3f}"
+    ax.text(0.02, 0.96, param_text,
             transform=ax.transAxes, fontsize=10,
             verticalalignment='top', bbox=dict(boxstyle='round,pad=0.2',
             fc='white', ec='gray', alpha=0.6))
@@ -343,7 +364,12 @@ def create_summary_plot(stats):
     rho_min = np.array(stats['rho_min'])
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
-    fig.suptitle(f"Summary (a={a}, power_index={power_index})", fontsize=12)
+    # Display appropriate title based on perturbation type
+    if str(perturbation_type).lower() == "power_spectrum":
+        title_text = f"Summary (a={a}, power_index={power_index})"
+    else:
+        title_text = f"Summary (a={a}, KX={kx:.3f}, KY={ky:.3f})"
+    fig.suptitle(title_text, fontsize=12)
 
     # Density evolution (max/min)
     axes[0].plot(times, rho_max, 'o-', label='Max', linewidth=2)
@@ -373,11 +399,17 @@ def create_summary_plot(stats):
 
 def main():
     """Main function to run the LAX analysis."""
-    print("LAX Power Spectrum Analysis Script")
+    print("LAX Analysis Script")
     print("=" * 40)
     print("Modify the configuration section at the top of this script")
     print("to explore different parameter values.")
+    print(f"Perturbation type: {perturbation_type.upper()}")
     print(f"Solver backend: {SOLVER_BACKEND.upper()}")
+    
+    if str(perturbation_type).lower() == "power_spectrum":
+        print(f"Power spectrum index: {power_index}")
+    else:
+        print(f"Wave vector: KX={kx:.3f}, KY={ky:.3f}")
     print("=" * 40)
     
     try:

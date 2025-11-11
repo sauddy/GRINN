@@ -1,7 +1,7 @@
 import numpy as np
 
 # Random seed for reproducibility across all functions
-RANDOM_SEED = 92
+RANDOM_SEED = 77 #Note to self: Seed 11 and 70 present two unique cases which can be tested
 
 # Perturbation selection: "power_spectrum" or "sinusoidal"
 PERTURBATION_TYPE = "power_spectrum"
@@ -26,7 +26,7 @@ NUM_BATCHES = 1
 a = 0.1
 
 tmin = 0.
-tmax = 3.5
+tmax = 3.0
 
 num_neurons = 64
 harmonics = 3
@@ -36,8 +36,8 @@ wave = 7.0
 k = 2 * np.pi / wave
 num_of_waves = 2.0
 
-iteration_adam_2D = 801
-iteration_lbgfs_2D = 251
+iteration_adam_2D = 1001
+iteration_lbgfs_2D = 201
 
 IC_WEIGHT = 1.0
 
@@ -50,11 +50,17 @@ SNAPSHOT_DIR = "/kaggle/working/"
 # Training diagnostics
 ENABLE_TRAINING_DIAGNOSTICS = False  # Enable automatic training diagnostics plots and logging
 
+# Density growth comparison plot controls
+PLOT_DENSITY_GROWTH = True
+GROWTH_PLOT_TMAX = 4.0
+GROWTH_PLOT_DT = 0.1
+
 KX = k
 KY = 0
-TIMES_1D = [3.0, 6.0, 8.0] # 1D cross-section times to plot (used for sinusoidal panel plots
-FD_N_1D = 300  # Grid points for 1D LAX (when used)
-FD_N_2D = 300  # Grid points per dimension for 2D LAX
+TIMES_1D = [3.0, 4.0, 5.0] # 1D cross-section times to plot (used for sinusoidal panel plots
+FD_N_1D = 400  # Grid points for 1D LAX (when used)
+FD_N_2D = 400  # Grid points per dimension for 2D LAX
+SHOW_LINEAR_THEORY = False
 
 # Power spectrum parameters
 N_GRID = 400  # Grid resolution for power spectrum generation
@@ -94,11 +100,6 @@ CAUSAL_NUM_TIME_BINS = 20    # Number of time bins for tracking residuals within
 # Iterations per Window (if None, splits total iterations equally)
 CAUSAL_ADAM_PER_WINDOW = None   # Adam iterations per window (None = auto-split iteration_adam_2D)
 CAUSAL_LBFGS_PER_WINDOW = None  # LBFGS iterations per window (None = auto-split iteration_lbgfs_2D)
-
-# Density growth comparison plot controls
-PLOT_DENSITY_GROWTH = True
-GROWTH_PLOT_TMAX = 4.0
-GROWTH_PLOT_DT = 0.1
 
 # ==================== XPINN Domain Decomposition Configuration ====================
 USE_XPINN = False  # Toggle XPINN on/off (False = original single PINN)

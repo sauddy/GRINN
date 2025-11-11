@@ -105,7 +105,7 @@ def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
     Fallback power spectrum generation when shared fields are not available.
     
     Args:
-        lam: Wavelength
+        lam: Wavelength (unused for domain sizing in fallback)
         v_1: Velocity amplitude
         x: Collocation coordinates
         seed: Random seed
@@ -116,12 +116,30 @@ def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
     if seed is None:
         seed = RANDOM_SEED
     
-    Lx = lam * 2  # Domain size
+    # Infer domain extents directly from the collocation coordinates to support arbitrary num_of_waves
+    # Use conservative defaults if tensors are degenerate (e.g., single point during a unit test)
+    x_coords = x[0].detach()
+    y_coords = x[1].detach() if len(x) > 1 else x[0].detach()
+
+    xmin_val = torch.min(x_coords).item() if x_coords.numel() > 0 else 0.0
+    xmax_val = torch.max(x_coords).item() if x_coords.numel() > 0 else float(lam * 2.0)
+    ymin_val = torch.min(y_coords).item() if y_coords.numel() > 0 else 0.0
+    ymax_val = torch.max(y_coords).item() if y_coords.numel() > 0 else float(lam * 2.0)
+
+    # Ensure positive lengths; fall back to 2*lam if bounds collapse
+    Lx = float(max(xmax_val - xmin_val, 1e-6))
+    Ly = float(max(ymax_val - ymin_val, 1e-6))
+    if not torch.isfinite(torch.tensor(Lx)) or Lx < 1e-6:
+        Lx = float(lam * 2.0)
+    if not torch.isfinite(torch.tensor(Ly)) or Ly < 1e-6:
+        Ly = float(lam * 2.0)
+
     dx = Lx / N_GRID
+    dy = Ly / N_GRID
     
     # Calculate wave numbers
     kx = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
-    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
+    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dy, device=x[0].device)
     KX_grid, KY_grid = torch.meshgrid(kx, ky, indexing='ij')
     
     # Calculate magnitude of wave number
@@ -150,8 +168,12 @@ def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
     field_real = field_real / torch.std(field_real) * v_1
     
     # Interpolate to the actual collocation points
-    x_norm = torch.clamp((x[0] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
-    y_norm = torch.clamp((x[1] / Lx) * (N_GRID - 1), 0, N_GRID - 1)
+    x_norm = torch.clamp(((x[0] - xmin_val) / Lx) * (N_GRID - 1), 0, N_GRID - 1)
+    if len(x) > 1:
+        y_norm = torch.clamp(((x[1] - ymin_val) / Ly) * (N_GRID - 1), 0, N_GRID - 1)
+    else:
+        # 1D fallback: mirror x for y to preserve shape
+        y_norm = x_norm.clone()
     
     x_idx = torch.round(x_norm).long()
     y_idx = torch.round(y_norm).long()

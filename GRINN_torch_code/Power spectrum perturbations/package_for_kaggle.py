@@ -33,6 +33,7 @@ MODULE_SPECS: List[Tuple[str, str]] = [
     ("methods/causal_training.py", "methods.causal_training"),
     ("methods/xpinn_decomposition.py", "methods.xpinn_decomposition"),
     ("numerical_solvers/LAX_2D.py", "numerical_solvers.LAX_2D"),
+    ("numerical_solvers/LAX_2D_torch.py", "numerical_solvers.LAX_2D_torch"),
     ("utilities/training_diagnostics.py", "utilities.training_diagnostics"),
     ("training/physics.py", "training.physics"),
     ("training/trainer.py", "training.trainer"),

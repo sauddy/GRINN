@@ -8,8 +8,9 @@ import scipy
 import os
 from numerical_solvers.LAX_2D import lax_solution, lax_solution_with_shared_velocity
 from numerical_solvers.LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
+from numerical_solvers.LAX_2D_torch import lax_solution_torch
 from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
-from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED
+from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED, SHOW_LINEAR_THEORY
 
 # Global variable to store shared velocity fields for plotting
 _shared_vx_np = None
@@ -1032,27 +1033,39 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
         rho_pinn = out[:, 0].data.cpu().numpy().reshape(Q, Q)
         pinn_max_list.append(np.max(rho_pinn))
 
-        # LAX/FD evaluation; use shared velocity fields when available
-        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-            if _shared_vx_np is not None and _shared_vy_np is not None:
-                # Use the native resolution of the shared velocity fields to avoid shape mismatch
-                n_fd_use = int(_shared_vx_np.shape[0])
-                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
-                    t, n_fd_use, 0.5, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
-                    gravity=True, isplot=False, comparison=False, animation=True
-                )
-            else:
-                # Fallback: when shared fields absent, still use N_GRID for power spectrum LAX
-                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                    t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
-                )
-        else:
-            # Sinusoidal case (keep defaults)
-            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                use_velocity_ps=False
+        # LAX/FD evaluation; prefer GPU when available for faster computation
+        if torch.cuda.is_available():
+            # Use GPU-accelerated torch solver (supports both power_spectrum and sinusoidal)
+            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+            if idx == 0:
+                print(f"Using GPU solver for density growth plot (CUDA available)")
+            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
+                time_val=t, N=N_GRID, nu=0.5, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
+                vel_rms=a*cs, random_seed=RANDOM_SEED
             )
+        else:
+            # Fallback to CPU solver when GPU not available
+            if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                if _shared_vx_np is not None and _shared_vy_np is not None:
+                    # Use the native resolution of the shared velocity fields to avoid shape mismatch
+                    n_fd_use = int(_shared_vx_np.shape[0])
+                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
+                        t, n_fd_use, 0.5, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                        gravity=True, isplot=False, comparison=False, animation=True
+                    )
+                else:
+                    # Fallback: when shared fields absent, still use N_GRID for power spectrum LAX
+                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                        t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                    )
+            else:
+                # Sinusoidal case (keep defaults)
+                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                    t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                    use_velocity_ps=False
+                )
 
         fd_max_list.append(np.max(rho_fd))
 
@@ -1196,20 +1209,33 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Top row: density
         ax_rho = fig.add_subplot(grid[0, c])
         ax_rho.plot(X[:, 0], rho_pinn, label="GRINN", color='c', linewidth=2)
-        # Only plot Linear Theory when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_rho.plot(X[:, 0], rho_fd_interp, label="FD", color='k', linewidth=1)
         ax_rho.set_title(f"t={t:.1f}")
         ax_rho.set_ylabel(r"$\rho$")
         ax_rho.grid(True)
-        if a < 0.1:
-            limu = 1.2*rho_o
-            liml = .8*rho_o
-        else:
-            limu = 3.0*rho_o
-            liml = -1.0*rho_o
-        ax_rho.set_ylim(liml,limu)
+        # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
+        # Collect all density values that are plotted
+        rho_all = [rho_pinn, rho_fd_interp]
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+            rho_all.append(rho_lt)
+        rho_min = min(np.min(rho) for rho in rho_all)
+        rho_max = max(np.max(rho) for rho in rho_all)
+        # Add padding: ~10% of the data range on each side (similar to t=3.0 example)
+        rho_range = rho_max - rho_min
+        padding = max(0.1 * rho_range, 0.05)  # At least 0.05 units of padding
+        liml = rho_min - padding
+        limu = rho_max + padding
+        # Commented out hardcoded limits:
+        # if a < 0.1:
+        #     limu = 1.2*rho_o
+        #     liml = .8*rho_o
+        # else:
+        #     limu = 3.0*rho_o
+        #     liml = -1.0*rho_o
+        ax_rho.set_ylim(liml, limu)
         if c == 0:
             ax_rho.legend(loc='upper right', fontsize=8)
 
@@ -1218,8 +1244,8 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-6)
         ax_eps_rho = fig.add_subplot(grid[1, c])
         ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
-        # Only plot Linear Theory epsilon when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-6)
             ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_rho.set_ylabel(r"$\varepsilon$")
@@ -1230,19 +1256,32 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Third row: velocity
         ax_v = fig.add_subplot(grid[2, c])
         ax_v.plot(X[:, 0], vx_pinn, label="GRINN", color='c', linewidth=2)
-        # Only plot Linear Theory when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_v.plot(X[:, 0], v_fd_interp, label="FD", color='k', linewidth=1)
         ax_v.set_ylabel(r"$v$")
         ax_v.grid(True)
-        if a < 0.1:
-            limu = 0.055
-            liml = -0.055
-        else:
-            limu = 0.6
-            liml = -0.6
-        ax_v.set_ylim(liml,limu)
+        # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
+        # Collect all velocity values that are plotted
+        v_all = [vx_pinn, v_fd_interp]
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+            v_all.append(vx_lt)
+        v_min = min(np.min(v) for v in v_all)
+        v_max = max(np.max(v) for v in v_all)
+        # Add padding: ~10% of the data range on each side (similar to t=3.0 example)
+        v_range = v_max - v_min
+        padding = max(0.1 * v_range, 0.005)  # At least 0.005 units of padding
+        liml = v_min - padding
+        limu = v_max + padding
+        # Commented out hardcoded limits:
+        # if a < 0.1:
+        #     limu = 0.055
+        #     liml = -0.055
+        # else:
+        #     limu = 0.6
+        #     liml = -0.6
+        ax_v.set_ylim(liml, limu)
         if c == 0:
             ax_v.legend(loc='upper right', fontsize=8)
 
@@ -1253,8 +1292,8 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         eps_v = 200.0 * np.abs(v_pred - v_ref) / (v_pred + v_ref + 2.0)
         ax_eps_v = fig.add_subplot(grid[3, c])
         ax_eps_v.plot(X[:, 0], eps_v, color='k', linewidth=1, label='FD')
-        # Only plot Linear Theory epsilon when KY == 0 and amplitude is small
-        if np.isclose(KY, 0.0) and (a < 0.1):
+        # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
             eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
             ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_v.set_xlabel("x")

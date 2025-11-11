@@ -1,12 +1,16 @@
 import numpy as np
 import torch
-from config import cs, rho_o, const, G
+from config import cs, rho_o, const, G, KX, KY
 
-# Device setup
+# Device setup - check at module import
 has_gpu = torch.cuda.is_available()
 device = torch.device("cuda:0" if has_gpu else "cpu")
 dtype = torch.float64
-print(f"Using device: {device}")
+if has_gpu:
+    print(f"LAX_2D_torch: GPU available, using device: {device}")
+    print(f"  GPU name: {torch.cuda.get_device_name(0)}")
+else:
+    print(f"LAX_2D_torch: No GPU available, using device: {device}")
 
 def fft_solver_torch(rho, Lx, nx, Ly, ny):
     """
@@ -125,6 +129,11 @@ def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False,
     PyTorch implementation of the LAX method for solving hydrodynamic equations.
     This version is designed to run on a GPU for accelerated computation.
     """
+    # Verify device is still correct (in case CUDA becomes available after import)
+    current_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if current_device != device:
+        print(f"Warning: Device changed from {device} to {current_device}")
+    
     # Grid and Domain Parameters
     Lx = Ly = lam * num_of_waves
     c_s = cs
@@ -151,12 +160,58 @@ def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False,
                                                               amplitude=vel_rms, 
                                                               random_seed=random_seed)
     else:
-        # This part is not being used by the calling script, so it's not converted for now.
-        raise NotImplementedError("Only power spectrum initial conditions are supported in the Torch version.")
-
+        # Sinusoidal perturbations: Use 2D wave pattern: cos(KX*x + KY*y)
+        KX_tensor = torch.tensor(KX, device=device, dtype=dtype)
+        KY_tensor = torch.tensor(KY, device=device, dtype=dtype)
+        rho0 = rho_o + rho_1 * torch.cos(KX_tensor * xx + KY_tensor * yy)
+    
+    # Copy initial conditions to rho1, vx1, vy1 for t=0 case
     rho1 = rho0.clone()
     vx1 = vx0.clone()
     vy1 = vy0.clone()
+
+    # Set velocity initial conditions for sinusoidal perturbations
+    if not use_velocity_ps:
+        if not gravity:
+            # No gravity case
+            v_1 = (c_s * rho_1) / rho_o  # velocity perturbation
+            k_magnitude = torch.sqrt(KX_tensor**2 + KY_tensor**2)
+            if k_magnitude > 0:
+                vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KX_tensor / k_magnitude)
+                vy0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KY_tensor / k_magnitude)
+            else:
+                vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy)
+                vy0 = torch.zeros_like(xx)
+        else:
+            # Gravity case: need to check Jeans length
+            jeans = torch.sqrt(torch.tensor(4 * np.pi**2 * c_s**2 / (const * G * rho_o), device=device, dtype=dtype))
+            
+            if lam >= jeans.item():
+                # Gravitational instability case
+                alpha = torch.sqrt(torch.tensor(const * G * rho_o - c_s**2 * (2 * np.pi / lam)**2, device=device, dtype=dtype))
+                v_1 = (rho_1 / rho_o) * (alpha / (2 * np.pi / lam))
+                k_magnitude = torch.sqrt(KX_tensor**2 + KY_tensor**2)
+                if k_magnitude > 0:
+                    vx0 = -v_1 * torch.sin(KX_tensor * xx + KY_tensor * yy) * (KX_tensor / k_magnitude)
+                    vy0 = -v_1 * torch.sin(KX_tensor * xx + KY_tensor * yy) * (KY_tensor / k_magnitude)
+                else:
+                    vx0 = -v_1 * torch.sin(KX_tensor * xx + KY_tensor * yy)
+                    vy0 = torch.zeros_like(xx)
+            else:
+                # Oscillatory regime
+                alpha = torch.sqrt(torch.tensor(c_s**2 * (2 * np.pi / lam)**2 - const * G * rho_o, device=device, dtype=dtype))
+                v_1 = (rho_1 / rho_o) * (alpha / (2 * np.pi / lam))
+                k_magnitude = torch.sqrt(KX_tensor**2 + KY_tensor**2)
+                if k_magnitude > 0:
+                    vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KX_tensor / k_magnitude)
+                    vy0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy) * (KY_tensor / k_magnitude)
+                else:
+                    vx0 = v_1 * torch.cos(KX_tensor * xx + KY_tensor * yy)
+                    vy0 = torch.zeros_like(xx)
+        
+        # Update vx1 and vy1 after setting initial velocities
+        vx1 = vx0.clone()
+        vy1 = vy0.clone()
 
     Px0 = rho0 * vx0
     Py0 = rho0 * vy0

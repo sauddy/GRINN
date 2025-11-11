@@ -16,7 +16,16 @@ Example:
     python compare_model.py /path/to/model.pth 0.0,1.0,2.0 --plot-type pdf
     python compare_model.py 1.5 --plot-type pdf --no-fit  # Uses default model path
     
-    # Use GPU-accelerated FD solver (faster for large grids)
+    # 1D cross-section plots (creates both spatial 2D plots AND 1D cross-section plots)
+    python compare_model.py /path/to/model.pth 3.0,6.0,8.0 --plot-type 1d
+    python compare_model.py 3.0,4.0,5.0 --plot-type cross-section --y-fixed 0.5
+    python compare_model.py model.pth 3.0,6.0 --plot-type 1d --N-fd 2000 --nu-fd 0.25
+    
+    # Density growth plot (power spectrum only)
+    python compare_model.py model.pth 0.0 --plot-growth
+    python compare_model.py model.pth 0.0 --plot-growth --growth-tmax 5.0 --growth-dt 0.1
+    
+    # Use GPU-accelerated FD solver (faster for large grids, not used for 1D plots)
     python compare_model.py model.pth 1.5,2.0,3.0 --plot-type pdf --fd-backend gpu
     python compare_model.py model.pth 0.0,1.0,2.0 --fd-backend torch  # Same as gpu
 """
@@ -35,19 +44,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import necessary modules
 from config import (
-    xmin, ymin, tmin, tmax, wave, a, cs, rho_o, harmonics,
-    PERTURBATION_TYPE, RANDOM_SEED, N_GRID, POWER_EXPONENT, DIMENSION, SNAPSHOT_DIR
+    xmin, ymin, tmin, tmax, wave, a, cs, rho_o, harmonics, const, G,
+    PERTURBATION_TYPE, RANDOM_SEED, N_GRID, POWER_EXPONENT, DIMENSION, SNAPSHOT_DIR, FD_N_1D,
+    GROWTH_PLOT_TMAX, GROWTH_PLOT_DT
 )
 # Import num_of_waves with different name to avoid scoping conflict in main()
 from config import num_of_waves as num_of_waves_config
 from core.model_architecture import PINN
 from core.data_generator import input_taker, req_consts_calc
 from core.initial_conditions import initialize_shared_velocity_fields
-from visualization.Plotting_2D import set_shared_velocity_fields
+from visualization.Plotting_2D import set_shared_velocity_fields, create_density_growth_plot
 import visualization.Plotting_2D as plotting_module
-from numerical_solvers.LAX_2D import lax_solution, lax_solution_with_shared_velocity
+from numerical_solvers.LAX_2D import lax_solution, lax_solution_with_shared_velocity, lax_solution1D_sinusoidal
 from numerical_solvers.LAX_2D_torch import lax_solution_torch
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import RegularGridInterpolator, interp1d
+from config import KX, KY, SHOW_LINEAR_THEORY
 
 # Device setup
 has_gpu = torch.cuda.is_available()
@@ -82,7 +93,7 @@ def load_model(model_path, xmax, ymax):
     return net
 
 
-def create_comparison_plots(net, initial_params, time_points, which="density", N=None, nu=0.5, save_plots=True, fd_backend="cpu"):
+def create_comparison_plots(net, initial_params, time_points, which="density", N=None, nu=0.5, save_plots=True, fd_backend="cpu", show_plot=True):
     """
     Create comparison plots showing PINN, FD, and epsilon metric at custom time points.
     Based on create_5x3_comparison_table but accepts custom time points.
@@ -96,12 +107,16 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         nu: Courant number for LAX solver
         save_plots: Whether to save the plots to disk (default: True)
         fd_backend: FD solver backend - "cpu" (default) or "gpu"/"torch" for GPU-accelerated solver
+        show_plot: Whether to show the plot immediately (default: True). Set to False to show later.
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
     
     # Use N_GRID by default to match training comparison plots
     if N is None:
         N = N_GRID
+        print(f"2D spatial plot: N not provided, using default N_GRID={N_GRID} from config")
+    else:
+        print(f"2D spatial plot: Using N={N} from command line argument")
     
     num_times = len(time_points)
     print(f"Creating {num_times}x3 comparison table for {which}...")
@@ -153,18 +168,20 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         # Get FD data - use same parameters as PINN for power spectrum
         num_of_waves = (xmax - xmin) / lam
         
-        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and str(PERTURBATION_TYPE).lower() == "power_spectrum":
-            # Use GPU-accelerated torch solver (only for power_spectrum perturbations)
+        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and torch.cuda.is_available():
+            # Use GPU-accelerated torch solver (supports both power_spectrum and sinusoidal)
+            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+            print(f"Using GPU solver for 2D spatial plot at t={t:.4f} with N={N} (grid size: {N}x{N})")
             x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
                 time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                gravity=True, use_velocity_ps=True, ps_index=POWER_EXPONENT, 
+                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
                 vel_rms=a*cs, random_seed=RANDOM_SEED
             )
             # Note: torch solver returns None for phi, but we don't use it in comparison plots
         else:
-            # Use CPU solver (default or when GPU not supported for perturbation type)
-            if fd_backend.lower() in ["gpu", "torch"] and str(PERTURBATION_TYPE).lower() != "power_spectrum":
-                print(f"Warning: GPU solver only supports power_spectrum perturbations. Using CPU solver.")
+            # Use CPU solver (default or when GPU not available)
+            if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch"):
+                print(f"Warning: GPU backend requested but CUDA not available. Using CPU solver.")
             if str(PERTURBATION_TYPE).lower() == "power_spectrum":
                 # For power spectrum, use shared velocity fields if available
                 shared_vx = getattr(plotting_module, '_shared_vx_np', None)
@@ -325,8 +342,203 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Saved comparison plot to {save_path}")
     
-    plt.show()
+    if show_plot:
+        plt.show()
     return fig, axes
+
+
+def create_1d_cross_section_plot(net, initial_params, time_points, y_fixed=0.6, N_fd=None, nu_fd=0.5, save_plots=True, fd_backend="cpu"):
+    """
+    Create 1D cross-section plots at fixed y, comparing PINN vs FD solver.
+    Always uses sinusoidal initial conditions regardless of PERTURBATION_TYPE.
+    Can use GPU-accelerated 2D solver and extract 1D slice, or CPU 1D solver.
+    
+    Args:
+        net: Trained neural network
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: Array of time points to plot
+        y_fixed: y value for the 1D slice through the 2D domain
+        N_fd: grid size for FD solver
+        nu_fd: Courant number for FD solver
+        save_plots: Whether to save plots to disk
+        fd_backend: FD solver backend - "cpu" (default) or "gpu"/"torch" for GPU-accelerated solver
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, _output_folder, _tmax = initial_params
+    num_of_waves = (xmax - xmin) / lam
+    
+    # Set default N_fd: use FD_N_1D from config.py if not provided
+    if N_fd is None:
+        N_fd = FD_N_1D
+        print(f"1D cross-section: N_fd not provided, using default FD_N_1D={FD_N_1D} from config")
+    else:
+        print(f"1D cross-section: Using N_fd={N_fd} from command line argument")
+    
+    # Use baseline density for Linear Theory reference
+    rho_base = rho_o
+    jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_base))
+    k = np.sqrt(KX**2 + KY**2)
+    v1_lt = (rho_1 / rho_base) * (alpha / k) if k > 0 else 0.0
+    
+    # Build x grid for PINN slice
+    X = np.linspace(xmin, xmax, 1000).reshape(1000, 1)
+    Y = y_fixed * np.ones_like(X)
+    
+    # Create 4 rows x T columns panel layout
+    T = len(time_points)
+    fig = plt.figure(figsize=(6*T, 8), constrained_layout=False)
+    grid = plt.GridSpec(4, T, figure=fig, hspace=0.12, wspace=0.18)
+    
+    for row_idx, t in enumerate(time_points):
+        # PINN predictions at fixed y
+        t_arr = t * np.ones_like(X)
+        pt_x = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
+        pt_t = Variable(torch.from_numpy(t_arr).float(), requires_grad=True).to(device)
+        
+        output_00 = net([pt_x, pt_y, pt_t])
+        rho_pinn = output_00[:, 0:1].data.cpu().numpy().reshape(-1)
+        vx_pinn = output_00[:, 1:2].data.cpu().numpy().reshape(-1)
+        
+        # Linear Theory (only meaningful for KY == 0)
+        rho_lt = None
+        vx_lt = None
+        if np.isclose(KY, 0.0):
+            if lam >= jeans:
+                # Gravitational instability case
+                rho_lt = rho_base + rho_1*np.exp(alpha * t)*np.cos(KX * X[:, 0] + KY * y_fixed)
+                vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(KX * X[:, 0] + KY * y_fixed) * (KX / k) if k > 0 else 0.0
+            else:
+                # Oscillatory regime
+                omega = np.sqrt(cs**2 * (KX**2 + KY**2) - const*G*rho_base)
+                rho_lt = rho_base + rho_1*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed)
+                vx_lt = v1_lt*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed) * (KX / k) if k > 0 else 0.0
+        
+        # Get FD solution - use GPU 2D solver if requested, otherwise use CPU 1D solver
+        # Always use sinusoidal initial conditions (use_velocity_ps=False)
+        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and torch.cuda.is_available():
+            # Use GPU-accelerated 2D torch solver and extract 1D slice
+            # Use N_fd as provided (or FD_N_1D from config if not specified)
+            print(f"Using GPU solver for 1D cross-section at t={t:.4f} with N={N_fd} (grid size: {N_fd}x{N_fd})")
+            x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, _phi_fd_2d, _n, _rho_max = lax_solution_torch(
+                time_val=t, N=N_fd, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                gravity=True, use_velocity_ps=False, ps_index=POWER_EXPONENT, 
+                vel_rms=a*cs, random_seed=RANDOM_SEED
+            )
+            
+            # Extract 1D slice from 2D solution at y = y_fixed
+            # Calculate y coordinates for FD solution
+            ymax_calc = ymin + lam * num_of_waves
+            y_fd_2d = np.linspace(ymin, ymax_calc, rho_fd_2d.shape[1], endpoint=False)
+            y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
+            
+            # Extract the slice
+            rho_fd_1d = rho_fd_2d[:, y_idx]
+            v_fd_1d = vx_fd_2d[:, y_idx]  # Use x-component of velocity
+            
+            # Offset x_fd_2d by xmin to match domain
+            x_fd_1d_offset = x_fd_2d + xmin
+        else:
+            # Use CPU 1D sinusoidal LAX solver
+            if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch"):
+                print(f"Warning: GPU backend requested but CUDA not available. Using CPU 1D solver.")
+            x_fd_1d, rho_fd_1d, v_fd_1d, _phi_fd_1d, _n, _rho_max = lax_solution1D_sinusoidal(
+                time=t, N=N_fd, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, 
+                gravity=True, isplot=False, comparison=False, animation=True
+            )
+            
+            # Offset x_fd_1d by xmin to match domain
+            x_fd_1d_offset = x_fd_1d + xmin
+        
+        # Interpolate FD results to PINN X grid for comparison
+        rho_fd_interp = interp1d(x_fd_1d_offset, rho_fd_1d, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        v_fd_interp = interp1d(x_fd_1d_offset, v_fd_1d, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        
+        # Column index
+        c = row_idx
+        
+        # Top row: density
+        ax_rho = fig.add_subplot(grid[0, c])
+        ax_rho.plot(X[:, 0], rho_pinn, label="GRINN", color='c', linewidth=2)
+        if SHOW_LINEAR_THEORY and rho_lt is not None and np.isclose(KY, 0.0) and (a < 0.1):
+            ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        ax_rho.plot(X[:, 0], rho_fd_interp, label="FD (1D)", color='k', linewidth=1)
+        ax_rho.set_title(f"t={t:.1f}")
+        ax_rho.set_ylabel(r"$\rho$")
+        ax_rho.grid(True)
+        # Dynamic y-axis limits
+        rho_all = [rho_pinn, rho_fd_interp]
+        if SHOW_LINEAR_THEORY and rho_lt is not None:
+            rho_all.append(rho_lt)
+        rho_min = min(np.min(rho) for rho in rho_all)
+        rho_max = max(np.max(rho) for rho in rho_all)
+        rho_range = rho_max - rho_min
+        padding = max(0.1 * rho_range, 0.05)
+        ax_rho.set_ylim(rho_min - padding, rho_max + padding)
+        if c == 0:
+            ax_rho.legend(loc='upper right', fontsize=8)
+        
+        # Second row: epsilon for density
+        eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-6)
+        ax_eps_rho = fig.add_subplot(grid[1, c])
+        ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
+        if SHOW_LINEAR_THEORY and rho_lt is not None and np.isclose(KY, 0.0) and (a < 0.1):
+            eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-6)
+            ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        ax_eps_rho.set_ylabel(r"$\varepsilon$")
+        ax_eps_rho.grid(True)
+        if c == 0:
+            ax_eps_rho.legend(loc='upper right', fontsize=8)
+        
+        # Third row: velocity
+        ax_v = fig.add_subplot(grid[2, c])
+        ax_v.plot(X[:, 0], vx_pinn, label="GRINN", color='c', linewidth=2)
+        if SHOW_LINEAR_THEORY and vx_lt is not None and np.isclose(KY, 0.0) and (a < 0.1):
+            ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        ax_v.plot(X[:, 0], v_fd_interp, label="FD (1D)", color='k', linewidth=1)
+        ax_v.set_ylabel(r"$v$")
+        ax_v.grid(True)
+        # Dynamic y-axis limits
+        v_all = [vx_pinn, v_fd_interp]
+        if SHOW_LINEAR_THEORY and vx_lt is not None:
+            v_all.append(vx_lt)
+        v_min = min(np.min(v) for v in v_all)
+        v_max = max(np.max(v) for v in v_all)
+        v_range = v_max - v_min
+        padding = max(0.1 * v_range, 0.005)
+        ax_v.set_ylim(v_min - padding, v_max + padding)
+        if c == 0:
+            ax_v.legend(loc='upper right', fontsize=8)
+        
+        # Fourth row: epsilon for velocity
+        v_ref = v_fd_interp
+        v_pred = vx_pinn
+        eps_v = 200.0 * np.abs(v_pred - v_ref) / (v_pred + v_ref + 2.0)
+        ax_eps_v = fig.add_subplot(grid[3, c])
+        ax_eps_v.plot(X[:, 0], eps_v, color='k', linewidth=1, label='FD')
+        if SHOW_LINEAR_THEORY and vx_lt is not None and np.isclose(KY, 0.0) and (a < 0.1):
+            eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
+            ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        ax_eps_v.set_xlabel("x")
+        ax_eps_v.set_ylabel(r"$\varepsilon$")
+        ax_eps_v.grid(True)
+        if c == 0:
+            ax_eps_v.legend(loc='upper right', fontsize=8)
+    
+    # Reduce outer margins
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.92, bottom=0.10, wspace=0.18, hspace=0.12)
+    
+    # Save the figure if requested
+    if save_plots:
+        desktop_path = r"C:\Users\tirth\OneDrive\Desktop"
+        output_dir = os.path.join(desktop_path, "model test plots")
+        os.makedirs(output_dir, exist_ok=True)
+        time_str = "_".join([f"{t:.4f}" for t in time_points])
+        save_path = os.path.join(output_dir, f"1d_cross_section_t{time_str}.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved 1D cross-section plot to {save_path}")
+    
+    plt.show()
+    return fig
 
 
 def compute_density_pdf(rho, rho_ref=None, bin_width=0.01, log_min=None, log_max=None):
@@ -588,17 +800,18 @@ def create_density_pdf_plot(net, initial_params, time_points, N=None, nu=0.5, sa
         rho_pinn = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
         
         # Get FD density field
-        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and str(PERTURBATION_TYPE).lower() == "power_spectrum":
-            # Use GPU-accelerated torch solver (only for power_spectrum perturbations)
+        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and torch.cuda.is_available():
+            # Use GPU-accelerated torch solver (supports both power_spectrum and sinusoidal)
+            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
             x_fd, rho_fd, _, _, _, _, _ = lax_solution_torch(
                 time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                gravity=True, use_velocity_ps=True, ps_index=POWER_EXPONENT, 
+                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
                 vel_rms=a*cs, random_seed=RANDOM_SEED
             )
         else:
-            # Use CPU solver (default or when GPU not supported for perturbation type)
-            if fd_backend.lower() in ["gpu", "torch"] and str(PERTURBATION_TYPE).lower() != "power_spectrum":
-                print(f"Warning: GPU solver only supports power_spectrum perturbations. Using CPU solver.")
+            # Use CPU solver (default or when GPU not available)
+            if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch"):
+                print(f"Warning: GPU backend requested but CUDA not available. Using CPU solver.")
             if str(PERTURBATION_TYPE).lower() == "power_spectrum":
                 shared_vx = getattr(plotting_module, '_shared_vx_np', None)
                 shared_vy = getattr(plotting_module, '_shared_vy_np', None)
@@ -698,26 +911,45 @@ def main():
     parser.add_argument('model_path', type=str, nargs='?', default=None,
                        help='Path to model file (optional: defaults to SNAPSHOT_DIR/GRINN/model.pth)')
     parser.add_argument('time_points', type=str, help='Comma-separated time points (e.g., "0.0,1.0,2.0,3.0")')
-    parser.add_argument('--plot-type', type=str, default='spatial', choices=['spatial', 'pdf'],
-                       help='Type of plot: spatial (PINN/FD/epsilon comparison) or pdf (density PDF) (default: spatial)')
+    parser.add_argument('--plot-type', type=str, default='spatial', choices=['spatial', 'pdf', '1d', 'cross-section'],
+                       help='Type of plot: spatial (PINN/FD/epsilon comparison only), pdf (density PDF only), or 1d/cross-section (spatial + 1D cross-section plots) (default: spatial)')
     parser.add_argument('--which', type=str, default='both', choices=['density', 'velocity', 'both'],
                        help='Which field to plot for spatial plots: density, velocity, or both (default: both)')
-    parser.add_argument('--N', type=int, default=None, help='Grid resolution for FD solver (default: N_GRID from config)')
     parser.add_argument('--nu', type=float, default=0.5, help='Courant number for FD solver (default: 0.5)')
     parser.add_argument('--no-save', action='store_true', help='Do not save plots to disk (only display them)')
     parser.add_argument('--no-fit', action='store_true', help='Do not fit distributions to PDF plots')
     parser.add_argument('--powerlaw-threshold', type=float, default=0.8, 
                        help='Minimum log density for power-law fit (default: 0.8)')
     parser.add_argument('--fd-backend', type=str, default='cpu', choices=['cpu', 'gpu', 'torch'],
-                       help='FD solver backend: cpu (default) or gpu/torch for GPU-accelerated solver')
+                       help='FD solver backend: cpu (default) or gpu/torch for GPU-accelerated solver (works for both spatial and 1D cross-section plots)')
+    parser.add_argument('--y-fixed', type=float, default=0.6,
+                       help='y value for 1D cross-section slice (default: 0.6)')
+    parser.add_argument('--N-fd', type=int, default=None,
+                       help='Grid size for FD solver for all plots (default: FD_N_1D from config.py for 1D plots, N_GRID for 2D spatial plots)')
+    parser.add_argument('--nu-fd', type=float, default=0.5,
+                       help='Courant number for 1D LAX solver (default: 0.5)')
+    parser.add_argument('--plot-growth', action='store_true',
+                       help='Generate density growth plot (PINN vs LAX over time). Only works for power_spectrum perturbation type.')
+    parser.add_argument('--growth-tmax', type=float, default=None,
+                       help='Maximum time for density growth plot (default: GROWTH_PLOT_TMAX from config.py)')
+    parser.add_argument('--growth-dt', type=float, default=None,
+                       help='Time step for density growth plot (default: GROWTH_PLOT_DT from config.py)')
     
     args = parser.parse_args()
     
-    # Parse time points
+    # Debug: Print N_fd value if provided
+    if args.N_fd is not None:
+        print(f"Command line: --N-fd argument parsed as args.N_fd = {args.N_fd} (for all plots)")
+    else:
+        print(f"Command line: --N-fd not provided, will use defaults (FD_N_1D={FD_N_1D} for 1D plots, N_GRID={N_GRID} for 2D spatial plots)")
+    
+    # Parse time points (handle spaces around commas)
     try:
-        time_points = np.array([float(t.strip()) for t in args.time_points.split(',')])
-    except ValueError:
-        print("Error: time_points must be comma-separated numbers")
+        # Split by comma and strip whitespace from each element
+        time_points = np.array([float(t.strip()) for t in args.time_points.replace(' ', '').split(',') if t.strip()])
+    except ValueError as e:
+        print(f"Error: time_points must be comma-separated numbers. Got: {args.time_points}")
+        print(f"Details: {e}")
         sys.exit(1)
     
     # Set up initial parameters (same as train.py) - need to calculate xmax/ymax before loading model
@@ -763,24 +995,61 @@ def main():
         else:
             print(f"Using GPU-accelerated FD solver (CUDA available)")
     
-    if args.plot_type == 'pdf':
-        # Density PDF plots
+    # Determine if we should create 1D cross-section plots
+    create_1d_plots = (args.plot_type in ['1d', 'cross-section'])
+    
+    # Spatial plots are always generated by default (regardless of --plot-type)
+    # The --plot-type flag only determines what ADDITIONAL plots to generate
+    create_spatial_plots = True
+    
+    # Determine if we should create PDF plots
+    create_pdf_plots = (args.plot_type == 'pdf')
+    
+    # Use --N-fd for all plots if provided, otherwise use defaults
+    N_for_all = args.N_fd if args.N_fd is not None else None
+    
+    # Generate spatial comparison plots (if requested)
+    if create_spatial_plots:
+        if args.which == 'both':
+            print(f"\nGenerating density and velocity comparison plots...")
+            # Create both plots without showing them immediately
+            fig_density, _ = create_comparison_plots(net, initial_params, time_points, which='density', N=N_for_all, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend, show_plot=False)
+            fig_velocity, _ = create_comparison_plots(net, initial_params, time_points, which='velocity', N=N_for_all, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend, show_plot=False)
+            # Show both plots together
+            plt.show()
+        else:
+            print(f"\nGenerating {args.which} comparison plots...")
+            create_comparison_plots(net, initial_params, time_points, which=args.which, N=N_for_all, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend)
+    
+    # Generate 1D cross-section plots (if requested, as additional plots)
+    if create_1d_plots:
+        print(f"\nGenerating 1D cross-section plots (additional)...")
+        print(f"Note: Using sinusoidal initial conditions regardless of PERTURBATION_TYPE setting")
+        create_1d_cross_section_plot(
+            net, initial_params, time_points, y_fixed=args.y_fixed, 
+            N_fd=args.N_fd, nu_fd=args.nu_fd, save_plots=save_plots, fd_backend=args.fd_backend
+        )
+    
+    # Generate PDF plots (if requested)
+    if create_pdf_plots:
         print(f"\nGenerating density PDF plots...")
         create_density_pdf_plot(
-            net, initial_params, time_points, N=args.N, nu=args.nu, save_plots=save_plots,
+            net, initial_params, time_points, N=N_for_all, nu=args.nu, save_plots=save_plots,
             fit_lognorm=not args.no_fit, fit_powerlaw_tail=not args.no_fit,
             powerlaw_threshold=args.powerlaw_threshold, fd_backend=args.fd_backend
         )
-    else:
-        # Spatial comparison plots
-        if args.which == 'both':
-            print(f"\nGenerating density comparison plots...")
-            create_comparison_plots(net, initial_params, time_points, which='density', N=args.N, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend)
-            print(f"\nGenerating velocity comparison plots...")
-            create_comparison_plots(net, initial_params, time_points, which='velocity', N=args.N, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend)
+    
+    # Generate density growth plot (additional plot when --plot-growth is given, only for power spectrum case)
+    if args.plot_growth:
+        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+            print(f"\nGenerating density growth plot (additional plot)...")
+            tmax_growth = args.growth_tmax if args.growth_tmax is not None else GROWTH_PLOT_TMAX
+            dt_growth = args.growth_dt if args.growth_dt is not None else GROWTH_PLOT_DT
+            print(f"Using tmax={tmax_growth}, dt={dt_growth} for density growth plot")
+            create_density_growth_plot(net, initial_params, tmax=tmax_growth, dt=dt_growth)
         else:
-            print(f"\nGenerating {args.which} comparison plots...")
-            create_comparison_plots(net, initial_params, time_points, which=args.which, N=args.N, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend)
+            print(f"\nWarning: --plot-growth is only available for power_spectrum perturbation type.")
+            print(f"Current PERTURBATION_TYPE is '{PERTURBATION_TYPE}'. Skipping density growth plot.")
     
     print("\nDone!")
 
