@@ -2954,6 +2954,161 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
                 return rho0,vx0,rho_max
 
 
+def lax_solution_warm_start(rho_ic, vx_ic, vy_ic, x_grid, y_grid, 
+                            t_start, t_end, nu=0.5, save_times=None, gravity=True):
+    """
+    Run FD solver from custom initial conditions (warm-start).
+    
+    This function allows restarting the FD solver from a PINN state or any custom state,
+    enabling efficient generation of FD data for hybrid PINN-FD training.
+    
+    Args:
+        rho_ic: Initial density field (Nx, Ny)
+        vx_ic: Initial x-velocity field (Nx, Ny)
+        vy_ic: Initial y-velocity field (Nx, Ny)
+        x_grid: x coordinates (Nx,)
+        y_grid: y coordinates (Ny,)
+        t_start: Starting time
+        t_end: Ending time
+        nu: Courant number
+        save_times: List of times to save snapshots [default: [t_end]]
+        gravity: Whether to include self-gravity (default: True)
+    
+    Returns:
+        Dictionary: {time: (rho, vx, vy, phi, x, y)} for each saved time
+    """
+    if save_times is None:
+        save_times = [t_end]
+    
+    # Domain setup
+    Nx, Ny = rho_ic.shape
+    Lx = x_grid[-1] - x_grid[0] + (x_grid[1] - x_grid[0])  # Approximate domain size
+    Ly = y_grid[-1] - y_grid[0] + (y_grid[1] - y_grid[0])
+    dx = Lx / Nx
+    dy = Ly / Ny
+    
+    # Physical constants
+    c_s = cs
+    
+    # Initialize from provided ICs
+    rho0 = rho_ic.copy()
+    vx0 = vx_ic.copy()
+    vy0 = vy_ic.copy()
+    
+    # Calculate initial potential (gravity is always True for collapse problems)
+    phi0 = fft_solver(const * (rho0 - rho_o), Lx, Nx, Ly, Ny, dim=2)
+    
+    # Initialize flux terms
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    
+    # Storage for snapshots
+    snapshots = {}
+    
+    # Time-stepping loop
+    t = t_start
+    k = 0
+    
+    # Initial dt
+    vmax_initial = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)), c_s)
+    dt = nu * dx / vmax_initial
+    
+    while t < t_end:
+        # Check if we should save a snapshot before this step
+        for save_t in save_times:
+            if t <= save_t < t + dt and save_t not in snapshots:
+                # Save current state (or interpolate if needed)
+                snapshots[save_t] = (rho0.copy(), vx0.copy(), vy0.copy(), 
+                                     phi0.copy(), x_grid.copy(), y_grid.copy())
+        
+        # Ensure last step doesn't overshoot
+        if t + dt > t_end:
+            dt = t_end - t
+        
+        # LAX time-stepping
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+        
+        # Update density
+        rho1 = (1/4) * (np.roll(rho0, -1, axis=0) + np.roll(rho0, 1, axis=0) +
+                       np.roll(rho0, -1, axis=1) + np.roll(rho0, 1, axis=1)) - \
+               (mux * (np.roll(rho0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                       np.roll(rho0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+               (muy * (np.roll(rho0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                       np.roll(rho0, 1, axis=1) * np.roll(vy0, 1, axis=1)))
+        
+        # Update momentum (with gravity)
+        if gravity:
+            Px1 = 0.25 * (np.roll(Px0, -1, axis=0) + np.roll(Px0, 1, axis=0) +
+                          np.roll(Px0, -1, axis=1) + np.roll(Px0, 1, axis=1)) - \
+                  (mux * (np.roll(Px0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Px0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  (muy * (np.roll(Px0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Px0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  ((c_s**2) * mux * (np.roll(rho0, -1, axis=0) - np.roll(rho0, 1, axis=0))) - \
+                  (mux * rho0 * (np.roll(phi0, -1, axis=0) - np.roll(phi0, 1, axis=0)))
+            
+            Py1 = 0.25 * (np.roll(Py0, -1, axis=0) + np.roll(Py0, 1, axis=0) +
+                          np.roll(Py0, -1, axis=1) + np.roll(Py0, 1, axis=1)) - \
+                  (muy * (np.roll(Py0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Py0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  (mux * (np.roll(Py0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Py0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  ((c_s**2) * muy * (np.roll(rho0, -1, axis=1) - np.roll(rho0, 1, axis=1))) - \
+                  (muy * rho0 * (np.roll(phi0, -1, axis=1) - np.roll(phi0, 1, axis=1)))
+            
+            # Update potential
+            phi1 = fft_solver(const * (rho1 - rho_o), Lx, Nx, Ly, Ny, dim=2)
+        else:
+            # Without gravity (shouldn't happen for collapse problems, but included for completeness)
+            Px1 = 0.25 * (np.roll(Px0, -1, axis=0) + np.roll(Px0, 1, axis=0) +
+                          np.roll(Px0, -1, axis=1) + np.roll(Px0, 1, axis=1)) - \
+                  (mux * (np.roll(Px0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Px0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  (muy * (np.roll(Px0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Px0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  ((c_s**2) * mux * (np.roll(rho0, -1, axis=0) - np.roll(rho0, 1, axis=0)))
+            
+            Py1 = 0.25 * (np.roll(Py0, -1, axis=0) + np.roll(Py0, 1, axis=0) +
+                          np.roll(Py0, -1, axis=1) + np.roll(Py0, 1, axis=1)) - \
+                  (muy * (np.roll(Py0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Py0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  (mux * (np.roll(Py0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Py0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  ((c_s**2) * muy * (np.roll(rho0, -1, axis=1) - np.roll(rho0, 1, axis=1)))
+            
+            phi1 = np.zeros_like(rho1)
+        
+        # Update velocities
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        
+        # Update state
+        rho0 = rho1
+        vx0 = vx1
+        vy0 = vy1
+        Px0 = Px1
+        Py0 = Py1
+        if gravity:
+            phi0 = phi1
+        
+        t += dt
+        k += 1
+        
+        # Calculate dt for next step
+        vmax = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)))
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+    
+    # Save final snapshot if not already saved
+    if t_end not in snapshots:
+        snapshots[t_end] = (rho0.copy(), vx0.copy(), vy0.copy(), 
+                           phi0.copy(), x_grid.copy(), y_grid.copy())
+    
+    return snapshots
+
+
 def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None):
     '''
     1D LAX solver for sinusoidal initial conditions with optional self-gravity and linear theory outputs.
@@ -3068,7 +3223,7 @@ def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isp
                 return rho1, v1, rho_LT, rho_LT_max, rho_max, v_LT
             else:
                 return rho1, v1, rho_max
-_register_module('numerical_solvers.LAX_2D', ['fft_solver', 'generate_shared_velocity_field', 'generate_velocity_field_power_spectrum', 'lax_solution', 'lax_solution1D_sinusoidal', 'lax_solution_with_shared_velocity'])
+_register_module('numerical_solvers.LAX_2D', ['fft_solver', 'generate_shared_velocity_field', 'generate_velocity_field_power_spectrum', 'lax_solution', 'lax_solution1D_sinusoidal', 'lax_solution_warm_start', 'lax_solution_with_shared_velocity'])
 
 # ==== Module: numerical_solvers.LAX_2D_torch (numerical_solvers/LAX_2D_torch.py) ====
 import numpy as np
@@ -3372,7 +3527,186 @@ def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False,
     rho_max = torch.max(rho0).item()
     
     return x.cpu().numpy(), rho0.cpu().numpy(), vx0.cpu().numpy(), vy0.cpu().numpy(), None, n, rho_max
-_register_module('numerical_solvers.LAX_2D_torch', ['device', 'dtype', 'fft_solver_torch', 'generate_velocity_field_power_spectrum_torch', 'has_gpu', 'lax_solution_torch'])
+
+
+def lax_solution_warm_start_torch(rho_ic, vx_ic, vy_ic, x_grid, y_grid, 
+                                   t_start, t_end, nu=0.5, save_times=None, gravity=True):
+    """
+    PyTorch implementation: Run FD solver from custom initial conditions (warm-start).
+    
+    This function allows restarting the FD solver from a PINN state or any custom state,
+    enabling efficient generation of FD data for hybrid PINN-FD training.
+    
+    Args:
+        rho_ic: Initial density field (Nx, Ny) - can be numpy array or torch tensor
+        vx_ic: Initial x-velocity field (Nx, Ny) - can be numpy array or torch tensor
+        vy_ic: Initial y-velocity field (Nx, Ny) - can be numpy array or torch tensor
+        x_grid: x coordinates (Nx,) - can be numpy array or torch tensor
+        y_grid: y coordinates (Ny,) - can be numpy array or torch tensor
+        t_start: Starting time
+        t_end: Ending time
+        nu: Courant number
+        save_times: List of times to save snapshots [default: [t_end]]
+        gravity: Whether to include self-gravity (default: True)
+    
+    Returns:
+        Dictionary: {time: (rho, vx, vy, phi, x, y)} for each saved time (all as numpy arrays)
+    """
+    if save_times is None:
+        save_times = [t_end]
+    
+    # Convert inputs to torch tensors if needed
+    if isinstance(rho_ic, np.ndarray):
+        rho_ic = torch.from_numpy(rho_ic).to(device=device, dtype=dtype)
+    if isinstance(vx_ic, np.ndarray):
+        vx_ic = torch.from_numpy(vx_ic).to(device=device, dtype=dtype)
+    if isinstance(vy_ic, np.ndarray):
+        vy_ic = torch.from_numpy(vy_ic).to(device=device, dtype=dtype)
+    if isinstance(x_grid, np.ndarray):
+        x_grid = torch.from_numpy(x_grid).to(device=device, dtype=dtype)
+    if isinstance(y_grid, np.ndarray):
+        y_grid = torch.from_numpy(y_grid).to(device=device, dtype=dtype)
+    
+    # Domain setup
+    Nx, Ny = rho_ic.shape
+    Lx = (x_grid[-1] - x_grid[0] + (x_grid[1] - x_grid[0])).item()  # Approximate domain size
+    Ly = (y_grid[-1] - y_grid[0] + (y_grid[1] - y_grid[0])).item()
+    dx = Lx / Nx
+    dy = Ly / Ny
+    
+    # Physical constants
+    c_s = cs
+    
+    # Initialize from provided ICs
+    rho0 = rho_ic.clone()
+    vx0 = vx_ic.clone()
+    vy0 = vy_ic.clone()
+    
+    # Calculate initial potential (gravity is always True for collapse problems)
+    phi0 = fft_solver_torch(const * (rho0 - rho_o), Lx, Nx, Ly, Ny)
+    
+    # Initialize flux terms
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    
+    # Storage for snapshots
+    snapshots = {}
+    
+    # Time-stepping loop
+    t = t_start
+    k = 0
+    
+    # Initial dt
+    vmax_initial = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item(), c_s)
+    dt = nu * dx / vmax_initial
+    
+    while t < t_end:
+        # Check if we should save a snapshot before this step
+        for save_t in save_times:
+            if t <= save_t < t + dt and save_t not in snapshots:
+                # Save current state (convert to numpy for consistency)
+                snapshots[save_t] = (
+                    rho0.cpu().numpy().copy(),
+                    vx0.cpu().numpy().copy(),
+                    vy0.cpu().numpy().copy(),
+                    phi0.cpu().numpy().copy(),
+                    x_grid.cpu().numpy().copy(),
+                    y_grid.cpu().numpy().copy()
+                )
+        
+        # Ensure last step doesn't overshoot
+        if t + dt > t_end:
+            dt = t_end - t
+        
+        # LAX time-stepping
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+        
+        # Update density
+        rho1 = (0.25) * (torch.roll(rho0, -1, dims=0) + torch.roll(rho0, 1, dims=0) +
+                        torch.roll(rho0, -1, dims=1) + torch.roll(rho0, 1, dims=1)) - \
+               (mux * (torch.roll(rho0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                       torch.roll(rho0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+               (muy * (torch.roll(rho0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                       torch.roll(rho0, 1, dims=1) * torch.roll(vy0, 1, dims=1)))
+        
+        # Update momentum (with gravity)
+        if gravity:
+            Px1 = (0.25) * (torch.roll(Px0, -1, dims=0) + torch.roll(Px0, 1, dims=0) +
+                            torch.roll(Px0, -1, dims=1) + torch.roll(Px0, 1, dims=1)) - \
+                  (mux * (torch.roll(Px0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Px0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  (muy * (torch.roll(Px0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Px0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  ((c_s**2) * mux * (torch.roll(rho0, -1, dims=0) - torch.roll(rho0, 1, dims=0))) - \
+                  (mux * rho0 * (torch.roll(phi0, -1, dims=0) - torch.roll(phi0, 1, dims=0)))
+            
+            Py1 = (0.25) * (torch.roll(Py0, -1, dims=0) + torch.roll(Py0, 1, dims=0) +
+                            torch.roll(Py0, -1, dims=1) + torch.roll(Py0, 1, dims=1)) - \
+                  (muy * (torch.roll(Py0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Py0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  (mux * (torch.roll(Py0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Py0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  ((c_s**2) * muy * (torch.roll(rho0, -1, dims=1) - torch.roll(rho0, 1, dims=1))) - \
+                  (muy * rho0 * (torch.roll(phi0, -1, dims=1) - torch.roll(phi0, 1, dims=1)))
+            
+            # Update potential
+            phi1 = fft_solver_torch(const * (rho1 - rho_o), Lx, Nx, Ly, Ny)
+        else:
+            # Without gravity (shouldn't happen for collapse problems, but included for completeness)
+            Px1 = (0.25) * (torch.roll(Px0, -1, dims=0) + torch.roll(Px0, 1, dims=0) +
+                            torch.roll(Px0, -1, dims=1) + torch.roll(Px0, 1, dims=1)) - \
+                  (mux * (torch.roll(Px0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Px0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  (muy * (torch.roll(Px0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Px0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  ((c_s**2) * mux * (torch.roll(rho0, -1, dims=0) - torch.roll(rho0, 1, dims=0)))
+            
+            Py1 = (0.25) * (torch.roll(Py0, -1, dims=0) + torch.roll(Py0, 1, dims=0) +
+                            torch.roll(Py0, -1, dims=1) + torch.roll(Py0, 1, dims=1)) - \
+                  (muy * (torch.roll(Py0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Py0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  (mux * (torch.roll(Py0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Py0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  ((c_s**2) * muy * (torch.roll(rho0, -1, dims=1) - torch.roll(rho0, 1, dims=1)))
+            
+            phi1 = torch.zeros_like(rho1)
+        
+        # Update velocities
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        
+        # Update state
+        rho0 = rho1
+        vx0 = vx1
+        vy0 = vy1
+        Px0 = Px1
+        Py0 = Py1
+        if gravity:
+            phi0 = phi1
+        
+        t += dt
+        k += 1
+        
+        # Calculate dt for next step
+        vmax = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item())
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+    
+    # Save final snapshot if not already saved
+    if t_end not in snapshots:
+        snapshots[t_end] = (
+            rho0.cpu().numpy().copy(),
+            vx0.cpu().numpy().copy(),
+            vy0.cpu().numpy().copy(),
+            phi0.cpu().numpy().copy(),
+            x_grid.cpu().numpy().copy(),
+            y_grid.cpu().numpy().copy()
+        )
+    
+    return snapshots
+_register_module('numerical_solvers.LAX_2D_torch', ['device', 'dtype', 'fft_solver_torch', 'generate_velocity_field_power_spectrum_torch', 'has_gpu', 'lax_solution_torch', 'lax_solution_warm_start_torch'])
 
 # ==== Module: utilities.training_diagnostics (utilities/training_diagnostics.py) ====
 import os
@@ -3528,7 +3862,7 @@ from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
 
 # ==================== Physics Calculations and Loss Functions ====================
 
-def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt):
+def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, fd_data=None, fd_weight=0.0):
 
     ############## Loss based on initial conditions ###############
     rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
@@ -3728,7 +4062,48 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
-    
+
+    fd_loss_value = None
+    if fd_data is not None and fd_weight > 0:
+        required_keys = {'x', 't'}
+        if required_keys.issubset(fd_data.keys()):
+            fd_inputs = [fd_data['x']]
+            if 'y' in fd_data and fd_data['y'] is not None:
+                fd_inputs.append(fd_data['y'])
+            if 'z' in fd_data and fd_data['z'] is not None:
+                fd_inputs.append(fd_data['z'])
+            fd_inputs.append(fd_data['t'])
+
+            fd_outputs = net(fd_inputs)
+
+            loss_sum = 0.0
+            component_count = 0
+
+            if fd_data.get('rho') is not None:
+                rho_fd_pred = fd_outputs[:, 0:1]
+                loss_sum = loss_sum + torch.mean((rho_fd_pred - fd_data['rho']) ** 2)
+                component_count += 1
+
+            if fd_data.get('vx') is not None:
+                vx_fd_pred = fd_outputs[:, 1:2]
+                loss_sum = loss_sum + torch.mean((vx_fd_pred - fd_data['vx']) ** 2)
+                component_count += 1
+
+            if fd_data.get('vy') is not None and fd_outputs.size(1) >= 3:
+                vy_fd_pred = fd_outputs[:, 2:3]
+                loss_sum = loss_sum + torch.mean((vy_fd_pred - fd_data['vy']) ** 2)
+                component_count += 1
+
+            if component_count > 0:
+                data_loss_unweighted = loss_sum / component_count
+                fd_loss_value = fd_weight * data_loss_unweighted
+                loss = loss + fd_loss_value
+        else:
+            fd_loss_value = None
+
+    if fd_loss_value is not None:
+        loss_breakdown['FD_DATA'] = fd_loss_value.item()
+
     return loss, loss_breakdown
 
 # Note: train() and train_xpinn() functions have been moved to training/trainer.py
@@ -3744,12 +4119,14 @@ def _make_batch_tensors(tensors_list, indices):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None):
+                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, fd_data=None, fd_weight=0.0, fd_batch_size=None, use_fft_poisson=None):
     """
     Batched closure function for training with optional causal weighting.
     
     This function computes losses over mini-batches and optionally applies causal weights.
     """
+    last_fd_loss = None
+
     # Aggregate losses across mini-batches
     total_loss = 0.0
     num_effective_batches = 0
@@ -3949,6 +4326,49 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 else:
                     residual_tracker.update_residuals(t_dom, [rho_r, vx_r, vy_r, vz_r, phi_r])
 
+        fd_loss_batch = None
+        if fd_data is not None and fd_weight > 0:
+            total_fd = fd_data.get('count', 0)
+            if total_fd > 0:
+                effective_fd_batch = int(fd_batch_size or batch_size)
+                effective_fd_batch = max(1, min(effective_fd_batch, total_fd))
+                fd_idx = _random_batch_indices(total_fd, effective_fd_batch, fd_data['x'].device)
+
+                fd_inputs = [fd_data['x'][fd_idx]]
+                if 'y' in fd_data and fd_data['y'] is not None:
+                    fd_inputs.append(fd_data['y'][fd_idx])
+                if 'z' in fd_data and fd_data.get('z') is not None:
+                    fd_inputs.append(fd_data['z'][fd_idx])
+                fd_inputs.append(fd_data['t'][fd_idx])
+
+                fd_outputs = net(fd_inputs)
+
+                loss_sum = 0.0
+                component_count = 0
+
+                if fd_data.get('rho') is not None:
+                    rho_fd_pred = fd_outputs[:, 0:1]
+                    loss_sum = loss_sum + torch.mean((rho_fd_pred - fd_data['rho'][fd_idx]) ** 2)
+                    component_count += 1
+
+                if fd_data.get('vx') is not None:
+                    vx_fd_pred = fd_outputs[:, 1:2]
+                    loss_sum = loss_sum + torch.mean((vx_fd_pred - fd_data['vx'][fd_idx]) ** 2)
+                    component_count += 1
+
+                if fd_data.get('vy') is not None and fd_outputs.size(1) >= 3:
+                    vy_fd_pred = fd_outputs[:, 2:3]
+                    loss_sum = loss_sum + torch.mean((vy_fd_pred - fd_data['vy'][fd_idx]) ** 2)
+                    component_count += 1
+
+                if component_count > 0:
+                    data_loss_unweighted = loss_sum / component_count
+                    fd_loss_batch = fd_weight * data_loss_unweighted
+                    loss = loss + fd_loss_batch
+
+        if fd_loss_batch is not None:
+            last_fd_loss = fd_loss_batch
+
         total_loss = total_loss + loss
         num_effective_batches += 1
 
@@ -3994,6 +4414,9 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
     
+    if last_fd_loss is not None:
+        loss_breakdown['FD_DATA'] = last_fd_loss.item()
+
     return avg_loss, loss_breakdown
 
 
@@ -4155,7 +4578,7 @@ from config import DECAY_PORTION, BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGN
 from training.physics import closure_batched
 
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, fd_data=None, fd_weight=0.0, fd_batch_size=None):
     """
     Standard training loop for single PINN.
     
@@ -4206,7 +4629,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=True))
 
         with torch.autograd.no_grad():
             # Diagnostics logging every 50 iterations
@@ -4248,7 +4671,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=False)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
@@ -6394,13 +6817,14 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
     return fig, axes
 _register_module('visualization.Plotting_2D', ['Two_D_surface_plots', 'Two_D_surface_plots_FD', '_shared_vx_np', '_shared_vy_np', 'add_interface_lines', 'create_1d_comparison_plots', 'create_1d_cross_sections_sinusoidal', 'create_2d_animation', 'create_2d_surface_plots', 'create_2d_surface_plots_FD', 'create_5x3_comparison_table', 'create_all_plots', 'create_density_growth_plot', 'create_growth_comparison_plot', 'device', 'get_fd_default_params', 'has_gpu', 'has_mps', 'plot_function', 'predict_xpinn', 'set_shared_velocity_fields'])
 
-# ==== Main Training Script (train.py) ====
+# ==== Module: train (train.py) ====
 import os
 import sys
+import json
 import shutil
 import numpy as np
 import time
-from typing import Tuple
+from typing import Tuple, Optional, Dict
 import torch
 import torch.nn as nn
 from core.data_generator import input_taker, req_consts_calc
@@ -6418,6 +6842,7 @@ from config import CAUSAL_GAMMA_MAX, CAUSAL_GAMMA_MIN
 from config import CAUSAL_EPSILON, CAUSAL_EPSILON_FLOOR, CAUSAL_NUM_TIME_BINS
 from config import USE_EPSILON_ANNEALING, CAUSAL_EPSILON_MIN, CAUSAL_EPSILON_MAX
 from config import CAUSAL_ADAM_PER_WINDOW, CAUSAL_LBFGS_PER_WINDOW
+from config import USE_FD_DATA, FD_DATA_PATH, FD_DATA_WEIGHT, FD_DATA_BATCH_SIZE
 from core.losses import ASTPN, XPINN_Loss
 from core.model_architecture import PINN
 from visualization.Plotting_2D import create_2d_animation
@@ -6426,9 +6851,42 @@ from visualization.Plotting_2D import create_density_growth_plot
 from config import PLOT_DENSITY_GROWTH, GROWTH_PLOT_TMAX, GROWTH_PLOT_DT
 from config import FD_N_2D
 import methods.xpinn_decomposition as xpinn_utils
-from methods.xpinn_decomposition import (setup_xpinn_devices, setup_xpinn_networks, 
-                                         setup_xpinn_collocation, setup_xpinn_interfaces, 
+from methods.xpinn_decomposition import (setup_xpinn_devices, setup_xpinn_networks,
+                                         setup_xpinn_collocation, setup_xpinn_interfaces,
                                          cache_xpinn_initial_conditions)
+
+
+def load_fd_anchor_points(path: str, device: torch.device) -> Dict[str, torch.Tensor]:
+    """Load FD anchor points generated in Phase 1 as tensors on the target device."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"FD anchor file not found: {path}")
+
+    with open(path, "r") as f:
+        raw_data = json.load(f)
+
+    if not raw_data:
+        raise ValueError(f"FD anchor file {path} is empty.")
+
+    device_obj = torch.device(device)
+
+    def tensor_from_key(key: str) -> torch.Tensor:
+        return torch.tensor(
+            [float(entry[key]) for entry in raw_data],
+            dtype=torch.float32,
+            device=device_obj,
+        ).unsqueeze(-1)
+
+    dataset: Dict[str, Optional[torch.Tensor]] = {
+        "x": tensor_from_key("x"),
+        "y": tensor_from_key("y"),
+        "t": tensor_from_key("t"),
+        "rho": tensor_from_key("rho"),
+        "vx": tensor_from_key("vx") if "vx" in raw_data[0] else None,
+        "vy": tensor_from_key("vy") if "vy" in raw_data[0] else None,
+    }
+
+    dataset["count"] = dataset["x"].size(0)
+    return dataset
 
 
 def clean_pycache(root_dir: str) -> Tuple[int, int]:
@@ -6504,6 +6962,21 @@ if str(PERTURBATION_TYPE).lower() == "power_spectrum":
     from visualization.Plotting_2D import set_shared_velocity_fields
     set_shared_velocity_fields(vx_np, vy_np)
 
+# Load FD anchor dataset if enabled
+fd_dataset: Optional[Dict[str, Optional[torch.Tensor]]] = None
+fd_data_batch_size: Optional[int] = None
+if USE_FD_DATA:
+    try:
+        fd_dataset = load_fd_anchor_points(FD_DATA_PATH, device)
+        fd_data_batch_size = int(max(1, min(FD_DATA_BATCH_SIZE, fd_dataset["count"])))
+        print(f"Loaded FD anchor dataset with {fd_dataset['count']} points from {FD_DATA_PATH}")
+    except Exception as fd_err:
+        print(f"[WARN] Unable to load FD anchor dataset: {fd_err}")
+        fd_dataset = None
+        fd_data_batch_size = None
+
+fd_weight_active = FD_DATA_WEIGHT if (USE_FD_DATA and fd_dataset is not None) else 0.0
+
 # ==================== MODE SWITCHING: ORIGINAL PINN vs XPINN ====================
 
 if not USE_XPINN:
@@ -6548,7 +7021,10 @@ if not USE_XPINN:
             v_1=v_1,
             device=device,
             causal_gamma=0.0,
-            causal_mode="none"
+            causal_mode="none",
+            fd_data=fd_dataset if fd_dataset is not None else None,
+            fd_weight=fd_weight_active,
+            fd_batch_size=fd_data_batch_size
         )
     else:
         # Causal training using CausalTrainer module
@@ -6596,7 +7072,15 @@ if not USE_XPINN:
         )
         
         # Train with or without curriculum
-        train_kwargs = {'rho_1': rho_1, 'lam': lam, 'jeans': jeans, 'v_1': v_1}
+        train_kwargs = {
+            'rho_1': rho_1,
+            'lam': lam,
+            'jeans': jeans,
+            'v_1': v_1,
+            'fd_data': fd_dataset if fd_dataset is not None else None,
+            'fd_weight': fd_weight_active,
+            'fd_batch_size': fd_data_batch_size
+        }
         
         if USE_CAUSAL_CURRICULUM:
             net = causal_trainer.train_with_curriculum(collocation_IC_2D, **train_kwargs)
@@ -6779,4 +7263,5 @@ except Exception as e:
 script_root = os.path.dirname(os.path.abspath(__file__))
 print("Performing final Python cache cleanup...")
 clean_pycache(script_root)
+_register_module('train', ['clean_pycache', 'device', 'fd_data_batch_size', 'fd_dataset', 'fd_weight_active', 'has_gpu', 'has_mps', 'initial_params', 'load_fd_anchor_points', 'script_root', 'xmax', 'ymax'])
 

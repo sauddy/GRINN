@@ -38,6 +38,7 @@ MODULE_SPECS: List[Tuple[str, str]] = [
     ("training/physics.py", "training.physics"),
     ("training/trainer.py", "training.trainer"),
     ("visualization/Plotting_2D.py", "visualization.Plotting_2D"),
+    ("train.py", "train"),
 ]
 
 
@@ -124,12 +125,6 @@ def build_kaggle_script() -> str:
             f"_register_module({module_name!r}, [{attr_list}])"
         )
         body_lines.append("")
-
-    train_path = ROOT / "train.py"
-    train_source = train_path.read_text(encoding="utf-8").rstrip()
-    body_lines.append("# ==== Main Training Script (train.py) ====")
-    body_lines.append(train_source)
-    body_lines.append("")
 
     return "\n".join(body_lines) + "\n"
 

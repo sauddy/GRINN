@@ -299,3 +299,182 @@ def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False,
     rho_max = torch.max(rho0).item()
     
     return x.cpu().numpy(), rho0.cpu().numpy(), vx0.cpu().numpy(), vy0.cpu().numpy(), None, n, rho_max
+
+
+def lax_solution_warm_start_torch(rho_ic, vx_ic, vy_ic, x_grid, y_grid, 
+                                   t_start, t_end, nu=0.5, save_times=None, gravity=True):
+    """
+    PyTorch implementation: Run FD solver from custom initial conditions (warm-start).
+    
+    This function allows restarting the FD solver from a PINN state or any custom state,
+    enabling efficient generation of FD data for hybrid PINN-FD training.
+    
+    Args:
+        rho_ic: Initial density field (Nx, Ny) - can be numpy array or torch tensor
+        vx_ic: Initial x-velocity field (Nx, Ny) - can be numpy array or torch tensor
+        vy_ic: Initial y-velocity field (Nx, Ny) - can be numpy array or torch tensor
+        x_grid: x coordinates (Nx,) - can be numpy array or torch tensor
+        y_grid: y coordinates (Ny,) - can be numpy array or torch tensor
+        t_start: Starting time
+        t_end: Ending time
+        nu: Courant number
+        save_times: List of times to save snapshots [default: [t_end]]
+        gravity: Whether to include self-gravity (default: True)
+    
+    Returns:
+        Dictionary: {time: (rho, vx, vy, phi, x, y)} for each saved time (all as numpy arrays)
+    """
+    if save_times is None:
+        save_times = [t_end]
+    
+    # Convert inputs to torch tensors if needed
+    if isinstance(rho_ic, np.ndarray):
+        rho_ic = torch.from_numpy(rho_ic).to(device=device, dtype=dtype)
+    if isinstance(vx_ic, np.ndarray):
+        vx_ic = torch.from_numpy(vx_ic).to(device=device, dtype=dtype)
+    if isinstance(vy_ic, np.ndarray):
+        vy_ic = torch.from_numpy(vy_ic).to(device=device, dtype=dtype)
+    if isinstance(x_grid, np.ndarray):
+        x_grid = torch.from_numpy(x_grid).to(device=device, dtype=dtype)
+    if isinstance(y_grid, np.ndarray):
+        y_grid = torch.from_numpy(y_grid).to(device=device, dtype=dtype)
+    
+    # Domain setup
+    Nx, Ny = rho_ic.shape
+    Lx = (x_grid[-1] - x_grid[0] + (x_grid[1] - x_grid[0])).item()  # Approximate domain size
+    Ly = (y_grid[-1] - y_grid[0] + (y_grid[1] - y_grid[0])).item()
+    dx = Lx / Nx
+    dy = Ly / Ny
+    
+    # Physical constants
+    c_s = cs
+    
+    # Initialize from provided ICs
+    rho0 = rho_ic.clone()
+    vx0 = vx_ic.clone()
+    vy0 = vy_ic.clone()
+    
+    # Calculate initial potential (gravity is always True for collapse problems)
+    phi0 = fft_solver_torch(const * (rho0 - rho_o), Lx, Nx, Ly, Ny)
+    
+    # Initialize flux terms
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    
+    # Storage for snapshots
+    snapshots = {}
+    
+    # Time-stepping loop
+    t = t_start
+    k = 0
+    
+    # Initial dt
+    vmax_initial = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item(), c_s)
+    dt = nu * dx / vmax_initial
+    
+    while t < t_end:
+        # Check if we should save a snapshot before this step
+        for save_t in save_times:
+            if t <= save_t < t + dt and save_t not in snapshots:
+                # Save current state (convert to numpy for consistency)
+                snapshots[save_t] = (
+                    rho0.cpu().numpy().copy(),
+                    vx0.cpu().numpy().copy(),
+                    vy0.cpu().numpy().copy(),
+                    phi0.cpu().numpy().copy(),
+                    x_grid.cpu().numpy().copy(),
+                    y_grid.cpu().numpy().copy()
+                )
+        
+        # Ensure last step doesn't overshoot
+        if t + dt > t_end:
+            dt = t_end - t
+        
+        # LAX time-stepping
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+        
+        # Update density
+        rho1 = (0.25) * (torch.roll(rho0, -1, dims=0) + torch.roll(rho0, 1, dims=0) +
+                        torch.roll(rho0, -1, dims=1) + torch.roll(rho0, 1, dims=1)) - \
+               (mux * (torch.roll(rho0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                       torch.roll(rho0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+               (muy * (torch.roll(rho0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                       torch.roll(rho0, 1, dims=1) * torch.roll(vy0, 1, dims=1)))
+        
+        # Update momentum (with gravity)
+        if gravity:
+            Px1 = (0.25) * (torch.roll(Px0, -1, dims=0) + torch.roll(Px0, 1, dims=0) +
+                            torch.roll(Px0, -1, dims=1) + torch.roll(Px0, 1, dims=1)) - \
+                  (mux * (torch.roll(Px0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Px0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  (muy * (torch.roll(Px0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Px0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  ((c_s**2) * mux * (torch.roll(rho0, -1, dims=0) - torch.roll(rho0, 1, dims=0))) - \
+                  (mux * rho0 * (torch.roll(phi0, -1, dims=0) - torch.roll(phi0, 1, dims=0)))
+            
+            Py1 = (0.25) * (torch.roll(Py0, -1, dims=0) + torch.roll(Py0, 1, dims=0) +
+                            torch.roll(Py0, -1, dims=1) + torch.roll(Py0, 1, dims=1)) - \
+                  (muy * (torch.roll(Py0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Py0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  (mux * (torch.roll(Py0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Py0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  ((c_s**2) * muy * (torch.roll(rho0, -1, dims=1) - torch.roll(rho0, 1, dims=1))) - \
+                  (muy * rho0 * (torch.roll(phi0, -1, dims=1) - torch.roll(phi0, 1, dims=1)))
+            
+            # Update potential
+            phi1 = fft_solver_torch(const * (rho1 - rho_o), Lx, Nx, Ly, Ny)
+        else:
+            # Without gravity (shouldn't happen for collapse problems, but included for completeness)
+            Px1 = (0.25) * (torch.roll(Px0, -1, dims=0) + torch.roll(Px0, 1, dims=0) +
+                            torch.roll(Px0, -1, dims=1) + torch.roll(Px0, 1, dims=1)) - \
+                  (mux * (torch.roll(Px0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Px0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  (muy * (torch.roll(Px0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Px0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  ((c_s**2) * mux * (torch.roll(rho0, -1, dims=0) - torch.roll(rho0, 1, dims=0)))
+            
+            Py1 = (0.25) * (torch.roll(Py0, -1, dims=0) + torch.roll(Py0, 1, dims=0) +
+                            torch.roll(Py0, -1, dims=1) + torch.roll(Py0, 1, dims=1)) - \
+                  (muy * (torch.roll(Py0, -1, dims=1) * torch.roll(vy0, -1, dims=1) -
+                          torch.roll(Py0, 1, dims=1) * torch.roll(vy0, 1, dims=1))) - \
+                  (mux * (torch.roll(Py0, -1, dims=0) * torch.roll(vx0, -1, dims=0) -
+                          torch.roll(Py0, 1, dims=0) * torch.roll(vx0, 1, dims=0))) - \
+                  ((c_s**2) * muy * (torch.roll(rho0, -1, dims=1) - torch.roll(rho0, 1, dims=1)))
+            
+            phi1 = torch.zeros_like(rho1)
+        
+        # Update velocities
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        
+        # Update state
+        rho0 = rho1
+        vx0 = vx1
+        vy0 = vy1
+        Px0 = Px1
+        Py0 = Py1
+        if gravity:
+            phi0 = phi1
+        
+        t += dt
+        k += 1
+        
+        # Calculate dt for next step
+        vmax = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item())
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+    
+    # Save final snapshot if not already saved
+    if t_end not in snapshots:
+        snapshots[t_end] = (
+            rho0.cpu().numpy().copy(),
+            vx0.cpu().numpy().copy(),
+            vy0.cpu().numpy().copy(),
+            phi0.cpu().numpy().copy(),
+            x_grid.cpu().numpy().copy(),
+            y_grid.cpu().numpy().copy()
+        )
+    
+    return snapshots

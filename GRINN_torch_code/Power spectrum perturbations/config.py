@@ -26,7 +26,7 @@ NUM_BATCHES = 1
 a = 0.1
 
 tmin = 0.
-tmax = 3.0
+tmax = 4.0
 
 num_neurons = 64
 harmonics = 3
@@ -132,3 +132,9 @@ CACHE_IC_VALUES = True  # True = precompute and cache IC values for faster train
 # Visualization
 SHOW_INTERFACE_LINES = True  # Draw subdomain boundaries in plots
 INTERFACE_AVERAGING = 'mean'  # Combine overlapping predictions: 'mean', 'weighted', 'subdomain1', 'subdomain2'
+
+# ==================== FD Data Assisted Training Configuration ====================
+USE_FD_DATA = True
+FD_DATA_PATH = "/kaggle/input/power-test184/anchor_points.json"
+FD_DATA_WEIGHT = 0.005
+FD_DATA_BATCH_SIZE = 512

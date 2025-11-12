@@ -507,6 +507,161 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
                 return rho0,vx0,rho_max
 
 
+def lax_solution_warm_start(rho_ic, vx_ic, vy_ic, x_grid, y_grid, 
+                            t_start, t_end, nu=0.5, save_times=None, gravity=True):
+    """
+    Run FD solver from custom initial conditions (warm-start).
+    
+    This function allows restarting the FD solver from a PINN state or any custom state,
+    enabling efficient generation of FD data for hybrid PINN-FD training.
+    
+    Args:
+        rho_ic: Initial density field (Nx, Ny)
+        vx_ic: Initial x-velocity field (Nx, Ny)
+        vy_ic: Initial y-velocity field (Nx, Ny)
+        x_grid: x coordinates (Nx,)
+        y_grid: y coordinates (Ny,)
+        t_start: Starting time
+        t_end: Ending time
+        nu: Courant number
+        save_times: List of times to save snapshots [default: [t_end]]
+        gravity: Whether to include self-gravity (default: True)
+    
+    Returns:
+        Dictionary: {time: (rho, vx, vy, phi, x, y)} for each saved time
+    """
+    if save_times is None:
+        save_times = [t_end]
+    
+    # Domain setup
+    Nx, Ny = rho_ic.shape
+    Lx = x_grid[-1] - x_grid[0] + (x_grid[1] - x_grid[0])  # Approximate domain size
+    Ly = y_grid[-1] - y_grid[0] + (y_grid[1] - y_grid[0])
+    dx = Lx / Nx
+    dy = Ly / Ny
+    
+    # Physical constants
+    c_s = cs
+    
+    # Initialize from provided ICs
+    rho0 = rho_ic.copy()
+    vx0 = vx_ic.copy()
+    vy0 = vy_ic.copy()
+    
+    # Calculate initial potential (gravity is always True for collapse problems)
+    phi0 = fft_solver(const * (rho0 - rho_o), Lx, Nx, Ly, Ny, dim=2)
+    
+    # Initialize flux terms
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    
+    # Storage for snapshots
+    snapshots = {}
+    
+    # Time-stepping loop
+    t = t_start
+    k = 0
+    
+    # Initial dt
+    vmax_initial = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)), c_s)
+    dt = nu * dx / vmax_initial
+    
+    while t < t_end:
+        # Check if we should save a snapshot before this step
+        for save_t in save_times:
+            if t <= save_t < t + dt and save_t not in snapshots:
+                # Save current state (or interpolate if needed)
+                snapshots[save_t] = (rho0.copy(), vx0.copy(), vy0.copy(), 
+                                     phi0.copy(), x_grid.copy(), y_grid.copy())
+        
+        # Ensure last step doesn't overshoot
+        if t + dt > t_end:
+            dt = t_end - t
+        
+        # LAX time-stepping
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+        
+        # Update density
+        rho1 = (1/4) * (np.roll(rho0, -1, axis=0) + np.roll(rho0, 1, axis=0) +
+                       np.roll(rho0, -1, axis=1) + np.roll(rho0, 1, axis=1)) - \
+               (mux * (np.roll(rho0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                       np.roll(rho0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+               (muy * (np.roll(rho0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                       np.roll(rho0, 1, axis=1) * np.roll(vy0, 1, axis=1)))
+        
+        # Update momentum (with gravity)
+        if gravity:
+            Px1 = 0.25 * (np.roll(Px0, -1, axis=0) + np.roll(Px0, 1, axis=0) +
+                          np.roll(Px0, -1, axis=1) + np.roll(Px0, 1, axis=1)) - \
+                  (mux * (np.roll(Px0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Px0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  (muy * (np.roll(Px0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Px0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  ((c_s**2) * mux * (np.roll(rho0, -1, axis=0) - np.roll(rho0, 1, axis=0))) - \
+                  (mux * rho0 * (np.roll(phi0, -1, axis=0) - np.roll(phi0, 1, axis=0)))
+            
+            Py1 = 0.25 * (np.roll(Py0, -1, axis=0) + np.roll(Py0, 1, axis=0) +
+                          np.roll(Py0, -1, axis=1) + np.roll(Py0, 1, axis=1)) - \
+                  (muy * (np.roll(Py0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Py0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  (mux * (np.roll(Py0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Py0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  ((c_s**2) * muy * (np.roll(rho0, -1, axis=1) - np.roll(rho0, 1, axis=1))) - \
+                  (muy * rho0 * (np.roll(phi0, -1, axis=1) - np.roll(phi0, 1, axis=1)))
+            
+            # Update potential
+            phi1 = fft_solver(const * (rho1 - rho_o), Lx, Nx, Ly, Ny, dim=2)
+        else:
+            # Without gravity (shouldn't happen for collapse problems, but included for completeness)
+            Px1 = 0.25 * (np.roll(Px0, -1, axis=0) + np.roll(Px0, 1, axis=0) +
+                          np.roll(Px0, -1, axis=1) + np.roll(Px0, 1, axis=1)) - \
+                  (mux * (np.roll(Px0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Px0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  (muy * (np.roll(Px0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Px0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  ((c_s**2) * mux * (np.roll(rho0, -1, axis=0) - np.roll(rho0, 1, axis=0)))
+            
+            Py1 = 0.25 * (np.roll(Py0, -1, axis=0) + np.roll(Py0, 1, axis=0) +
+                          np.roll(Py0, -1, axis=1) + np.roll(Py0, 1, axis=1)) - \
+                  (muy * (np.roll(Py0, -1, axis=1) * np.roll(vy0, -1, axis=1) -
+                          np.roll(Py0, 1, axis=1) * np.roll(vy0, 1, axis=1))) - \
+                  (mux * (np.roll(Py0, -1, axis=0) * np.roll(vx0, -1, axis=0) -
+                          np.roll(Py0, 1, axis=0) * np.roll(vx0, 1, axis=0))) - \
+                  ((c_s**2) * muy * (np.roll(rho0, -1, axis=1) - np.roll(rho0, 1, axis=1)))
+            
+            phi1 = np.zeros_like(rho1)
+        
+        # Update velocities
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        
+        # Update state
+        rho0 = rho1
+        vx0 = vx1
+        vy0 = vy1
+        Px0 = Px1
+        Py0 = Py1
+        if gravity:
+            phi0 = phi1
+        
+        t += dt
+        k += 1
+        
+        # Calculate dt for next step
+        vmax = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)))
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+    
+    # Save final snapshot if not already saved
+    if t_end not in snapshots:
+        snapshots[t_end] = (rho0.copy(), vx0.copy(), vy0.copy(), 
+                           phi0.copy(), x_grid.copy(), y_grid.copy())
+    
+    return snapshots
+
+
 def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None):
     '''
     1D LAX solver for sinusoidal initial conditions with optional self-gravity and linear theory outputs.

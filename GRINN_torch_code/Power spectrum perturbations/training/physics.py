@@ -17,7 +17,7 @@ from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
 
 # ==================== Physics Calculations and Loss Functions ====================
 
-def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt):
+def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, fd_data=None, fd_weight=0.0):
 
     ############## Loss based on initial conditions ###############
     rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
@@ -217,7 +217,48 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
-    
+
+    fd_loss_value = None
+    if fd_data is not None and fd_weight > 0:
+        required_keys = {'x', 't'}
+        if required_keys.issubset(fd_data.keys()):
+            fd_inputs = [fd_data['x']]
+            if 'y' in fd_data and fd_data['y'] is not None:
+                fd_inputs.append(fd_data['y'])
+            if 'z' in fd_data and fd_data['z'] is not None:
+                fd_inputs.append(fd_data['z'])
+            fd_inputs.append(fd_data['t'])
+
+            fd_outputs = net(fd_inputs)
+
+            loss_sum = 0.0
+            component_count = 0
+
+            if fd_data.get('rho') is not None:
+                rho_fd_pred = fd_outputs[:, 0:1]
+                loss_sum = loss_sum + torch.mean((rho_fd_pred - fd_data['rho']) ** 2)
+                component_count += 1
+
+            if fd_data.get('vx') is not None:
+                vx_fd_pred = fd_outputs[:, 1:2]
+                loss_sum = loss_sum + torch.mean((vx_fd_pred - fd_data['vx']) ** 2)
+                component_count += 1
+
+            if fd_data.get('vy') is not None and fd_outputs.size(1) >= 3:
+                vy_fd_pred = fd_outputs[:, 2:3]
+                loss_sum = loss_sum + torch.mean((vy_fd_pred - fd_data['vy']) ** 2)
+                component_count += 1
+
+            if component_count > 0:
+                data_loss_unweighted = loss_sum / component_count
+                fd_loss_value = fd_weight * data_loss_unweighted
+                loss = loss + fd_loss_value
+        else:
+            fd_loss_value = None
+
+    if fd_loss_value is not None:
+        loss_breakdown['FD_DATA'] = fd_loss_value.item()
+
     return loss, loss_breakdown
 
 # Note: train() and train_xpinn() functions have been moved to training/trainer.py
@@ -233,12 +274,14 @@ def _make_batch_tensors(tensors_list, indices):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None):
+                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, fd_data=None, fd_weight=0.0, fd_batch_size=None, use_fft_poisson=None):
     """
     Batched closure function for training with optional causal weighting.
     
     This function computes losses over mini-batches and optionally applies causal weights.
     """
+    last_fd_loss = None
+
     # Aggregate losses across mini-batches
     total_loss = 0.0
     num_effective_batches = 0
@@ -438,6 +481,49 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 else:
                     residual_tracker.update_residuals(t_dom, [rho_r, vx_r, vy_r, vz_r, phi_r])
 
+        fd_loss_batch = None
+        if fd_data is not None and fd_weight > 0:
+            total_fd = fd_data.get('count', 0)
+            if total_fd > 0:
+                effective_fd_batch = int(fd_batch_size or batch_size)
+                effective_fd_batch = max(1, min(effective_fd_batch, total_fd))
+                fd_idx = _random_batch_indices(total_fd, effective_fd_batch, fd_data['x'].device)
+
+                fd_inputs = [fd_data['x'][fd_idx]]
+                if 'y' in fd_data and fd_data['y'] is not None:
+                    fd_inputs.append(fd_data['y'][fd_idx])
+                if 'z' in fd_data and fd_data.get('z') is not None:
+                    fd_inputs.append(fd_data['z'][fd_idx])
+                fd_inputs.append(fd_data['t'][fd_idx])
+
+                fd_outputs = net(fd_inputs)
+
+                loss_sum = 0.0
+                component_count = 0
+
+                if fd_data.get('rho') is not None:
+                    rho_fd_pred = fd_outputs[:, 0:1]
+                    loss_sum = loss_sum + torch.mean((rho_fd_pred - fd_data['rho'][fd_idx]) ** 2)
+                    component_count += 1
+
+                if fd_data.get('vx') is not None:
+                    vx_fd_pred = fd_outputs[:, 1:2]
+                    loss_sum = loss_sum + torch.mean((vx_fd_pred - fd_data['vx'][fd_idx]) ** 2)
+                    component_count += 1
+
+                if fd_data.get('vy') is not None and fd_outputs.size(1) >= 3:
+                    vy_fd_pred = fd_outputs[:, 2:3]
+                    loss_sum = loss_sum + torch.mean((vy_fd_pred - fd_data['vy'][fd_idx]) ** 2)
+                    component_count += 1
+
+                if component_count > 0:
+                    data_loss_unweighted = loss_sum / component_count
+                    fd_loss_batch = fd_weight * data_loss_unweighted
+                    loss = loss + fd_loss_batch
+
+        if fd_loss_batch is not None:
+            last_fd_loss = fd_loss_batch
+
         total_loss = total_loss + loss
         num_effective_batches += 1
 
@@ -483,6 +569,9 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
     
+    if last_fd_loss is not None:
+        loss_breakdown['FD_DATA'] = last_fd_loss.item()
+
     return avg_loss, loss_breakdown
 
 
