@@ -22,8 +22,8 @@ from tqdm import tqdm
 # Add parent directory to path for imports when running from utilities directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from numerical_solvers.LAX_2D import lax_solution as lax_solution_cpu, generate_velocity_field_power_spectrum
-from numerical_solvers.LAX_2D_torch import lax_solution_torch
+from numerical_solvers.LAX import lax_solution as lax_solution_cpu, generate_velocity_field_power_spectrum
+from numerical_solvers.LAX_torch import lax_solution_torch
 from config import (
     RANDOM_SEED, POWER_EXPONENT, num_of_waves as NUM_OF_WAVES_CONFIG,
     xmin, ymin, cs, rho_o, const, G, a, wave, PERTURBATION_TYPE, KX, KY
@@ -34,11 +34,11 @@ from config import (
 # =============================================================================
 
 # Grid & Domain Parameters
-N = 800                    # Grid resolution (Nx = Ny)
-nu = 0.25                   # Courant number for stability (typically 0.1-0.9)
+N = 400                    # Grid resolution (Nx = Ny)
+nu = 0.3                   # Courant number for stability (typically 0.1-0.9)
 lam = wave                  # Wavelength (from config.py)
 num_of_waves = NUM_OF_WAVES_CONFIG  # Number of wavelengths in domain (from config.py)
-time_points = [3.0, 4.0]  # Times to plot
+time_points = [1.0, 1.5, 2.0]  # Times to plot
 
 # Physical Constants (all from config.py)
 # cs, rho_o, const, G, a, xmin, ymin are imported from config.py above
@@ -53,8 +53,8 @@ random_seed = RANDOM_SEED         # Seed for reproducibility (from config.py)
 kx = KX  # Wave vector x-component for sinusoidal perturbations (only used for sinusoidal perturbations)
 ky = KY  # Wave vector y-component for sinusoidal perturbations (only used for sinusoidal perturbations)
 
-# Solver backend selection: "cpu" uses numerical_solvers.LAX_2D (reference implementation),
-# "torch" uses numerical_solvers.LAX_2D_torch (GPU version, supports both power spectrum and sinusoidal)
+# Solver backend selection: "cpu" uses numerical_solvers.LAX (reference implementation),
+# "torch" uses numerical_solvers.LAX_torch (GPU version, supports both power spectrum and sinusoidal)
 SOLVER_BACKEND = "torch"      # Options: "cpu" or "torch"
 
 # Output Settings

@@ -11,7 +11,7 @@ from config import DECAY_PORTION, BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGN
 from training.physics import closure_batched
 
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, fd_data=None, fd_weight=0.0, fd_batch_size=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, fd_data=None, fd_weight=0.0, fd_batch_size=None, data_terms=None):
     """
     Standard training loop for single PINN.
     
@@ -38,6 +38,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         causal_mode: Causal training mode
         residual_tracker: Residual tracker for adaptive causal weighting
         window_idx: Current curriculum window index
+        data_terms: Optional list of additional supervised datasets with weights
     """
     # Batched training is the default
     total_steps = iteration_adam + iterationL
@@ -62,7 +63,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=True))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=True, data_terms=data_terms))
 
         with torch.autograd.no_grad():
             # Diagnostics logging every 50 iterations
@@ -78,9 +79,6 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
                         },
                         geomtime_col=collocation_domain
                     )
-                    if i % 200 == 0:
-                        diagnostics.plot_diagnostics(i)
-                        print(f"Diagnostics saved at iteration {i}")
                 except Exception as _diag_err:
                     # Keep training robust if diagnostics fail
                     print(f"[WARN] Diagnostics logging failed at {i}: {_diag_err}")
@@ -104,7 +102,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=False)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=False, data_terms=data_terms)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
@@ -125,9 +123,6 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
                         },
                         geomtime_col=collocation_domain
                     )
-                    if i % 200 == 0:
-                        diagnostics.plot_diagnostics(iteration_adam + i)
-                        print(f"Diagnostics saved at iteration {iteration_adam + i}")
                 except Exception as _diag_err:
                     print(f"[WARN] Diagnostics logging (LBFGS) failed at {i}: {_diag_err}")
             if i % 50 == 0:
@@ -136,6 +131,14 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
                 breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
                 if breakdown_str:
                     print(f"  Loss breakdown: {breakdown_str}", flush=True)
+    
+    # Generate diagnostic plots at the end of training
+    if diagnostics is not None:
+        try:
+            final_iteration = iteration_adam + iterationL - 1
+            diagnostics.plot_diagnostics(final_iteration)
+        except Exception as _diag_err:
+            print(f"[WARN] Final diagnostics plotting failed: {_diag_err}")
 
 
 def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs,
@@ -311,9 +314,6 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                         },
                         geomtime_col=subdomain_collocs[0]
                     )
-                    if i % 200 == 0:
-                        xpinn_diagnostics.plot_diagnostics(i)
-                        print(f"Diagnostics saved at iteration {i}")
                 except Exception as _diag_err:
                     print(f"[WARN] XPINN diagnostics logging failed at {i}: {_diag_err}")
 
@@ -349,9 +349,6 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                         },
                         geomtime_col=subdomain_collocs[0]
                     )
-                    if i % 200 == 0:
-                        xpinn_diagnostics.plot_diagnostics(i)
-                        print(f"Diagnostics saved at iteration {i}")
                 except Exception as _diag_err:
                     print(f"[WARN] XPINN diagnostics logging failed at {i}: {_diag_err}")
 
@@ -378,15 +375,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
             
             # Create optimizer for this subdomain only
             optimizer_sub = torch.optim.LBFGS(
-                net.parameters(),
-                lr=1.0,
-                max_iter=50,
-                max_eval=None,
-                tolerance_grad=1e-11,
-                tolerance_change=1e-11,
-                history_size=100,
-                line_search_fn='strong_wolfe'
-            )
+                net.parameters(), line_search_fn='strong_wolfe')
             
             # Create closure for this subdomain
             # Computes loss for this subdomain + its interface losses
@@ -480,6 +469,14 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                     )
         
         print("Per-subdomain L-BFGS training completed.")
+    
+    # Generate diagnostic plots at the end of XPINN training
+    if xpinn_diagnostics is not None:
+        try:
+            final_iteration = iteration_adam + iterationL - 1
+            xpinn_diagnostics.plot_diagnostics(final_iteration)
+        except Exception as _diag_err:
+            print(f"[WARN] Final XPINN diagnostics plotting failed: {_diag_err}")
     
     print("XPINN training completed.")
 

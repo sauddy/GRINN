@@ -325,8 +325,14 @@ class CausalTrainer:
                 # Expanding windows: train from t=0 to current t_max
                 t_start = max(cfg['tmin'], cfg['startup_dt'])
             
-            self.model.rmin = [cfg['xmin'], cfg['ymin'], t_start]
-            self.model.rmax = [cfg['xmax'], cfg['ymax'], t_window_max]
+            # Build rmin/rmax based on spatial dimension (2D or 3D)
+            dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
+            if dimension == 3:
+                self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], t_start]
+                self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], t_window_max]
+            else:  # 2D or 1D
+                self.model.rmin = [cfg['xmin'], cfg['ymin'], t_start]
+                self.model.rmax = [cfg['xmax'], cfg['ymax'], t_window_max]
             
             # Regenerate domain collocation for this window
             collocation_domain_window = self.model.geo_time_coord(option="Domain")
@@ -352,8 +358,13 @@ class CausalTrainer:
             )
         
         # Restore full time/space range for final evaluation/plotting
-        self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['tmin']]
-        self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['tmax']]
+        dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
+        if dimension == 3:
+            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], cfg['tmin']]
+            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], cfg['tmax']]
+        else:  # 2D or 1D
+            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['tmin']]
+            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['tmax']]
         
         if use_restarts:
             print(f"\nCausal training completed (restart marching). Final time range: [{cfg['tmin']}, {cfg['tmax']}]")

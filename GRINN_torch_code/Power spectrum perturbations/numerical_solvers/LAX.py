@@ -11,18 +11,19 @@ import scipy
 
 ## For the FFT solver
 
-from numpy.fft import fft, ifft,fft2, ifft2
+from numpy.fft import fft, ifft, fft2, ifft2, fftn, ifftn
 from scipy import signal
 
 from config import RANDOM_SEED
 
 # Import wave vector components and physical constants for 2D sinusoidal perturbations
 try:
-    from config import KX, KY, cs, rho_o, const, G
+    from config import KX, KY, KZ, cs, rho_o, const, G
 except ImportError:
     # Fallback if config not available
     KX = 2*np.pi/5.0  # Default wavelength
     KY = 0.0
+    KZ = 0.0
     cs = 1.0
     rho_o = 1.0
     const = 1.0
@@ -35,30 +36,22 @@ def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amp
     """
     Generate 2D velocity components (vx, vy) with an isotropic power-law spectrum P(k) ~ k^{power_index}.
     
-    This function generates resolution-independent initial conditions by:
-    1. Synthesizing at fixed high resolution (1024x1024)
-    2. Applying power-law filter with sharp cutoff at target Nyquist frequency
-    3. Downsampling to target resolution via interpolation
-    
-    This ensures that N=300 and N=400 runs start with the same physical velocity field,
-    just sampled at different resolutions, making convergence studies meaningful.
+    This function generates velocity fields directly at the target resolution (nx, ny)
+    without any downsampling or cutoff strategies.
     """
-    # Use a fixed, high-resolution grid for synthesis to ensure resolution independence
-    hires_nx, hires_ny = 1024, 1024
-    
     if random_seed is not None:
         rng = np.random.default_rng(random_seed)
     else:
         rng = np.random.default_rng()
 
     def synthesize_component():
-        # 1. Generate random field at high resolution
-        field = rng.standard_normal((hires_nx, hires_ny))
+        # 1. Generate random field at target resolution
+        field = rng.standard_normal((nx, ny))
         F = fft2(field)
         
-        # 2. Construct k-space grid at high resolution
-        kx = 2 * np.pi * np.fft.fftfreq(hires_nx, d=Lx / hires_nx)
-        ky = 2 * np.pi * np.fft.fftfreq(hires_ny, d=Ly / hires_ny)
+        # 2. Construct k-space grid at target resolution
+        kx = 2 * np.pi * np.fft.fftfreq(nx, d=Lx / nx)
+        ky = 2 * np.pi * np.fft.fftfreq(ny, d=Ly / ny)
         kxg, kyg = np.meshgrid(kx, ky, indexing='ij')
         kk = np.sqrt(kxg**2 + kyg**2)
         kk[0, 0] = 1.0  # Avoid division by zero
@@ -67,33 +60,16 @@ def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amp
         filt = (kk) ** (power_index / 2.0)
         filt[kk == 0] = 0.0
         
-        # 4. KEY: Apply sharp cutoff at target Nyquist frequency to prevent aliasing
-        k_nyquist = np.pi * nx / Lx  # Target grid's Nyquist frequency
-        filt[kk > k_nyquist] = 0.0   # Remove unresolvable modes
-        
         F_filtered = F * filt
         
-        # 5. Transform back to real space at high resolution
-        comp_hires = np.real(ifft2(F_filtered))
+        # 4. Transform back to real space
+        comp = np.real(ifft2(F_filtered))
         
-        # 6. Normalize the high-resolution field
-        comp_hires -= np.mean(comp_hires)
-        std = np.std(comp_hires)
+        # 5. Normalize the field
+        comp -= np.mean(comp)
+        std = np.std(comp)
         if std > 0:
-            comp_hires = comp_hires * (amplitude / std)
-        
-        # 7. Downsample to target resolution via interpolation
-        from scipy.interpolate import RegularGridInterpolator
-        
-        x_hires = np.linspace(0, Lx, hires_nx, endpoint=False)
-        y_hires = np.linspace(0, Ly, hires_ny, endpoint=False)
-        x_lores = np.linspace(0, Lx, nx, endpoint=False)
-        y_lores = np.linspace(0, Ly, ny, endpoint=False)
-        
-        interp = RegularGridInterpolator((x_hires, y_hires), comp_hires, 
-                                        method='linear', bounds_error=False, fill_value=0.0)
-        X_lores, Y_lores = np.meshgrid(x_lores, y_lores, indexing='ij')
-        comp = interp((X_lores, Y_lores))
+            comp = comp * (amplitude / std)
         
         return comp
 
@@ -182,6 +158,24 @@ def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
 #     dphidx = np.gradient(phi, dx)
 #     dphidy = np.gradient(phi, dy)
 #     return phi,dphidx, dphidy 
+    return phi
+
+def fft_solver_3d(rho, Lx, nx, Ly, ny, Lz, nz):
+    """
+    FFT-based Poisson solver for 3D periodic domains.
+    """
+    dx = Lx / nx
+    dy = Ly / ny
+    dz = Lz / nz
+    rhohat = fftn(rho)
+    kx = 2 * np.pi * np.fft.fftfreq(nx, dx)
+    ky = 2 * np.pi * np.fft.fftfreq(ny, dy)
+    kz = 2 * np.pi * np.fft.fftfreq(nz, dz)
+    kx2, ky2, kz2 = np.meshgrid(kx**2, ky**2, kz**2, indexing='ij')
+    laplace = -(kx2 + ky2 + kz2)
+    laplace[laplace == 0] = 1e-9
+    phihat = rhohat / laplace
+    phi = np.real(ifftn(phihat))
     return phi
 
 def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None,
@@ -505,6 +499,136 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
                 return rho0,vx0,rho_LT,rho_LT_max,rho_max,vx_LT
             else:
                 return rho0,vx0,rho_max
+
+
+def lax_solution_3d_sinusoidal(time, N, nu, lam, num_of_waves, rho_1, gravity=True):
+    """
+    3D LAX solver for sinusoidal perturbations with optional self-gravity.
+    Returns full 3D fields which can be sliced for visualization/comparison.
+    """
+    Lx = lam * num_of_waves
+    Ly = lam * num_of_waves
+    Lz = lam * num_of_waves
+    c_s = cs
+
+    Nx = Ny = Nz = int(N)
+    dx = float(Lx / Nx)
+    dy = float(Ly / Ny)
+    dz = float(Lz / Nz)
+
+    x = np.linspace(0, Lx, Nx, endpoint=False)
+    y = np.linspace(0, Ly, Ny, endpoint=False)
+    z = np.linspace(0, Lz, Nz, endpoint=False)
+    xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
+
+    rho0 = rho_o + rho_1 * np.cos(KX * xx + KY * yy + KZ * zz)
+
+    Px0 = np.zeros_like(rho0)
+    Py0 = np.zeros_like(rho0)
+    Pz0 = np.zeros_like(rho0)
+
+    if gravity:
+        jeans = np.sqrt(4*np.pi**2*c_s**2/(const*G*rho_o))
+        if lam >= jeans:
+            alpha = np.sqrt(const*G*rho_o-c_s**2*(2*np.pi/lam)**2)
+            v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+            wave_field = -v_1 * np.sin(KX * xx + KY * yy + KZ * zz)
+        else:
+            alpha = np.sqrt(c_s**2*(2*np.pi/lam)**2 - const*G*rho_o)
+            v_1 = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+            wave_field = v_1 * np.cos(KX * xx + KY * yy + KZ * zz)
+    else:
+        v_1 = (c_s * rho_1) / rho_o
+        wave_field = v_1 * np.cos(KX * xx + KY * yy + KZ * zz)
+
+    k_magnitude = np.sqrt(KX**2 + KY**2 + KZ**2)
+    if k_magnitude > 0:
+        vx0 = wave_field * (KX / k_magnitude)
+        vy0 = wave_field * (KY / k_magnitude)
+        vz0 = wave_field * (KZ / k_magnitude)
+    else:
+        vx0 = wave_field
+        vy0 = np.zeros_like(vx0)
+        vz0 = np.zeros_like(vx0)
+
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    Pz0 = rho0 * vz0
+
+    phi0 = np.zeros_like(rho0)
+    phi1 = np.zeros_like(rho0)
+    if gravity:
+        phi0 = fft_solver_3d(const*(rho0-rho_o), Lx, Nx, Ly, Ny, Lz, Nz)
+
+    t = 0.0
+    k_iter = 0
+    vmax_initial = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)), np.max(np.abs(vz0)), c_s)
+    dt = nu * dx / vmax_initial
+
+    while t < time:
+        if t + dt > time:
+            dt = time - t
+
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+        muz = dt / (2 * dz)
+
+        rho1 = (1/6)*(np.roll(rho0, -1, axis=0) + np.roll(rho0, 1, axis=0) +
+                      np.roll(rho0, -1, axis=1) + np.roll(rho0, 1, axis=1) +
+                      np.roll(rho0, -1, axis=2) + np.roll(rho0, 1, axis=2)) \
+               - mux*(np.roll(rho0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(rho0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+               - muy*(np.roll(rho0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(rho0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+               - muz*(np.roll(rho0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(rho0,1,axis=2)*np.roll(vz0,1,axis=2))
+
+        Px1 = (1/6)*(np.roll(Px0,-1,axis=0) + np.roll(Px0,1,axis=0) +
+                      np.roll(Px0,-1,axis=1) + np.roll(Px0,1,axis=1) +
+                      np.roll(Px0,-1,axis=2) + np.roll(Px0,1,axis=2)) \
+              - mux*(np.roll(Px0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(Px0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+              - muy*(np.roll(Px0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(Px0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+              - muz*(np.roll(Px0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(Px0,1,axis=2)*np.roll(vz0,1,axis=2)) \
+              - ((c_s**2)*mux*(np.roll(rho0,-1,axis=0) - np.roll(rho0,1,axis=0)))
+
+        Py1 = (1/6)*(np.roll(Py0,-1,axis=0) + np.roll(Py0,1,axis=0) +
+                      np.roll(Py0,-1,axis=1) + np.roll(Py0,1,axis=1) +
+                      np.roll(Py0,-1,axis=2) + np.roll(Py0,1,axis=2)) \
+              - muy*(np.roll(Py0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(Py0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+              - mux*(np.roll(Py0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(Py0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+              - muz*(np.roll(Py0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(Py0,1,axis=2)*np.roll(vz0,1,axis=2)) \
+              - ((c_s**2)*muy*(np.roll(rho0,-1,axis=1) - np.roll(rho0,1,axis=1)))
+
+        Pz1 = (1/6)*(np.roll(Pz0,-1,axis=0) + np.roll(Pz0,1,axis=0) +
+                      np.roll(Pz0,-1,axis=1) + np.roll(Pz0,1,axis=1) +
+                      np.roll(Pz0,-1,axis=2) + np.roll(Pz0,1,axis=2)) \
+              - muz*(np.roll(Pz0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(Pz0,1,axis=2)*np.roll(vz0,1,axis=2)) \
+              - mux*(np.roll(Pz0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(Pz0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+              - muy*(np.roll(Pz0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(Pz0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+              - ((c_s**2)*muz*(np.roll(rho0,-1,axis=2) - np.roll(rho0,1,axis=2)))
+
+        if gravity:
+            Px1 -= mux * rho0 * (np.roll(phi0,-1,axis=0) - np.roll(phi0,1,axis=0))
+            Py1 -= muy * rho0 * (np.roll(phi0,-1,axis=1) - np.roll(phi0,1,axis=1))
+            Pz1 -= muz * rho0 * (np.roll(phi0,-1,axis=2) - np.roll(phi0,1,axis=2))
+            phi1 = fft_solver_3d(const*(rho1 - rho_o), Lx, Nx, Ly, Ny, Lz, Nz)
+
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        vz1 = Pz1 / rho1
+
+        rho0, vx0, vy0, vz0 = rho1, vx1, vy1, vz1
+        Px0, Py0, Pz0 = Px1, Py1, Pz1
+        if gravity:
+            phi0 = phi1
+
+        t += dt
+        k_iter += 1
+
+        vmax = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)), np.max(np.abs(vz0)))
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+
+    rho_max = np.max(rho0)
+    return x, y, z, rho0, vx0, vy0, vz0, phi0, k_iter, rho_max
 
 
 def lax_solution_warm_start(rho_ic, vx_ic, vy_ic, x_grid, y_grid, 

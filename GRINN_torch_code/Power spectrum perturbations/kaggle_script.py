@@ -473,11 +473,17 @@ Functions:
 import numpy as np
 import torch
 from config import (cs, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, 
-                    PERTURBATION_TYPE, KX, KY, RANDOM_SEED)
+                    PERTURBATION_TYPE, KX, KY, KZ, RANDOM_SEED)
 
 # Global shared velocity fields for consistent initial conditions
 _shared_vx_interp = None
 _shared_vy_interp = None
+
+def _ensure_column_tensor(tensor):
+    return tensor if tensor.dim() > 1 else tensor.unsqueeze(-1)
+
+def _extract_spatial_coords(coords):
+    return coords[:-1] if len(coords) > 1 else coords
 
 
 def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
@@ -503,8 +509,8 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
     if seed is None:
         seed = RANDOM_SEED
     
-    # Import LAX_2D functions
-    from numerical_solvers.LAX_2D import generate_shared_velocity_field
+    # Import LAX functions
+    from numerical_solvers.LAX import generate_shared_velocity_field
     
     # Calculate domain size to match FD solver
     Lx = lam * num_of_waves
@@ -690,77 +696,62 @@ def generate_power_spectrum_field_vy(lam, v_1, x, seed=None):
     return _generate_power_spectrum_fallback(lam, v_1, x, seed)
 
 
-def _sinusoidal_component(coord, lam, jeans, v_1, k_component=None):
+def _compute_wave_phase(spatial_coords, lam):
     """
-    Helper function to generate sinusoidal velocity component.
-    
-    Args:
-        coord: Coordinate tensor [N,1] or [N]
-        lam: Wavelength
-        jeans: Jeans length
-        v_1: Velocity amplitude
-        k_component: Wave vector component (for 2D case)
-    
-    Returns:
-        Sinusoidal velocity component
+    Compute wave phase and wave-vector components for sinusoidal perturbations.
     """
-    u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
+    if not spatial_coords:
+        raise ValueError("Spatial coordinates are required to compute wave phase.")
     
-    if k_component is not None:
-        # Use specific k component for 2D case
-        wave_phase = k_component * u
-    else:
-        # Fallback to original behavior for 1D case
-        wave_phase = 2*np.pi*u/lam
+    x_coord = _ensure_column_tensor(spatial_coords[0])
+    zeros = torch.zeros_like(x_coord)
+    y_coord = _ensure_column_tensor(spatial_coords[1]) if len(spatial_coords) >= 2 else zeros
+    z_coord = _ensure_column_tensor(spatial_coords[2]) if len(spatial_coords) >= 3 else zeros
     
-    if lam > jeans:
-        return -v_1 * torch.sin(wave_phase)
-    else:
-        return v_1 * torch.cos(wave_phase)
+    device = x_coord.device
+    dtype = x_coord.dtype
+    kx = torch.as_tensor(float(KX), device=device, dtype=dtype)
+    ky = torch.as_tensor(float(KY), device=device, dtype=dtype)
+    kz = torch.as_tensor(float(KZ), device=device, dtype=dtype)
+    
+    phase = kx * x_coord + ky * y_coord + kz * z_coord
+    
+    # Fallback to fundamental wavelength if wave-vector is zero (e.g., user-specified)
+    if torch.allclose(kx.abs() + ky.abs() + kz.abs(), torch.tensor(0.0, device=device, dtype=dtype)):
+        fundamental = torch.as_tensor(2 * np.pi / lam, device=device, dtype=dtype)
+        phase = fundamental * x_coord
+        kx, ky, kz = fundamental, torch.zeros_like(fundamental), torch.zeros_like(fundamental)
+    
+    return phase, kx, ky, kz, x_coord, y_coord, z_coord
 
 
-def _coupled_2d_velocity_components(x, lam, jeans, v_1):
+def _coupled_velocity_components(coords, lam, jeans, v_1):
     """
-    Generate coupled 2D velocity components from the same wave pattern.
-    
-    Args:
-        x: Coordinates [x, y, ...]
-        lam: Wavelength
-        jeans: Jeans length
-        v_1: Velocity amplitude
-    
-    Returns:
-        Tuple (vx, vy) of velocity components
+    Generate coupled velocity components from the same wave pattern (supports 1D/2D/3D).
     """
-    if len(x) < 2:
-        # Fallback to 1D case
-        return _sinusoidal_component(x[0], lam, jeans, v_1), torch.zeros_like(x[0])
-    
-    x_coord = x[0] if x[0].dim() > 1 else x[0].unsqueeze(-1)
-    y_coord = x[1] if x[1].dim() > 1 else x[1].unsqueeze(-1)
-    
-    # Calculate wave vector magnitude (convert to tensor)
-    k_magnitude = torch.sqrt(torch.tensor(KX**2 + KY**2, device=x_coord.device, dtype=x_coord.dtype))
-    
-    # Generate the coupled wave pattern
-    wave_phase = KX * x_coord + KY * y_coord
+    spatial_coords = _extract_spatial_coords(coords)
+    phase, kx, ky, kz, _, _, _ = _compute_wave_phase(spatial_coords, lam)
+    dtype = phase.dtype
+    device = phase.device
+    v_scale = torch.as_tensor(float(v_1), device=device, dtype=dtype)
     
     if lam > jeans:
-        # Gravitational instability case
-        wave_field = -v_1 * torch.sin(wave_phase)
+        wave_field = -v_scale * torch.sin(phase)
     else:
-        # Oscillatory case
-        wave_field = v_1 * torch.cos(wave_phase)
+        wave_field = v_scale * torch.cos(phase)
     
-    # Coupled velocity components
-    if k_magnitude > 0:
-        vx = wave_field * (KX / k_magnitude)
-        vy = wave_field * (KY / k_magnitude)
-    else:
+    k_mag = torch.sqrt(kx**2 + ky**2 + kz**2)
+    if k_mag <= torch.tensor(1e-12, device=device, dtype=dtype):
         vx = wave_field
         vy = torch.zeros_like(wave_field)
+        vz = torch.zeros_like(wave_field)
+    else:
+        inv_mag = 1.0 / k_mag
+        vx = wave_field * (kx * inv_mag)
+        vy = wave_field * (ky * inv_mag)
+        vz = wave_field * (kz * inv_mag)
     
-    return vx, vy
+    return vx, vy, vz
 
 
 def fun_rho_0(rho_1, lam, x):
@@ -776,15 +767,9 @@ def fun_rho_0(rho_1, lam, x):
         rho_0: Initial density field
     """
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        # Use separate kx and ky components for 2D wave vector
-        if len(x) >= 2:  # 2D case
-            x_coord = x[0] if x[0].dim() > 1 else x[0].unsqueeze(-1)
-            y_coord = x[1] if x[1].dim() > 1 else x[1].unsqueeze(-1)
-            rho_0 = rho_o + rho_1 * torch.cos(KX * x_coord + KY * y_coord)
-        else:  # 1D case - fallback to original behavior
-            coord = x[0]
-            u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
-            rho_0 = rho_o + rho_1 * torch.cos(2*np.pi*u/lam)
+        spatial_coords = _extract_spatial_coords(x)
+        phase, *_ = _compute_wave_phase(spatial_coords, lam)
+        rho_0 = rho_o + rho_1 * torch.cos(phase)
     else:
         # Power spectrum: uniform initial density
         rho_0 = torch.full_like(x[0], rho_o)
@@ -809,12 +794,8 @@ def fun_vx_0(lam, jeans, v_1, x):
         vx_0: Initial x-velocity field
     """
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        # Use coupled 2D velocity components for proper 2D wave physics
-        if len(x) >= 2:  # 2D case
-            vx, _ = _coupled_2d_velocity_components(x, lam, jeans, v_1)
-            return vx
-        else:  # 1D case
-            return _sinusoidal_component(x[0], lam, jeans, v_1)
+        vx, _, _ = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vx
     else:
         # Power spectrum case
         return generate_power_spectrum_field(lam, v_1, x, seed=RANDOM_SEED)
@@ -834,16 +815,23 @@ def fun_vy_0(lam, jeans, v_1, x):
         vy_0: Initial y-velocity field
     """
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        # Use coupled 2D velocity components for proper 2D wave physics
-        if len(x) >= 2:  # 2D case
-            _, vy = _coupled_2d_velocity_components(x, lam, jeans, v_1)
-            return vy
-        else:
-            # Fallback to x if y is unavailable (1D)
-            return _sinusoidal_component(x[0], lam, jeans, v_1)
+        _, vy, _ = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vy
     else:
         # Power spectrum case
         return generate_power_spectrum_field_vy(lam, v_1, x, seed=RANDOM_SEED)
+
+
+def fun_vz_0(lam, jeans, v_1, x):
+    """
+    Initial condition for z-velocity (used in 3D sinusoidal runs).
+    """
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        _, _, vz = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vz
+    else:
+        # Power spectrum setup is currently 2D; default to zero
+        return func(x)
 
 
 def func(x):
@@ -857,7 +845,7 @@ def func(x):
         Zero tensor matching the shape of x[0]
     """
     return x[0] * 0
-_register_module('core.initial_conditions', ['_coupled_2d_velocity_components', '_generate_power_spectrum_fallback', '_interpolate_shared_field', '_shared_vx_interp', '_shared_vy_interp', '_sinusoidal_component', 'fun_rho_0', 'fun_vx_0', 'fun_vy_0', 'func', 'generate_power_spectrum_field', 'generate_power_spectrum_field_vy', 'initialize_shared_velocity_fields'])
+_register_module('core.initial_conditions', ['_compute_wave_phase', '_coupled_velocity_components', '_ensure_column_tensor', '_extract_spatial_coords', '_generate_power_spectrum_fallback', '_interpolate_shared_field', '_shared_vx_interp', '_shared_vy_interp', 'fun_rho_0', 'fun_vx_0', 'fun_vy_0', 'fun_vz_0', 'func', 'generate_power_spectrum_field', 'generate_power_spectrum_field_vy', 'initialize_shared_velocity_fields'])
 
 # ==== Module: core.losses (core/losses.py) ====
 from core.data_generator import col_gen
@@ -1892,8 +1880,14 @@ class CausalTrainer:
                 # Expanding windows: train from t=0 to current t_max
                 t_start = max(cfg['tmin'], cfg['startup_dt'])
             
-            self.model.rmin = [cfg['xmin'], cfg['ymin'], t_start]
-            self.model.rmax = [cfg['xmax'], cfg['ymax'], t_window_max]
+            # Build rmin/rmax based on spatial dimension (2D or 3D)
+            dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
+            if dimension == 3:
+                self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], t_start]
+                self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], t_window_max]
+            else:  # 2D or 1D
+                self.model.rmin = [cfg['xmin'], cfg['ymin'], t_start]
+                self.model.rmax = [cfg['xmax'], cfg['ymax'], t_window_max]
             
             # Regenerate domain collocation for this window
             collocation_domain_window = self.model.geo_time_coord(option="Domain")
@@ -1919,8 +1913,13 @@ class CausalTrainer:
             )
         
         # Restore full time/space range for final evaluation/plotting
-        self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['tmin']]
-        self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['tmax']]
+        dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
+        if dimension == 3:
+            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], cfg['tmin']]
+            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], cfg['tmax']]
+        else:  # 2D or 1D
+            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['tmin']]
+            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['tmax']]
         
         if use_restarts:
             print(f"\nCausal training completed (restart marching). Final time range: [{cfg['tmin']}, {cfg['tmax']}]")
@@ -2444,7 +2443,7 @@ def cache_xpinn_initial_conditions(num_subdomains, subdomain_ic_collocs, ic_func
     return cached_ic_values
 _register_module('methods.xpinn_decomposition', ['cache_xpinn_initial_conditions', 'generate_interface_points', 'generate_subdomain_collocation', 'get_exterior_boundary_info', 'get_interfaces', 'get_num_subdomains', 'get_subdomain_bounds', 'point_in_subdomain', 'setup_xpinn_collocation', 'setup_xpinn_devices', 'setup_xpinn_interfaces', 'setup_xpinn_networks', 'subdomain_idx_to_grid'])
 
-# ==== Module: numerical_solvers.LAX_2D (numerical_solvers/LAX_2D.py) ====
+# ==== Module: numerical_solvers.LAX (numerical_solvers/LAX.py) ====
 import numpy as np
 import os
 
@@ -2458,18 +2457,19 @@ import scipy
 
 ## For the FFT solver
 
-from numpy.fft import fft, ifft,fft2, ifft2
+from numpy.fft import fft, ifft, fft2, ifft2, fftn, ifftn
 from scipy import signal
 
 from config import RANDOM_SEED
 
 # Import wave vector components and physical constants for 2D sinusoidal perturbations
 try:
-    from config import KX, KY, cs, rho_o, const, G
+    from config import KX, KY, KZ, cs, rho_o, const, G
 except ImportError:
     # Fallback if config not available
     KX = 2*np.pi/5.0  # Default wavelength
     KY = 0.0
+    KZ = 0.0
     cs = 1.0
     rho_o = 1.0
     const = 1.0
@@ -2482,30 +2482,22 @@ def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amp
     """
     Generate 2D velocity components (vx, vy) with an isotropic power-law spectrum P(k) ~ k^{power_index}.
     
-    This function generates resolution-independent initial conditions by:
-    1. Synthesizing at fixed high resolution (1024x1024)
-    2. Applying power-law filter with sharp cutoff at target Nyquist frequency
-    3. Downsampling to target resolution via interpolation
-    
-    This ensures that N=300 and N=400 runs start with the same physical velocity field,
-    just sampled at different resolutions, making convergence studies meaningful.
+    This function generates velocity fields directly at the target resolution (nx, ny)
+    without any downsampling or cutoff strategies.
     """
-    # Use a fixed, high-resolution grid for synthesis to ensure resolution independence
-    hires_nx, hires_ny = 1024, 1024
-    
     if random_seed is not None:
         rng = np.random.default_rng(random_seed)
     else:
         rng = np.random.default_rng()
 
     def synthesize_component():
-        # 1. Generate random field at high resolution
-        field = rng.standard_normal((hires_nx, hires_ny))
+        # 1. Generate random field at target resolution
+        field = rng.standard_normal((nx, ny))
         F = fft2(field)
         
-        # 2. Construct k-space grid at high resolution
-        kx = 2 * np.pi * np.fft.fftfreq(hires_nx, d=Lx / hires_nx)
-        ky = 2 * np.pi * np.fft.fftfreq(hires_ny, d=Ly / hires_ny)
+        # 2. Construct k-space grid at target resolution
+        kx = 2 * np.pi * np.fft.fftfreq(nx, d=Lx / nx)
+        ky = 2 * np.pi * np.fft.fftfreq(ny, d=Ly / ny)
         kxg, kyg = np.meshgrid(kx, ky, indexing='ij')
         kk = np.sqrt(kxg**2 + kyg**2)
         kk[0, 0] = 1.0  # Avoid division by zero
@@ -2514,33 +2506,16 @@ def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amp
         filt = (kk) ** (power_index / 2.0)
         filt[kk == 0] = 0.0
         
-        # 4. KEY: Apply sharp cutoff at target Nyquist frequency to prevent aliasing
-        k_nyquist = np.pi * nx / Lx  # Target grid's Nyquist frequency
-        filt[kk > k_nyquist] = 0.0   # Remove unresolvable modes
-        
         F_filtered = F * filt
         
-        # 5. Transform back to real space at high resolution
-        comp_hires = np.real(ifft2(F_filtered))
+        # 4. Transform back to real space
+        comp = np.real(ifft2(F_filtered))
         
-        # 6. Normalize the high-resolution field
-        comp_hires -= np.mean(comp_hires)
-        std = np.std(comp_hires)
+        # 5. Normalize the field
+        comp -= np.mean(comp)
+        std = np.std(comp)
         if std > 0:
-            comp_hires = comp_hires * (amplitude / std)
-        
-        # 7. Downsample to target resolution via interpolation
-        from scipy.interpolate import RegularGridInterpolator
-        
-        x_hires = np.linspace(0, Lx, hires_nx, endpoint=False)
-        y_hires = np.linspace(0, Ly, hires_ny, endpoint=False)
-        x_lores = np.linspace(0, Lx, nx, endpoint=False)
-        y_lores = np.linspace(0, Ly, ny, endpoint=False)
-        
-        interp = RegularGridInterpolator((x_hires, y_hires), comp_hires, 
-                                        method='linear', bounds_error=False, fill_value=0.0)
-        X_lores, Y_lores = np.meshgrid(x_lores, y_lores, indexing='ij')
-        comp = interp((X_lores, Y_lores))
+            comp = comp * (amplitude / std)
         
         return comp
 
@@ -2629,6 +2604,24 @@ def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
 #     dphidx = np.gradient(phi, dx)
 #     dphidy = np.gradient(phi, dy)
 #     return phi,dphidx, dphidy 
+    return phi
+
+def fft_solver_3d(rho, Lx, nx, Ly, ny, Lz, nz):
+    """
+    FFT-based Poisson solver for 3D periodic domains.
+    """
+    dx = Lx / nx
+    dy = Ly / ny
+    dz = Lz / nz
+    rhohat = fftn(rho)
+    kx = 2 * np.pi * np.fft.fftfreq(nx, dx)
+    ky = 2 * np.pi * np.fft.fftfreq(ny, dy)
+    kz = 2 * np.pi * np.fft.fftfreq(nz, dz)
+    kx2, ky2, kz2 = np.meshgrid(kx**2, ky**2, kz**2, indexing='ij')
+    laplace = -(kx2 + ky2 + kz2)
+    laplace[laplace == 0] = 1e-9
+    phihat = rhohat / laplace
+    phi = np.real(ifftn(phihat))
     return phi
 
 def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,comparison =None,animation=None,
@@ -2954,6 +2947,136 @@ def lax_solution(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isplot = None,co
                 return rho0,vx0,rho_max
 
 
+def lax_solution_3d_sinusoidal(time, N, nu, lam, num_of_waves, rho_1, gravity=True):
+    """
+    3D LAX solver for sinusoidal perturbations with optional self-gravity.
+    Returns full 3D fields which can be sliced for visualization/comparison.
+    """
+    Lx = lam * num_of_waves
+    Ly = lam * num_of_waves
+    Lz = lam * num_of_waves
+    c_s = cs
+
+    Nx = Ny = Nz = int(N)
+    dx = float(Lx / Nx)
+    dy = float(Ly / Ny)
+    dz = float(Lz / Nz)
+
+    x = np.linspace(0, Lx, Nx, endpoint=False)
+    y = np.linspace(0, Ly, Ny, endpoint=False)
+    z = np.linspace(0, Lz, Nz, endpoint=False)
+    xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
+
+    rho0 = rho_o + rho_1 * np.cos(KX * xx + KY * yy + KZ * zz)
+
+    Px0 = np.zeros_like(rho0)
+    Py0 = np.zeros_like(rho0)
+    Pz0 = np.zeros_like(rho0)
+
+    if gravity:
+        jeans = np.sqrt(4*np.pi**2*c_s**2/(const*G*rho_o))
+        if lam >= jeans:
+            alpha = np.sqrt(const*G*rho_o-c_s**2*(2*np.pi/lam)**2)
+            v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+            wave_field = -v_1 * np.sin(KX * xx + KY * yy + KZ * zz)
+        else:
+            alpha = np.sqrt(c_s**2*(2*np.pi/lam)**2 - const*G*rho_o)
+            v_1 = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+            wave_field = v_1 * np.cos(KX * xx + KY * yy + KZ * zz)
+    else:
+        v_1 = (c_s * rho_1) / rho_o
+        wave_field = v_1 * np.cos(KX * xx + KY * yy + KZ * zz)
+
+    k_magnitude = np.sqrt(KX**2 + KY**2 + KZ**2)
+    if k_magnitude > 0:
+        vx0 = wave_field * (KX / k_magnitude)
+        vy0 = wave_field * (KY / k_magnitude)
+        vz0 = wave_field * (KZ / k_magnitude)
+    else:
+        vx0 = wave_field
+        vy0 = np.zeros_like(vx0)
+        vz0 = np.zeros_like(vx0)
+
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    Pz0 = rho0 * vz0
+
+    phi0 = np.zeros_like(rho0)
+    phi1 = np.zeros_like(rho0)
+    if gravity:
+        phi0 = fft_solver_3d(const*(rho0-rho_o), Lx, Nx, Ly, Ny, Lz, Nz)
+
+    t = 0.0
+    k_iter = 0
+    vmax_initial = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)), np.max(np.abs(vz0)), c_s)
+    dt = nu * dx / vmax_initial
+
+    while t < time:
+        if t + dt > time:
+            dt = time - t
+
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+        muz = dt / (2 * dz)
+
+        rho1 = (1/6)*(np.roll(rho0, -1, axis=0) + np.roll(rho0, 1, axis=0) +
+                      np.roll(rho0, -1, axis=1) + np.roll(rho0, 1, axis=1) +
+                      np.roll(rho0, -1, axis=2) + np.roll(rho0, 1, axis=2)) \
+               - mux*(np.roll(rho0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(rho0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+               - muy*(np.roll(rho0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(rho0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+               - muz*(np.roll(rho0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(rho0,1,axis=2)*np.roll(vz0,1,axis=2))
+
+        Px1 = (1/6)*(np.roll(Px0,-1,axis=0) + np.roll(Px0,1,axis=0) +
+                      np.roll(Px0,-1,axis=1) + np.roll(Px0,1,axis=1) +
+                      np.roll(Px0,-1,axis=2) + np.roll(Px0,1,axis=2)) \
+              - mux*(np.roll(Px0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(Px0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+              - muy*(np.roll(Px0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(Px0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+              - muz*(np.roll(Px0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(Px0,1,axis=2)*np.roll(vz0,1,axis=2)) \
+              - ((c_s**2)*mux*(np.roll(rho0,-1,axis=0) - np.roll(rho0,1,axis=0)))
+
+        Py1 = (1/6)*(np.roll(Py0,-1,axis=0) + np.roll(Py0,1,axis=0) +
+                      np.roll(Py0,-1,axis=1) + np.roll(Py0,1,axis=1) +
+                      np.roll(Py0,-1,axis=2) + np.roll(Py0,1,axis=2)) \
+              - muy*(np.roll(Py0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(Py0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+              - mux*(np.roll(Py0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(Py0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+              - muz*(np.roll(Py0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(Py0,1,axis=2)*np.roll(vz0,1,axis=2)) \
+              - ((c_s**2)*muy*(np.roll(rho0,-1,axis=1) - np.roll(rho0,1,axis=1)))
+
+        Pz1 = (1/6)*(np.roll(Pz0,-1,axis=0) + np.roll(Pz0,1,axis=0) +
+                      np.roll(Pz0,-1,axis=1) + np.roll(Pz0,1,axis=1) +
+                      np.roll(Pz0,-1,axis=2) + np.roll(Pz0,1,axis=2)) \
+              - muz*(np.roll(Pz0,-1,axis=2)*np.roll(vz0,-1,axis=2) - np.roll(Pz0,1,axis=2)*np.roll(vz0,1,axis=2)) \
+              - mux*(np.roll(Pz0,-1,axis=0)*np.roll(vx0,-1,axis=0) - np.roll(Pz0,1,axis=0)*np.roll(vx0,1,axis=0)) \
+              - muy*(np.roll(Pz0,-1,axis=1)*np.roll(vy0,-1,axis=1) - np.roll(Pz0,1,axis=1)*np.roll(vy0,1,axis=1)) \
+              - ((c_s**2)*muz*(np.roll(rho0,-1,axis=2) - np.roll(rho0,1,axis=2)))
+
+        if gravity:
+            Px1 -= mux * rho0 * (np.roll(phi0,-1,axis=0) - np.roll(phi0,1,axis=0))
+            Py1 -= muy * rho0 * (np.roll(phi0,-1,axis=1) - np.roll(phi0,1,axis=1))
+            Pz1 -= muz * rho0 * (np.roll(phi0,-1,axis=2) - np.roll(phi0,1,axis=2))
+            phi1 = fft_solver_3d(const*(rho1 - rho_o), Lx, Nx, Ly, Ny, Lz, Nz)
+
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        vz1 = Pz1 / rho1
+
+        rho0, vx0, vy0, vz0 = rho1, vx1, vy1, vz1
+        Px0, Py0, Pz0 = Px1, Py1, Pz1
+        if gravity:
+            phi0 = phi1
+
+        t += dt
+        k_iter += 1
+
+        vmax = max(np.max(np.abs(vx0)), np.max(np.abs(vy0)), np.max(np.abs(vz0)))
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+
+    rho_max = np.max(rho0)
+    return x, y, z, rho0, vx0, vy0, vz0, phi0, k_iter, rho_max
+
+
 def lax_solution_warm_start(rho_ic, vx_ic, vy_ic, x_grid, y_grid, 
                             t_start, t_end, nu=0.5, save_times=None, gravity=True):
     """
@@ -3223,22 +3346,22 @@ def lax_solution1D_sinusoidal(time,N,nu,lam,num_of_waves,rho_1,gravity=False,isp
                 return rho1, v1, rho_LT, rho_LT_max, rho_max, v_LT
             else:
                 return rho1, v1, rho_max
-_register_module('numerical_solvers.LAX_2D', ['fft_solver', 'generate_shared_velocity_field', 'generate_velocity_field_power_spectrum', 'lax_solution', 'lax_solution1D_sinusoidal', 'lax_solution_warm_start', 'lax_solution_with_shared_velocity'])
+_register_module('numerical_solvers.LAX', ['fft_solver', 'fft_solver_3d', 'generate_shared_velocity_field', 'generate_velocity_field_power_spectrum', 'lax_solution', 'lax_solution1D_sinusoidal', 'lax_solution_3d_sinusoidal', 'lax_solution_warm_start', 'lax_solution_with_shared_velocity'])
 
-# ==== Module: numerical_solvers.LAX_2D_torch (numerical_solvers/LAX_2D_torch.py) ====
+# ==== Module: numerical_solvers.LAX_torch (numerical_solvers/LAX_torch.py) ====
 import numpy as np
 import torch
-from config import cs, rho_o, const, G, KX, KY
+from config import cs, rho_o, const, G, KX, KY, KZ
 
 # Device setup - check at module import
 has_gpu = torch.cuda.is_available()
 device = torch.device("cuda:0" if has_gpu else "cpu")
 dtype = torch.float64
 if has_gpu:
-    print(f"LAX_2D_torch: GPU available, using device: {device}")
+    print(f"LAX_torch: GPU available, using device: {device}")
     print(f"  GPU name: {torch.cuda.get_device_name(0)}")
 else:
-    print(f"LAX_2D_torch: No GPU available, using device: {device}")
+    print(f"LAX_torch: No GPU available, using device: {device}")
 
 def fft_solver_torch(rho, Lx, nx, Ly, ny):
     """
@@ -3273,21 +3396,28 @@ def fft_solver_torch(rho, Lx, nx, Ly, ny):
     
     return phi
 
+def fft_solver_torch_3d(rho, Lx, nx, Ly, ny, Lz, nz):
+    dx = Lx / nx
+    dy = Ly / ny
+    dz = Lz / nz
+    rhohat = torch.fft.fftn(rho)
+    kx = 2 * np.pi * torch.fft.fftfreq(nx, d=dx).to(device)
+    ky = 2 * np.pi * torch.fft.fftfreq(ny, d=dy).to(device)
+    kz = 2 * np.pi * torch.fft.fftfreq(nz, d=dz).to(device)
+    kx2, ky2, kz2 = torch.meshgrid(kx**2, ky**2, kz**2, indexing='ij')
+    laplace = -(kx2 + ky2 + kz2)
+    laplace = torch.where(laplace == 0, torch.tensor(1e-9, device=device, dtype=dtype), laplace)
+    phihat = rhohat / laplace
+    phi = torch.real(torch.fft.ifftn(phihat))
+    return phi
+
 def generate_velocity_field_power_spectrum_torch(nx, ny, Lx, Ly, power_index=-3.0, amplitude=0.02, random_seed=None):
     """
     PyTorch implementation for generating a 2D velocity field with a power-law spectrum.
     
-    This function generates resolution-independent initial conditions by:
-    1. Synthesizing at fixed high resolution (1024x1024)
-    2. Applying power-law filter with sharp cutoff at target Nyquist frequency
-    3. Downsampling to target resolution via interpolation
-    
-    This ensures that N=300 and N=400 runs start with the same physical velocity field,
-    just sampled at different resolutions, making convergence studies meaningful.
+    This function generates velocity fields directly at the target resolution (nx, ny)
+    without any downsampling or cutoff strategies.
     """
-    # Use a fixed, high-resolution grid for synthesis to ensure resolution independence
-    hires_nx, hires_ny = 1024, 1024
-    
     # Use NumPy's random generator for consistency with CPU solver
     if random_seed is not None:
         rng = np.random.default_rng(random_seed)
@@ -3295,14 +3425,14 @@ def generate_velocity_field_power_spectrum_torch(nx, ny, Lx, Ly, power_index=-3.
         rng = np.random.default_rng()
 
     def synthesize_component():
-        # 1. Generate random field at high resolution using NumPy (for consistency)
-        field_np = rng.standard_normal((hires_nx, hires_ny))
+        # 1. Generate random field at target resolution using NumPy (for consistency)
+        field_np = rng.standard_normal((nx, ny))
         field = torch.from_numpy(field_np).to(device=device, dtype=dtype)
         F = torch.fft.fft2(field)
         
-        # 2. Construct k-space grid at high resolution
-        kx = 2 * np.pi * torch.fft.fftfreq(hires_nx, d=Lx / hires_nx).to(device)
-        ky = 2 * np.pi * torch.fft.fftfreq(hires_ny, d=Ly / hires_ny).to(device)
+        # 2. Construct k-space grid at target resolution
+        kx = 2 * np.pi * torch.fft.fftfreq(nx, d=Lx / nx).to(device)
+        ky = 2 * np.pi * torch.fft.fftfreq(ny, d=Ly / ny).to(device)
         kxg, kyg = torch.meshgrid(kx, ky, indexing='ij')
         
         kk = torch.sqrt(kxg**2 + kyg**2)
@@ -3312,38 +3442,16 @@ def generate_velocity_field_power_spectrum_torch(nx, ny, Lx, Ly, power_index=-3.
         filt = kk**(power_index / 2.0)
         filt[kk == 0] = 0.0
         
-        # 4. KEY: Apply sharp cutoff at target Nyquist frequency to prevent aliasing
-        k_nyquist = np.pi * nx / Lx  # Target grid's Nyquist frequency
-        filt[kk > k_nyquist] = 0.0   # Remove unresolvable modes
-        
         F_filtered = F * filt
         
-        # 5. Transform back to real space at high resolution
-        comp_hires = torch.real(torch.fft.ifft2(F_filtered))
+        # 4. Transform back to real space
+        comp = torch.real(torch.fft.ifft2(F_filtered))
         
-        # 6. Normalize the high-resolution field
-        comp_hires -= torch.mean(comp_hires)
-        std = torch.std(comp_hires)
+        # 5. Normalize the field
+        comp -= torch.mean(comp)
+        std = torch.std(comp)
         if std > 0:
-            comp_hires = comp_hires * (amplitude / std)
-        
-        # 7. Downsample to target resolution via interpolation
-        # Convert to NumPy for interpolation (scipy doesn't work with torch tensors)
-        comp_hires_np = comp_hires.cpu().numpy()
-        
-        from scipy.interpolate import RegularGridInterpolator
-        x_hires = np.linspace(0, Lx, hires_nx, endpoint=False)
-        y_hires = np.linspace(0, Ly, hires_ny, endpoint=False)
-        x_lores = np.linspace(0, Lx, nx, endpoint=False)
-        y_lores = np.linspace(0, Ly, ny, endpoint=False)
-        
-        interp = RegularGridInterpolator((x_hires, y_hires), comp_hires_np, 
-                                        method='linear', bounds_error=False, fill_value=0.0)
-        X_lores, Y_lores = np.meshgrid(x_lores, y_lores, indexing='ij')
-        comp_np = interp((X_lores, Y_lores))
-        
-        # Convert back to torch tensor
-        comp = torch.from_numpy(comp_np).to(device=device, dtype=dtype)
+            comp = comp * (amplitude / std)
         
         return comp
 
@@ -3529,6 +3637,139 @@ def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False,
     return x.cpu().numpy(), rho0.cpu().numpy(), vx0.cpu().numpy(), vy0.cpu().numpy(), None, n, rho_max
 
 
+def lax_solution_3d_sinusoidal_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=True):
+    current_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    Nx = Ny = Nz = int(N)
+    Lx = Ly = Lz = lam * num_of_waves
+    dx = float(Lx / Nx)
+    dy = float(Ly / Ny)
+    dz = float(Lz / Nz)
+    c_s = cs
+
+    x = torch.linspace(0, Lx, Nx+1, device=device, dtype=dtype)[:-1]
+    y = torch.linspace(0, Ly, Ny+1, device=device, dtype=dtype)[:-1]
+    z = torch.linspace(0, Lz, Nz+1, device=device, dtype=dtype)[:-1]
+    xx, yy, zz = torch.meshgrid(x, y, z, indexing='ij')
+
+    rho0 = rho_o + rho_1 * torch.cos(torch.tensor(KX, device=device, dtype=dtype) * xx +
+                                     torch.tensor(KY, device=device, dtype=dtype) * yy +
+                                     torch.tensor(KZ, device=device, dtype=dtype) * zz)
+
+    Px0 = rho0 * 0
+    Py0 = rho0 * 0
+    Pz0 = rho0 * 0
+
+    if gravity:
+        jeans = torch.sqrt(torch.tensor(4*np.pi**2*cs**2/(const*G*rho_o), device=device, dtype=dtype))
+        if lam >= jeans.item():
+            alpha = torch.sqrt(torch.tensor(const*G*rho_o-cs**2*(2*np.pi/lam)**2, device=device, dtype=dtype))
+            v_1  = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+            wave_field = -v_1 * torch.sin(torch.tensor(KX, device=device, dtype=dtype) * xx +
+                                          torch.tensor(KY, device=device, dtype=dtype) * yy +
+                                          torch.tensor(KZ, device=device, dtype=dtype) * zz)
+        else:
+            alpha = torch.sqrt(torch.tensor(cs**2*(2*np.pi/lam)**2 - const*G*rho_o, device=device, dtype=dtype))
+            v_1 = (rho_1/rho_o) * (alpha/(2*np.pi/lam))
+            wave_field = v_1 * torch.cos(torch.tensor(KX, device=device, dtype=dtype) * xx +
+                                         torch.tensor(KY, device=device, dtype=dtype) * yy +
+                                         torch.tensor(KZ, device=device, dtype=dtype) * zz)
+    else:
+        v_1 = (cs * rho_1) / rho_o
+        wave_field = v_1 * torch.cos(torch.tensor(KX, device=device, dtype=dtype) * xx +
+                                     torch.tensor(KY, device=device, dtype=dtype) * yy +
+                                     torch.tensor(KZ, device=device, dtype=dtype) * zz)
+
+    k_mag = np.sqrt(KX**2 + KY**2 + KZ**2)
+    if k_mag > 0:
+        vx0 = wave_field * (KX / k_mag)
+        vy0 = wave_field * (KY / k_mag)
+        vz0 = wave_field * (KZ / k_mag)
+    else:
+        vx0 = wave_field
+        vy0 = torch.zeros_like(vx0)
+        vz0 = torch.zeros_like(vx0)
+
+    Px0 = rho0 * vx0
+    Py0 = rho0 * vy0
+    Pz0 = rho0 * vz0
+
+    phi0 = torch.zeros_like(rho0)
+    phi1 = torch.zeros_like(rho0)
+    if gravity:
+        phi0 = fft_solver_torch_3d(const*(rho0-rho_o), Lx, Nx, Ly, Ny, Lz, Nz)
+
+    t_val = 0.0
+    k_iter = 0
+    vmax_initial = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item(), torch.max(torch.abs(vz0)).item(), cs)
+    dt = nu * dx / vmax_initial
+
+    while t_val < time_val:
+        if t_val + dt > time_val:
+            dt = time_val - t_val
+
+        mux = dt / (2 * dx)
+        muy = dt / (2 * dy)
+        muz = dt / (2 * dz)
+
+        rho1 = (1/6)*(torch.roll(rho0,-1,0) + torch.roll(rho0,1,0) +
+                      torch.roll(rho0,-1,1) + torch.roll(rho0,1,1) +
+                      torch.roll(rho0,-1,2) + torch.roll(rho0,1,2)) \
+               - mux*(torch.roll(rho0,-1,0)*torch.roll(vx0,-1,0) - torch.roll(rho0,1,0)*torch.roll(vx0,1,0)) \
+               - muy*(torch.roll(rho0,-1,1)*torch.roll(vy0,-1,1) - torch.roll(rho0,1,1)*torch.roll(vy0,1,1)) \
+               - muz*(torch.roll(rho0,-1,2)*torch.roll(vz0,-1,2) - torch.roll(rho0,1,2)*torch.roll(vz0,1,2))
+
+        Px1 = (1/6)*(torch.roll(Px0,-1,0) + torch.roll(Px0,1,0) +
+                      torch.roll(Px0,-1,1) + torch.roll(Px0,1,1) +
+                      torch.roll(Px0,-1,2) + torch.roll(Px0,1,2)) \
+              - mux*(torch.roll(Px0,-1,0)*torch.roll(vx0,-1,0) - torch.roll(Px0,1,0)*torch.roll(vx0,1,0)) \
+              - muy*(torch.roll(Px0,-1,1)*torch.roll(vy0,-1,1) - torch.roll(Px0,1,1)*torch.roll(vy0,1,1)) \
+              - muz*(torch.roll(Px0,-1,2)*torch.roll(vz0,-1,2) - torch.roll(Px0,1,2)*torch.roll(vz0,1,2)) \
+              - ((c_s**2)*mux*(torch.roll(rho0,-1,0) - torch.roll(rho0,1,0)))
+
+        Py1 = (1/6)*(torch.roll(Py0,-1,0) + torch.roll(Py0,1,0) +
+                      torch.roll(Py0,-1,1) + torch.roll(Py0,1,1) +
+                      torch.roll(Py0,-1,2) + torch.roll(Py0,1,2)) \
+              - muy*(torch.roll(Py0,-1,1)*torch.roll(vy0,-1,1) - torch.roll(Py0,1,1)*torch.roll(vy0,1,1)) \
+              - mux*(torch.roll(Py0,-1,0)*torch.roll(vx0,-1,0) - torch.roll(Py0,1,0)*torch.roll(vx0,1,0)) \
+              - muz*(torch.roll(Py0,-1,2)*torch.roll(vz0,-1,2) - torch.roll(Py0,1,2)*torch.roll(vz0,1,2)) \
+              - ((c_s**2)*muy*(torch.roll(rho0,-1,1) - torch.roll(rho0,1,1)))
+
+        Pz1 = (1/6)*(torch.roll(Pz0,-1,0) + torch.roll(Pz0,1,0) +
+                      torch.roll(Pz0,-1,1) + torch.roll(Pz0,1,1) +
+                      torch.roll(Pz0,-1,2) + torch.roll(Pz0,1,2)) \
+              - muz*(torch.roll(Pz0,-1,2)*torch.roll(vz0,-1,2) - torch.roll(Pz0,1,2)*torch.roll(vz0,1,2)) \
+              - mux*(torch.roll(Pz0,-1,0)*torch.roll(vx0,-1,0) - torch.roll(Pz0,1,0)*torch.roll(vx0,1,0)) \
+              - muy*(torch.roll(Pz0,-1,1)*torch.roll(vy0,-1,1) - torch.roll(Pz0,1,1)*torch.roll(vy0,1,1)) \
+              - ((c_s**2)*muz*(torch.roll(rho0,-1,2) - torch.roll(rho0,1,2)))
+
+        if gravity:
+            Px1 -= mux * rho0 * (torch.roll(phi0,-1,0) - torch.roll(phi0,1,0))
+            Py1 -= muy * rho0 * (torch.roll(phi0,-1,1) - torch.roll(phi0,1,1))
+            Pz1 -= muz * rho0 * (torch.roll(phi0,-1,2) - torch.roll(phi0,1,2))
+            phi1 = fft_solver_torch_3d(const*(rho1 - rho_o), Lx, Nx, Ly, Ny, Lz, Nz)
+
+        vx1 = Px1 / rho1
+        vy1 = Py1 / rho1
+        vz1 = Pz1 / rho1
+
+        rho0, vx0, vy0, vz0 = rho1, vx1, vy1, vz1
+        Px0, Py0, Pz0 = Px1, Py1, Pz1
+        if gravity:
+            phi0 = phi1
+
+        t_val += dt
+        k_iter += 1
+        vmax = max(torch.max(torch.abs(vx0)).item(), torch.max(torch.abs(vy0)).item(), torch.max(torch.abs(vz0)).item())
+        dt1 = nu * dx / vmax if vmax > 1e-9 else float('inf')
+        dt2 = nu * dx / c_s
+        dt = min(dt1, dt2)
+
+    rho_max = torch.max(rho0).item()
+    return (x.cpu().numpy(), y.cpu().numpy(), z.cpu().numpy(),
+            rho0.detach().cpu().numpy(), vx0.detach().cpu().numpy(),
+            vy0.detach().cpu().numpy(), vz0.detach().cpu().numpy(),
+            phi0.detach().cpu().numpy() if gravity else None, k_iter, rho_max)
+
 def lax_solution_warm_start_torch(rho_ic, vx_ic, vy_ic, x_grid, y_grid, 
                                    t_start, t_end, nu=0.5, save_times=None, gravity=True):
     """
@@ -3706,7 +3947,7 @@ def lax_solution_warm_start_torch(rho_ic, vx_ic, vy_ic, x_grid, y_grid,
         )
     
     return snapshots
-_register_module('numerical_solvers.LAX_2D_torch', ['device', 'dtype', 'fft_solver_torch', 'generate_velocity_field_power_spectrum_torch', 'has_gpu', 'lax_solution_torch', 'lax_solution_warm_start_torch'])
+_register_module('numerical_solvers.LAX_torch', ['device', 'dtype', 'fft_solver_torch', 'fft_solver_torch_3d', 'generate_velocity_field_power_spectrum_torch', 'has_gpu', 'lax_solution_3d_sinusoidal_torch', 'lax_solution_torch', 'lax_solution_warm_start_torch'])
 
 # ==== Module: utilities.training_diagnostics (utilities/training_diagnostics.py) ====
 import os
@@ -3772,74 +4013,100 @@ class TrainingDiagnostics:
                 self.history['mean_residual'].append(float(np.nanmean(np.abs(res_np))))
                 self.history['max_residual'].append(float(np.nanmax(np.abs(res_np))))
 
-    def plot_diagnostics(self, iteration):
-        """Generate diagnostic plots at this iteration."""
-        fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+    def plot_diagnostics(self, iteration=None):
+        """Generate all diagnostic plots as separate files. Call at the end of training."""
+        if len(self.history['iteration']) == 0:
+            print("No diagnostic data to plot.")
+            return
+        
         iters = self.history['iteration']
+        suffix = f"_iter_{iteration}" if iteration is not None else "_final"
 
         # Plot 1: Loss evolution
-        axes[0, 0].semilogy(iters, self.history['total_loss'], 'b-', linewidth=2, label='Total')
-        axes[0, 0].semilogy(iters, self.history['pde_loss'], 'r-', linewidth=2, label='PDE')
-        axes[0, 0].semilogy(iters, self.history['ic_loss'], 'g-', linewidth=2, label='IC')
-        axes[0, 0].set_xlabel('Iteration')
-        axes[0, 0].set_ylabel('Loss (log scale)')
-        axes[0, 0].set_title('Loss Components')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.semilogy(iters, self.history['total_loss'], 'b-', linewidth=2, label='Total')
+        ax.semilogy(iters, self.history['pde_loss'], 'r-', linewidth=2, label='PDE')
+        ax.semilogy(iters, self.history['ic_loss'], 'g-', linewidth=2, label='IC')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('Loss (log scale)')
+        ax.set_title('Loss Components')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{self.save_dir}/loss_components{suffix}.png', dpi=120, bbox_inches='tight')
+        plt.close()
 
         # Plot 2: Loss ratio (PDE/IC)
+        fig, ax = plt.subplots(figsize=(8, 6))
         ic_arr = np.array(self.history['ic_loss'])
         pde_arr = np.array(self.history['pde_loss'])
         ratio = pde_arr / (ic_arr + 1e-10)
-        axes[0, 1].plot(iters, ratio, 'purple', linewidth=2)
-        axes[0, 1].axhline(1.0, color='k', linestyle='--', label='Balanced')
-        axes[0, 1].set_xlabel('Iteration')
-        axes[0, 1].set_ylabel('PDE Loss / IC Loss')
-        axes[0, 1].set_title('Loss Balance (Should be ~1)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
+        ax.plot(iters, ratio, 'purple', linewidth=2)
+        ax.axhline(1.0, color='k', linestyle='--', label='Balanced')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('PDE Loss / IC Loss')
+        ax.set_title('Loss Balance (Should be ~1)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{self.save_dir}/loss_balance{suffix}.png', dpi=120, bbox_inches='tight')
+        plt.close()
 
         # Plot 3: Density statistics
-        axes[1, 0].plot(iters, self.history['mean_rho'], 'b-', linewidth=2, label='Mean ρ')
-        axes[1, 0].plot(iters, self.history['max_rho'], 'r-', linewidth=2, label='Max ρ')
-        axes[1, 0].set_xlabel('Iteration')
-        axes[1, 0].set_ylabel('Density')
-        axes[1, 0].set_title('Density Evolution')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(iters, self.history['mean_rho'], 'b-', linewidth=2, label='Mean ρ')
+        ax.plot(iters, self.history['max_rho'], 'r-', linewidth=2, label='Max ρ')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('Density')
+        ax.set_title('Density Evolution')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{self.save_dir}/density_evolution{suffix}.png', dpi=120, bbox_inches='tight')
+        plt.close()
 
         # Plot 4: Max density growth rate
         if len(self.history['max_rho']) > 10:
+            fig, ax = plt.subplots(figsize=(8, 6))
             growth_rate = np.diff(self.history['max_rho'])
-            axes[1, 1].plot(iters[1:], growth_rate, 'orange', linewidth=2)
-            axes[1, 1].axhline(0, color='k', linestyle='--')
-            axes[1, 1].set_xlabel('Iteration')
-            axes[1, 1].set_ylabel('Δ(Max ρ)')
-            axes[1, 1].set_title('Density Growth Rate (Should be positive)')
-            axes[1, 1].grid(True, alpha=0.3)
+            ax.plot(iters[1:], growth_rate, 'orange', linewidth=2)
+            ax.axhline(0, color='k', linestyle='--')
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel('Δ(Max ρ)')
+            ax.set_title('Density Growth Rate (Should be positive)')
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(f'{self.save_dir}/density_growth_rate{suffix}.png', dpi=120, bbox_inches='tight')
+            plt.close()
 
         # Plot 5: Gradient magnitude
-        axes[2, 0].semilogy(iters, self.history['mean_grad_rho'], 'b-', linewidth=2, label='Mean')
-        axes[2, 0].semilogy(iters, self.history['max_grad_rho'], 'r-', linewidth=2, label='Max')
-        axes[2, 0].set_xlabel('Iteration')
-        axes[2, 0].set_ylabel('Gradient Magnitude (log)')
-        axes[2, 0].set_title('Density Gradients')
-        axes[2, 0].legend()
-        axes[2, 0].grid(True, alpha=0.3)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.semilogy(iters, self.history['mean_grad_rho'], 'b-', linewidth=2, label='Mean')
+        ax.semilogy(iters, self.history['max_grad_rho'], 'r-', linewidth=2, label='Max')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('Gradient Magnitude (log)')
+        ax.set_title('Density Gradients')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{self.save_dir}/density_gradients{suffix}.png', dpi=120, bbox_inches='tight')
+        plt.close()
 
         # Plot 6: Residual statistics (if available)
         if len(self.history['mean_residual']) > 0:
-            axes[2, 1].semilogy(iters, self.history['mean_residual'], 'b-', linewidth=2, label='Mean')
-            axes[2, 1].semilogy(iters, self.history['max_residual'], 'r-', linewidth=2, label='Max')
-            axes[2, 1].set_xlabel('Iteration')
-            axes[2, 1].set_ylabel('Residual Magnitude (log)')
-            axes[2, 1].set_title('PDE Residuals')
-            axes[2, 1].legend()
-            axes[2, 1].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(f'{self.save_dir}/diagnostics_iter_{iteration}.png', dpi=120, bbox_inches='tight')
-        plt.close()
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.semilogy(iters, self.history['mean_residual'], 'b-', linewidth=2, label='Mean')
+            ax.semilogy(iters, self.history['max_residual'], 'r-', linewidth=2, label='Max')
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel('Residual Magnitude (log)')
+            ax.set_title('PDE Residuals')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(f'{self.save_dir}/pde_residuals{suffix}.png', dpi=120, bbox_inches='tight')
+            plt.close()
+        
+        print(f"Diagnostic plots saved to {self.save_dir}")
 _register_module('utilities.training_diagnostics', ['TrainingDiagnostics'])
 
 # ==== Module: training.physics (training/physics.py) ====
@@ -3855,14 +4122,14 @@ from core.data_generator import diff
 from core.model_architecture import PINN
 from methods.causal_training import compute_causal_weights_static
 from core.initial_conditions import (initialize_shared_velocity_fields, generate_power_spectrum_field, 
-                                     generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, func)
+                                     generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0, func)
 from config import cs, const, G, rho_o, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
 from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
 
 
 # ==================== Physics Calculations and Loss Functions ====================
 
-def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, fd_data=None, fd_weight=0.0):
+def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, fd_data=None, fd_weight=0.0, fd_batch_size=None, data_terms=None):
 
     ############## Loss based on initial conditions ###############
     rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
@@ -3873,7 +4140,7 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
 
     elif model.dimension == 3:
         vy_0  = fun_vy_0(lam, jeans, v_1, collocation_IC)
-        vz_0  = func(collocation_IC)
+        vz_0  = fun_vz_0(lam, jeans, v_1, collocation_IC)
     
     net_ic_out = net(collocation_IC)
 
@@ -3962,7 +4229,7 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
             rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
             vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
             vy0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
-            vz0 = func(collocation_IC)
+            vz0 = fun_vz_0(lam, jeans, v_1, collocation_IC)
             dvx_dx = diff(vx0, x_ic, order=1)
             dvy_dy = diff(vy0, y_ic, order=1)
             dvz_dz = diff(vz0, z_ic, order=1)
@@ -4063,46 +4330,22 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
 
-    fd_loss_value = None
+    data_terms_full = []
     if fd_data is not None and fd_weight > 0:
-        required_keys = {'x', 't'}
-        if required_keys.issubset(fd_data.keys()):
-            fd_inputs = [fd_data['x']]
-            if 'y' in fd_data and fd_data['y'] is not None:
-                fd_inputs.append(fd_data['y'])
-            if 'z' in fd_data and fd_data['z'] is not None:
-                fd_inputs.append(fd_data['z'])
-            fd_inputs.append(fd_data['t'])
+        data_terms_full.append({
+            'dataset': fd_data,
+            'weight': fd_weight,
+            'batch_size': fd_batch_size,
+            'label': 'FD_DATA'
+        })
+    if data_terms:
+        data_terms_full.extend(data_terms)
 
-            fd_outputs = net(fd_inputs)
-
-            loss_sum = 0.0
-            component_count = 0
-
-            if fd_data.get('rho') is not None:
-                rho_fd_pred = fd_outputs[:, 0:1]
-                loss_sum = loss_sum + torch.mean((rho_fd_pred - fd_data['rho']) ** 2)
-                component_count += 1
-
-            if fd_data.get('vx') is not None:
-                vx_fd_pred = fd_outputs[:, 1:2]
-                loss_sum = loss_sum + torch.mean((vx_fd_pred - fd_data['vx']) ** 2)
-                component_count += 1
-
-            if fd_data.get('vy') is not None and fd_outputs.size(1) >= 3:
-                vy_fd_pred = fd_outputs[:, 2:3]
-                loss_sum = loss_sum + torch.mean((vy_fd_pred - fd_data['vy']) ** 2)
-                component_count += 1
-
-            if component_count > 0:
-                data_loss_unweighted = loss_sum / component_count
-                fd_loss_value = fd_weight * data_loss_unweighted
-                loss = loss + fd_loss_value
-        else:
-            fd_loss_value = None
-
-    if fd_loss_value is not None:
-        loss_breakdown['FD_DATA'] = fd_loss_value.item()
+    data_loss_tensor, data_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms_full)
+    if data_loss_tensor is not None:
+        loss = loss + data_loss_tensor
+        for label, value in data_breakdown.items():
+            loss_breakdown[label] = value
 
     return loss, loss_breakdown
 
@@ -4118,15 +4361,100 @@ def _make_batch_tensors(tensors_list, indices):
     return [t[indices] for t in tensors_list]
 
 
+def _sample_data_term(dataset, batch_size):
+    if dataset is None or dataset.get('x') is None or dataset.get('t') is None:
+        return None
+    count = int(dataset.get('count', dataset['x'].shape[0]))
+    if count <= 0:
+        return None
+    device = dataset['x'].device
+    bs = batch_size if batch_size is not None else count
+    bs = max(1, min(int(bs), count))
+    indices = _random_batch_indices(count, bs, device)
+
+    def _slice(key):
+        tensor = dataset.get(key)
+        if tensor is None:
+            return None
+        return tensor[indices]
+
+    return {
+        'x': _slice('x'),
+        'y': _slice('y'),
+        'z': _slice('z'),
+        't': _slice('t'),
+        'rho': _slice('rho'),
+        'vx': _slice('vx'),
+        'vy': _slice('vy'),
+        'phi': _slice('phi'),
+    }
+
+
+def _compute_data_loss_unweighted(net, batch, mse_cost_function):
+    if batch is None or batch['x'] is None or batch['t'] is None:
+        return None
+
+    inputs = [batch['x']]
+    if batch.get('y') is not None:
+        inputs.append(batch['y'])
+    if batch.get('z') is not None:
+        inputs.append(batch['z'])
+    inputs.append(batch['t'])
+
+    outputs = net(inputs)
+    num_outputs = outputs.shape[1]
+
+    component_specs = [
+        ('rho', 0),
+        ('vx', 1),
+        ('vy', 2),
+        ('phi', 3),
+    ]
+
+    losses = []
+    for key, idx in component_specs:
+        target = batch.get(key)
+        if target is None or idx >= num_outputs:
+            continue
+        pred = outputs[:, idx:idx+1]
+        losses.append(mse_cost_function(pred, target))
+
+    if not losses:
+        return None
+    return sum(losses) / len(losses)
+
+
+def _evaluate_data_terms(net, mse_cost_function, data_terms):
+    if not data_terms:
+        return None, {}
+
+    total_loss = None
+    breakdown = {}
+
+    for term in data_terms:
+        dataset = term.get('dataset')
+        weight = float(term.get('weight', 0.0) or 0.0)
+        if dataset is None or weight <= 0:
+            continue
+        batch = _sample_data_term(dataset, term.get('batch_size'))
+        data_loss = _compute_data_loss_unweighted(net, batch, mse_cost_function)
+        if data_loss is None:
+            continue
+        weighted_loss = weight * data_loss
+        total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
+        label = term.get('label', 'DATA')
+        breakdown[label] = breakdown.get(label, 0.0) + float(weighted_loss.detach().cpu())
+
+    return total_loss, breakdown
+
+
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, fd_data=None, fd_weight=0.0, fd_batch_size=None, use_fft_poisson=None):
+                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, fd_data=None, fd_weight=0.0, fd_batch_size=None, use_fft_poisson=None, data_terms=None):
     """
     Batched closure function for training with optional causal weighting.
     
     This function computes losses over mini-batches and optionally applies causal weights.
     """
-    last_fd_loss = None
-
     # Aggregate losses across mini-batches
     total_loss = 0.0
     num_effective_batches = 0
@@ -4141,6 +4469,19 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         device = collocation_domain.device
     
     ic_n = collocation_IC[0].size(0)
+
+    data_terms_full = []
+    if fd_data is not None and fd_weight > 0:
+        data_terms_full.append({
+            'dataset': fd_data,
+            'weight': fd_weight,
+            'batch_size': fd_batch_size if fd_batch_size is not None else batch_size,
+            'label': 'FD_DATA'
+        })
+    if data_terms:
+        data_terms_full.extend(data_terms)
+
+    last_data_breakdown = {}
 
     for _ in range(int(max(1, num_batches))):
         dom_idx = _random_batch_indices(dom_n, batch_size, device)
@@ -4168,7 +4509,7 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
             vy_ic_out = net_ic_out[:,2:3]
         elif model.dimension == 3:
             vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-            vz_0 = func(batch_ic)
+            vz_0 = fun_vz_0(lam, jeans, v_1, batch_ic)
             vy_ic_out = net_ic_out[:,2:3]
             vz_ic_out = net_ic_out[:,3:4]
 
@@ -4242,7 +4583,7 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
                 vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
                 vy0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-                vz0 = func(batch_ic)
+                vz0 = fun_vz_0(lam, jeans, v_1, batch_ic)
                 dvx_dx = diff(vx0, x_ic, order=1)
                 dvy_dy = diff(vy0, y_ic, order=1)
                 dvz_dz = diff(vz0, z_ic, order=1)
@@ -4326,48 +4667,11 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 else:
                     residual_tracker.update_residuals(t_dom, [rho_r, vx_r, vy_r, vz_r, phi_r])
 
-        fd_loss_batch = None
-        if fd_data is not None and fd_weight > 0:
-            total_fd = fd_data.get('count', 0)
-            if total_fd > 0:
-                effective_fd_batch = int(fd_batch_size or batch_size)
-                effective_fd_batch = max(1, min(effective_fd_batch, total_fd))
-                fd_idx = _random_batch_indices(total_fd, effective_fd_batch, fd_data['x'].device)
-
-                fd_inputs = [fd_data['x'][fd_idx]]
-                if 'y' in fd_data and fd_data['y'] is not None:
-                    fd_inputs.append(fd_data['y'][fd_idx])
-                if 'z' in fd_data and fd_data.get('z') is not None:
-                    fd_inputs.append(fd_data['z'][fd_idx])
-                fd_inputs.append(fd_data['t'][fd_idx])
-
-                fd_outputs = net(fd_inputs)
-
-                loss_sum = 0.0
-                component_count = 0
-
-                if fd_data.get('rho') is not None:
-                    rho_fd_pred = fd_outputs[:, 0:1]
-                    loss_sum = loss_sum + torch.mean((rho_fd_pred - fd_data['rho'][fd_idx]) ** 2)
-                    component_count += 1
-
-                if fd_data.get('vx') is not None:
-                    vx_fd_pred = fd_outputs[:, 1:2]
-                    loss_sum = loss_sum + torch.mean((vx_fd_pred - fd_data['vx'][fd_idx]) ** 2)
-                    component_count += 1
-
-                if fd_data.get('vy') is not None and fd_outputs.size(1) >= 3:
-                    vy_fd_pred = fd_outputs[:, 2:3]
-                    loss_sum = loss_sum + torch.mean((vy_fd_pred - fd_data['vy'][fd_idx]) ** 2)
-                    component_count += 1
-
-                if component_count > 0:
-                    data_loss_unweighted = loss_sum / component_count
-                    fd_loss_batch = fd_weight * data_loss_unweighted
-                    loss = loss + fd_loss_batch
-
-        if fd_loss_batch is not None:
-            last_fd_loss = fd_loss_batch
+        if data_terms_full:
+            data_loss_batch, batch_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms_full)
+            if data_loss_batch is not None:
+                loss = loss + data_loss_batch
+                last_data_breakdown = batch_breakdown
 
         total_loss = total_loss + loss
         num_effective_batches += 1
@@ -4414,8 +4718,8 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
     
-    if last_fd_loss is not None:
-        loss_breakdown['FD_DATA'] = last_fd_loss.item()
+    for label, value in last_data_breakdown.items():
+        loss_breakdown[label] = value
 
     return avg_loss, loss_breakdown
 
@@ -4562,7 +4866,7 @@ def closure_xpinn_batched(xpinn_loss_model, nets, subdomain_collocs, interface_c
     # Note: batch_loss_dict is already computed from the last batch iteration above
     
     return total_loss, batch_loss_dict
-_register_module('training.physics', ['_make_batch_tensors', '_random_batch_indices', 'closure', 'closure_batched', 'closure_xpinn', 'closure_xpinn_batched'])
+_register_module('training.physics', ['_compute_data_loss_unweighted', '_evaluate_data_terms', '_make_batch_tensors', '_random_batch_indices', '_sample_data_term', 'closure', 'closure_batched', 'closure_xpinn', 'closure_xpinn_batched'])
 
 # ==== Module: training.trainer (training/trainer.py) ====
 """
@@ -4578,7 +4882,7 @@ from config import DECAY_PORTION, BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGN
 from training.physics import closure_batched
 
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, fd_data=None, fd_weight=0.0, fd_batch_size=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, fd_data=None, fd_weight=0.0, fd_batch_size=None, data_terms=None):
     """
     Standard training loop for single PINN.
     
@@ -4605,6 +4909,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         causal_mode: Causal training mode
         residual_tracker: Residual tracker for adaptive causal weighting
         window_idx: Current curriculum window index
+        data_terms: Optional list of additional supervised datasets with weights
     """
     # Batched training is the default
     total_steps = iteration_adam + iterationL
@@ -4629,7 +4934,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
         startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=True))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=True, data_terms=data_terms))
 
         with torch.autograd.no_grad():
             # Diagnostics logging every 50 iterations
@@ -4645,9 +4950,6 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
                         },
                         geomtime_col=collocation_domain
                     )
-                    if i % 200 == 0:
-                        diagnostics.plot_diagnostics(i)
-                        print(f"Diagnostics saved at iteration {i}")
                 except Exception as _diag_err:
                     # Keep training robust if diagnostics fail
                     print(f"[WARN] Diagnostics logging failed at {i}: {_diag_err}")
@@ -4671,7 +4973,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=False)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=False, data_terms=data_terms)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
@@ -4692,9 +4994,6 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
                         },
                         geomtime_col=collocation_domain
                     )
-                    if i % 200 == 0:
-                        diagnostics.plot_diagnostics(iteration_adam + i)
-                        print(f"Diagnostics saved at iteration {iteration_adam + i}")
                 except Exception as _diag_err:
                     print(f"[WARN] Diagnostics logging (LBFGS) failed at {i}: {_diag_err}")
             if i % 50 == 0:
@@ -4703,6 +5002,14 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
                 breakdown_str = " | ".join([f"{k}: {v:.2e}" for k, v in loss_breakdown.items() if v > 0])
                 if breakdown_str:
                     print(f"  Loss breakdown: {breakdown_str}", flush=True)
+    
+    # Generate diagnostic plots at the end of training
+    if diagnostics is not None:
+        try:
+            final_iteration = iteration_adam + iterationL - 1
+            diagnostics.plot_diagnostics(final_iteration)
+        except Exception as _diag_err:
+            print(f"[WARN] Final diagnostics plotting failed: {_diag_err}")
 
 
 def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs,
@@ -4878,9 +5185,6 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                         },
                         geomtime_col=subdomain_collocs[0]
                     )
-                    if i % 200 == 0:
-                        xpinn_diagnostics.plot_diagnostics(i)
-                        print(f"Diagnostics saved at iteration {i}")
                 except Exception as _diag_err:
                     print(f"[WARN] XPINN diagnostics logging failed at {i}: {_diag_err}")
 
@@ -4916,9 +5220,6 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
                         },
                         geomtime_col=subdomain_collocs[0]
                     )
-                    if i % 200 == 0:
-                        xpinn_diagnostics.plot_diagnostics(i)
-                        print(f"Diagnostics saved at iteration {i}")
                 except Exception as _diag_err:
                     print(f"[WARN] XPINN diagnostics logging failed at {i}: {_diag_err}")
 
@@ -4945,15 +5246,7 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
             
             # Create optimizer for this subdomain only
             optimizer_sub = torch.optim.LBFGS(
-                net.parameters(),
-                lr=1.0,
-                max_iter=50,
-                max_eval=None,
-                tolerance_grad=1e-11,
-                tolerance_change=1e-11,
-                history_size=100,
-                line_search_fn='strong_wolfe'
-            )
+                net.parameters(), line_search_fn='strong_wolfe')
             
             # Create closure for this subdomain
             # Computes loss for this subdomain + its interface losses
@@ -5048,6 +5341,14 @@ def train_xpinn(nets, subdomain_collocs, interface_collocs, subdomain_ic_collocs
         
         print("Per-subdomain L-BFGS training completed.")
     
+    # Generate diagnostic plots at the end of XPINN training
+    if xpinn_diagnostics is not None:
+        try:
+            final_iteration = iteration_adam + iterationL - 1
+            xpinn_diagnostics.plot_diagnostics(final_iteration)
+        except Exception as _diag_err:
+            print(f"[WARN] Final XPINN diagnostics plotting failed: {_diag_err}")
+    
     print("XPINN training completed.")
 _register_module('training.trainer', ['train', 'train_xpinn'])
 
@@ -5060,15 +5361,58 @@ from torch.autograd import Variable
 import torch
 import scipy
 import os
-from numerical_solvers.LAX_2D import lax_solution, lax_solution_with_shared_velocity
-from numerical_solvers.LAX_2D import lax_solution1D_sinusoidal as lax_solution1D_sin
-from numerical_solvers.LAX_2D_torch import lax_solution_torch
-from config import SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, TIMES_1D, a, KX, KY, FD_N_1D, FD_N_2D, POWER_EXPONENT, FILTER_SCALE, N_GRID
+import time
+from numerical_solvers.LAX import lax_solution, lax_solution_with_shared_velocity, lax_solution_3d_sinusoidal
+from numerical_solvers.LAX import lax_solution1D_sinusoidal as lax_solution1D_sin
+from numerical_solvers.LAX_torch import lax_solution_torch, lax_solution_3d_sinusoidal_torch
+def _clear_cuda_cache():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _timed_call(label, fn, *args, **kwargs):
+    start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    elapsed = time.perf_counter() - start
+    print(f"[Timing] {label} took {elapsed:.2f}s")
+    return result
+
+from config import (SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, 
+                    TIMES_1D, a, KX, KY, KZ, FD_N_1D, FD_N_2D, FD_N_3D, POWER_EXPONENT, FILTER_SCALE, 
+                    N_GRID, DIMENSION, SLICE_Y, SLICE_Z)
 from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED, SHOW_LINEAR_THEORY
 
 # Global variable to store shared velocity fields for plotting
 _shared_vx_np = None
 _shared_vy_np = None
+
+def _build_input_list(x_tensor, t_tensor, y_tensor=None, z_tensor=None):
+    coords = [x_tensor]
+    if DIMENSION >= 2:
+        if y_tensor is None:
+            y_tensor = torch.full_like(x_tensor, SLICE_Y)
+        coords.append(y_tensor)
+    if DIMENSION >= 3:
+        if z_tensor is None:
+            z_tensor = torch.full_like(x_tensor, SLICE_Z)
+        coords.append(z_tensor)
+    coords.append(t_tensor)
+    return coords
+
+def _split_outputs(outputs):
+    rho = outputs[:, 0:1]
+    vx = outputs[:, 1:2]
+    vy = outputs[:, 2:3] if DIMENSION >= 2 else None
+    if DIMENSION == 1:
+        phi = outputs[:, 2:3]
+        vz = None
+    elif DIMENSION == 2:
+        phi = outputs[:, 3:4]
+        vz = None
+    else:
+        vz = outputs[:, 3:4]
+        phi = outputs[:, 4:5]
+    return rho, vx, vy, vz, phi
 
 def set_shared_velocity_fields(vx_np, vy_np):
     """Set shared velocity fields for consistent FD plotting"""
@@ -5259,23 +5603,35 @@ def plot_function(net, time_array, initial_params, velocity=False, isplot=False,
         
         # Create 1D slice through the domain (like in notebook: Y = 0.6)
         X = np.linspace(xmin, xmax, 1000).reshape(1000, 1)
-        Y = 0.6 * np.ones(1000).reshape(1000, 1)  # Fixed Y slice like in notebook
+        Y = SLICE_Y * np.ones(1000).reshape(1000, 1)  # Fixed Y slice
+        if DIMENSION >= 3:
+            Z = SLICE_Z * np.ones(1000).reshape(1000, 1)
         t_ = t * np.ones(1000).reshape(1000, 1)
         
         pt_x_collocation = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
-        pt_y_collocation = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z_collocation = Variable(torch.from_numpy(Z).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
         pt_t_collocation = Variable(torch.from_numpy(t_).float(), requires_grad=True).to(device)
         
         # Evaluate network(s)
         if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN visualizations currently support up to 2D.")
             output_0 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
         else:
-            output_0 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+            inputs = _build_input_list(
+                pt_x_collocation,
+                pt_t_collocation,
+                pt_y_collocation,
+                pt_z_collocation
+            )
+            output_0 = nets[0](inputs)
         
-        rho_pred0 = output_0[:, 0:1].data.cpu().numpy()
-        v_pred_x0 = output_0[:, 1:2].data.cpu().numpy()
-        v_pred_y0 = output_0[:, 2:3].data.cpu().numpy()
-        phi_pred0 = output_0[:, 3:4].data.cpu().numpy()
+        rho_tensor, vx_tensor, vy_tensor, vz_tensor, phi_tensor = _split_outputs(output_0)
+        rho_pred0 = rho_tensor.detach().cpu().numpy()
+        v_pred_x0 = vx_tensor.detach().cpu().numpy()
+        v_pred_y0 = vy_tensor.detach().cpu().numpy() if vy_tensor is not None else None
+        phi_pred0 = phi_tensor.detach().cpu().numpy()
  
         rho_max_PN = np.max(rho_pred0)
         
@@ -5370,18 +5726,25 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
     
     # Convert to tensors
     pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-    pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+    pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+    pt_z_collocation = Variable(torch.from_numpy(np.full((Q**2,1), SLICE_Z)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
     pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
     
     # Evaluate network(s)
     if use_xpinn:
+        if DIMENSION >= 3:
+            raise NotImplementedError("XPINN visualizations currently support up to 2D.")
         output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
     else:
-        output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+        output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
     
-    rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
-    U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-    V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+    rho_tensor, vx_tensor, vy_tensor, _, _ = _split_outputs(output_00)
+    rho = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
+    U = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+    if vy_tensor is not None:
+        V = vy_tensor.detach().cpu().numpy().reshape(Q, Q)
+    else:
+        V = np.zeros_like(U)
 
     if ax is None:  # for single plot
         plt.figure(figsize=(5, 5))
@@ -5472,23 +5835,32 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     Q = N_GRID
     xs = np.linspace(xmin, xmax, Q, endpoint=False)
     ys = np.linspace(ymin, ymax, Q, endpoint=False)
-    tau, phi = np.meshgrid(xs, ys) 
+    tau, phi = np.meshgrid(xs, ys)
+    if DIMENSION >= 3:
+        zeta = np.full_like(tau, SLICE_Z)
     Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
     t_00 = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)
     
     # Convert to tensors for first frame
     pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-    pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+    pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+    pt_z_collocation = Variable(torch.from_numpy(zeta.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
     pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
     
     # Get first frame data to set colorbar limits
     if use_xpinn:
+        if DIMENSION >= 3:
+            raise NotImplementedError("XPINN animations currently support up to 2D.")
         output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
     else:
-        output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
-    rho_first = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
-    U_first = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-    V_first = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+        output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
+    rho_first_tensor, vx_first_tensor, vy_first_tensor, _, _ = _split_outputs(output_00)
+    rho_first = rho_first_tensor.detach().cpu().numpy().reshape(Q, Q)
+    U_first = vx_first_tensor.detach().cpu().numpy().reshape(Q, Q)
+    if vy_first_tensor is not None:
+        V_first = vy_first_tensor.detach().cpu().numpy().reshape(Q, Q)
+    else:
+        V_first = np.zeros_like(U_first)
     
     # (removed temporary quick-check print of mean(U), mean(V))
     
@@ -5506,13 +5878,16 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         # First frame
         t_first = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)
         pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z = Variable(torch.from_numpy(zeta.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
         pt_t = Variable(torch.from_numpy(t_first).float(), requires_grad=True).to(device)
         if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN animations currently support up to 2D.")
             pred_first = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
             rho_first = pred_first[:, 0].data.cpu().numpy().reshape(Q, Q)
         else:
-            rho_first = nets[0]([pt_x, pt_y, pt_t])[:, 0].data.cpu().numpy().reshape(Q, Q)
+            rho_first = nets[0](_build_input_list(pt_x, pt_t, pt_y, pt_z))[:, 0].data.cpu().numpy().reshape(Q, Q)
         # Last frame
         t_last = time_points[-1] * np.ones(Q**2).reshape(Q**2, 1)
         pt_t_last = Variable(torch.from_numpy(t_last).float(), requires_grad=True).to(device)
@@ -5520,7 +5895,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
             pred_last = predict_xpinn(nets, pt_x, pt_y, pt_t_last, xmin, xmax, ymin, ymax)
             rho_last = pred_last[:, 0].data.cpu().numpy().reshape(Q, Q)
         else:
-            rho_last = nets[0]([pt_x, pt_y, pt_t_last])[:, 0].data.cpu().numpy().reshape(Q, Q)
+            rho_last = nets[0](_build_input_list(pt_x, pt_t_last, pt_y, pt_z))[:, 0].data.cpu().numpy().reshape(Q, Q)
         fixed_vmin = min(np.min(rho_first), np.min(rho_last))
         fixed_vmax = max(np.max(rho_first), np.max(rho_last))
         if fixed_vmin == fixed_vmax:
@@ -5571,18 +5946,23 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         
         # Convert to tensors
         pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z_collocation = Variable(torch.from_numpy(zeta.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
         pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
         
         # Evaluate network(s)
         if use_xpinn:
             output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
         else:
-            output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+            output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
         
-        rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
-        U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-        V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+        rho_tensor, vx_tensor, vy_tensor, _, _ = _split_outputs(output_00)
+        rho = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
+        U = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+        if vy_tensor is not None:
+            V = vy_tensor.detach().cpu().numpy().reshape(Q, Q)
+        else:
+            V = np.zeros_like(U)
         
         # Update plot data
         if which == "density":
@@ -5690,13 +6070,21 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     # Only generate comparison tables if this is the density animation call
     # This prevents duplicate generation when both density and velocity animations are created
     if which == "density":
+        # Compute cache for 5x3 comparison table time points (5 points uniformly over [0, tmax])
+        comparison_time_points = np.linspace(0.0, float(tmax), 5)
+        print(f"Computing FD cache for 5x3 comparison table ({len(comparison_time_points)} time points)...")
+        fd_cache_5x3 = compute_fd_data_cache(
+            initial_params, comparison_time_points,
+            N=N_GRID, nu=0.5
+        )
+        
         print("Generating density comparison table...")
-        # Create comparison table for density - use N_GRID to match PINN's power spectrum resolution
-        create_5x3_comparison_table(net, initial_params, which="density", N=N_GRID, nu=0.5)
+        # Create comparison table for density - use cached data
+        create_5x3_comparison_table(net, initial_params, which="density", N=N_GRID, nu=0.5, fd_cache=fd_cache_5x3)
         
         print("Generating velocity comparison table...")
-        # Create comparison table for velocity - use N_GRID to match PINN's power spectrum resolution
-        create_5x3_comparison_table(net, initial_params, which="velocity", N=N_GRID, nu=0.5)
+        # Create comparison table for velocity - use cached data
+        create_5x3_comparison_table(net, initial_params, which="velocity", N=N_GRID, nu=0.5, fd_cache=fd_cache_5x3)
     
     # Display animation inline if in a notebook
     try:
@@ -5802,7 +6190,9 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         print(f"Creating 1D comparison plots at t = {time}")
         
         # Get LAX solution (Finite Difference)
-        x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = lax_solution(
+        x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = _timed_call(
+            "LAX comparison slice (cpu)",
+            lax_solution,
             time, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
         )
         
@@ -5855,7 +6245,7 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         
         # Potential comparison plots
         axes[i*3+2].plot(X, phi_pred0, color='c', linewidth=3, label="PINN")
-        axes[i*3+2].plot(X, phi_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
+        axes[i*3+2].plot(X, phi_fd_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
         axes[i*3+2].set_xlim(xmin, xmax)
         axes[i*3+2].set_title(f"Potential at t={time:.1f}")
         axes[i*3+2].set_ylabel(r"$\phi$")
@@ -5932,7 +6322,9 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
     for i, time in enumerate(time_array_growth):
         print(f"Processing growth point {i+1}/{len(time_array_growth)} at t={time:.2f}")
         # Get LAX solution with configured grid resolution
-        x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = lax_solution(
+        x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = _timed_call(
+            "LAX comparison slice (cpu)",
+            lax_solution,
             time, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
         )
         
@@ -5973,10 +6365,139 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
     plt.show()
 
 
+def compute_fd_data_cache(initial_params, time_points, N=200, nu=0.5,
+                          use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+    """
+    Compute and cache FD solver data for all time points to avoid redundant solver calls.
+    
+    Args:
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: List of time points to compute
+        N: Grid resolution for LAX solver
+        nu: Courant number for LAX solver
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config)
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT)
+        vel_rms: Velocity RMS amplitude (defaults to a*cs)
+        random_seed: Random seed (defaults to RANDOM_SEED)
+    
+    Returns:
+        Dictionary mapping time -> FD data: {time: {'x': x_fd, 'y': y_fd, 'z': z_fd (if 3D),
+                                                    'rho': rho_fd, 'vx': vx_fd, 'vy': vy_fd, 'phi': phi_fd}}
+    """
+    xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax = initial_params
+    
+    # Use config defaults if not specified
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    num_of_waves = (xmax - xmin) / lam
+    
+    # Decide grid resolution policy
+    if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+        N_use = N_GRID
+    else:
+        N_use = FD_N_2D if N is None else N
+    
+    print(f"Computing FD data cache for {len(time_points)} time points...")
+    fd_cache = {}
+    
+    for t in time_points:
+        print(f"  Computing FD data at t = {t:.2f}")
+        
+        if DIMENSION == 3:
+            if torch.cuda.is_available():
+                _clear_cuda_cache()
+                fd_result = _timed_call(
+                    "LAX 3D (torch)",
+                    lax_solution_3d_sinusoidal_torch,
+                    time_val=t, N=FD_N_3D, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, gravity=True
+                )
+                x_fd = fd_result[0]
+                y_fd = fd_result[1]
+                z_fd = fd_result[2]
+                rho_vol = fd_result[3]
+                vx_vol = fd_result[4]
+                vy_vol = fd_result[5]
+                phi_vol = fd_result[7]
+            else:
+                x_fd, y_fd, z_fd, rho_vol, vx_vol, vy_vol, _vz, phi_vol, _n, _rho_max = _timed_call(
+                    "LAX 3D (cpu)",
+                    lax_solution_3d_sinusoidal,
+                    t, FD_N_3D, nu, lam, num_of_waves, rho_1, gravity=True
+                )
+            z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+            fd_cache[t] = {
+                'x': x_fd,
+                'y': y_fd,
+                'z': z_fd,
+                'rho': rho_vol[:, :, z_idx],
+                'vx': vx_vol[:, :, z_idx],
+                'vy': vy_vol[:, :, z_idx],
+                'phi': phi_vol[:, :, z_idx] if phi_vol is not None else None,
+                'rho_vol': rho_vol,  # Store full volume for 1D cross-sections
+                'vx_vol': vx_vol,
+                'vy_vol': vy_vol,
+                'phi_vol': phi_vol,
+                'z_idx': z_idx
+            }
+        else:
+            if (str(PERTURBATION_TYPE).lower() == "power_spectrum" \
+                and _shared_vx_np is not None and _shared_vy_np is not None):
+                n_fd_use = int(_shared_vx_np.shape[0])
+                x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                    "LAX 2D (shared-field cpu)",
+                    lax_solution_with_shared_velocity,
+                    t, n_fd_use, nu, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                    gravity=True, isplot=False, comparison=False, animation=True
+                )
+            else:
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
+                        "LAX 2D (torch)",
+                        lax_solution_torch,
+                        time_val=t, N=N_use, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=ps_index,
+                        vel_rms=vel_rms, random_seed=random_seed
+                    )
+                    phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                else:
+                    x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                        "LAX 2D (cpu)",
+                        lax_solution,
+                        t, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                    )
+            
+            Lx = lam * num_of_waves
+            Nx = x_fd.shape[0]
+            Ny = rho_fd.shape[1]
+            y_fd = np.linspace(0.0, Lx, Ny, endpoint=False)
+            
+            fd_cache[t] = {
+                'x': x_fd,
+                'y': y_fd,
+                'rho': rho_fd,
+                'vx': vx_fd,
+                'vy': vy_fd,
+                'phi': phi_fd if phi_fd is not None else np.zeros_like(rho_fd)
+            }
+    
+    print(f"FD data cache computed for {len(fd_cache)} time points.")
+    return fd_cache
+
+
 def create_all_plots(net, initial_params, include_growth=False,
                      fd_use_velocity_ps=None, fd_ps_index=None, fd_vel_rms=None, fd_random_seed=None):
     """
     Create only 2D surface plot grids (density and velocity). Optionally create FD grids and return figures.
+    Uses cached FD data to avoid redundant solver calls.
 
     Args:
         net: Trained neural network
@@ -6004,21 +6525,40 @@ def create_all_plots(net, initial_params, include_growth=False,
     if fd_random_seed is None:
         fd_random_seed = RANDOM_SEED
 
+    # Default time points for 2D surface plots
+    time_points_2d = [0.0, 0.5, 1.0, 1.5, 2.0]
+    
+    # Get time points for 1D cross-sections (if used)
+    time_points_1d = TIMES_1D if isinstance(TIMES_1D, (list, tuple)) and len(TIMES_1D) > 0 else [0.5, 1.0, 1.5]
+    
+    # Combine all time points and remove duplicates
+    all_time_points = sorted(list(set(time_points_2d + time_points_1d)))
+    
+    # Compute FD data cache once for all plots (2D and 1D)
+    print(f"Computing FD cache for {len(all_time_points)} unique time points...")
+    fd_cache = compute_fd_data_cache(
+        initial_params, all_time_points,
+        use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
+        vel_rms=fd_vel_rms, random_seed=fd_random_seed
+    )
+
     # 1. PINN density grid
     fig_den, axes_den = create_2d_surface_plots(net, initial_params, which="density")
 
     # 2. PINN velocity grid
     fig_vel, axes_vel = create_2d_surface_plots(net, initial_params, which="velocity")
 
-    # 3. FD density grid - now uses consistent parameters with PINN training
+    # 3. FD density grid - uses cached data
     fig_fd_den, axes_fd_den = create_2d_surface_plots_FD(initial_params, which="density",
                                                          use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
-                                                         vel_rms=fd_vel_rms, random_seed=fd_random_seed)
+                                                         vel_rms=fd_vel_rms, random_seed=fd_random_seed,
+                                                         fd_cache=fd_cache)
 
-    # 4. FD velocity grid - now uses consistent parameters with PINN training
+    # 4. FD velocity grid - uses cached data
     fig_fd_vel, axes_fd_vel = create_2d_surface_plots_FD(initial_params, which="velocity",
                                                          use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
-                                                         vel_rms=fd_vel_rms, random_seed=fd_random_seed)
+                                                         vel_rms=fd_vel_rms, random_seed=fd_random_seed,
+                                                         fd_cache=fd_cache)
 
     print("="*60)
     print("ALL GRID PLOTS COMPLETED!")
@@ -6032,6 +6572,7 @@ def create_all_plots(net, initial_params, include_growth=False,
         "pinn_velocity": (fig_vel, axes_vel),
         "fd_density": (fig_fd_den, axes_fd_den),
         "fd_velocity": (fig_fd_vel, axes_fd_vel),
+        "fd_cache": fd_cache,  # Return cache for reuse in other plotting functions
     }
     
     return result
@@ -6072,56 +6613,87 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
     xs = np.linspace(xmin, xmax, Q, endpoint=False)
     ys = np.linspace(ymin, ymax, Q, endpoint=False)
     TAU, PHI = np.meshgrid(xs, ys)
+    if DIMENSION >= 3:
+        ZETA = np.full_like(TAU, SLICE_Z)
     Xgrid = np.vstack([TAU.flatten(), PHI.flatten()]).T
 
     for idx, t in enumerate(time_points):
         # PINN evaluation on QxQ grid
         t_vec = t * np.ones(Q**2).reshape(Q**2, 1)
         pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z = Variable(torch.from_numpy(ZETA.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
         pt_t = Variable(torch.from_numpy(t_vec).float(), requires_grad=True).to(device)
         if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN density-growth visualization not supported for DIMENSION=3.")
             out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
         else:
-            out = nets[0]([pt_x, pt_y, pt_t])
-        rho_pinn = out[:, 0].data.cpu().numpy().reshape(Q, Q)
+            out = nets[0](_build_input_list(pt_x, pt_t, pt_y, pt_z))
+        rho_tensor, *_ = _split_outputs(out)
+        rho_pinn = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
         pinn_max_list.append(np.max(rho_pinn))
 
         # LAX/FD evaluation; prefer GPU when available for faster computation
-        if torch.cuda.is_available():
-            # Use GPU-accelerated torch solver (supports both power_spectrum and sinusoidal)
-            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
-            if idx == 0:
-                print(f"Using GPU solver for density growth plot (CUDA available)")
-            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
-                time_val=t, N=N_GRID, nu=0.5, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
-                vel_rms=a*cs, random_seed=RANDOM_SEED
-            )
-        else:
-            # Fallback to CPU solver when GPU not available
-            if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-                if _shared_vx_np is not None and _shared_vy_np is not None:
-                    # Use the native resolution of the shared velocity fields to avoid shape mismatch
-                    n_fd_use = int(_shared_vx_np.shape[0])
-                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
-                        t, n_fd_use, 0.5, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
-                        gravity=True, isplot=False, comparison=False, animation=True
-                    )
-                else:
-                    # Fallback: when shared fields absent, still use N_GRID for power spectrum LAX
-                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                        t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                        use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
-                    )
-            else:
-                # Sinusoidal case (keep defaults)
-                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                    t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=False
+        if DIMENSION == 3:
+            if torch.cuda.is_available():
+                _clear_cuda_cache()
+                fd_result = _timed_call(
+                    "LAX 3D (torch)",
+                    lax_solution_3d_sinusoidal_torch,
+                    time_val=t, N=FD_N_3D, nu=0.5, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, gravity=True
                 )
+                rho_fd = fd_result[3]
+                z_grid = fd_result[2]
+            else:
+                fd_result = _timed_call(
+                    "LAX 3D (cpu)",
+                    lax_solution_3d_sinusoidal,
+                    t, FD_N_3D, 0.5, lam, num_of_waves, rho_1, gravity=True
+                )
+                rho_fd = fd_result[3]
+                z_grid = fd_result[2]
+            z_idx = np.argmin(np.abs(z_grid - SLICE_Z))
+            fd_max_list.append(np.max(rho_fd[:, :, z_idx]))
+        else:
+            if torch.cuda.is_available():
+                _clear_cuda_cache()
+                use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+                if idx == 0:
+                    print(f"Using GPU solver for density growth plot (CUDA available)")
+                x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                    "LAX 2D (torch)",
+                    lax_solution_torch,
+                    time_val=t, N=N_GRID, nu=0.5, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                    gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
+                    vel_rms=a*cs, random_seed=RANDOM_SEED
+                )
+            else:
+                if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                    if _shared_vx_np is not None and _shared_vy_np is not None:
+                        n_fd_use = int(_shared_vx_np.shape[0])
+                        x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                            "LAX 2D (shared-field cpu)",
+                            lax_solution_with_shared_velocity,
+                            t, n_fd_use, 0.5, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                            gravity=True, isplot=False, comparison=False, animation=True
+                        )
+                    else:
+                        x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                            "LAX 2D (power cpu)",
+                            lax_solution,
+                            t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                            use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                        )
+                else:
+                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                        "LAX 2D (sinusoidal cpu)",
+                        lax_solution,
+                        t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        use_velocity_ps=False
+                    )
 
-        fd_max_list.append(np.max(rho_fd))
+            fd_max_list.append(np.max(rho_fd))
 
     # Build figure with two subplots
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -6172,7 +6744,8 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
     return fig, axes
 
 
-def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=1000, nu_fd=0.5):
+def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=1000, nu_fd=0.5,
+                                        fd_cache=None):
     """
     Create 1D cross-section plots at fixed y for sinusoidal perturbations, comparing
     PINN vs Linear Theory vs 1D LAX (sinusoidal).
@@ -6182,8 +6755,9 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
         time_points: list of times to plot
         y_fixed: y value for the 1D slice through the 2D domain
-        N_fd: grid size for 1D LAX solver
-        nu_fd: Courant number for 1D LAX solver
+        N_fd: grid size for 1D LAX solver (only used if fd_cache is None)
+        nu_fd: Courant number for 1D LAX solver (only used if fd_cache is None)
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, _output_folder, _tmax = initial_params
     
@@ -6202,12 +6776,17 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
     # Use baseline density 1.0 for Linear Theory reference
     rho_base = 1.0
     jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_base))
-    k = np.sqrt(KX**2 + KY**2)
-    v1_lt = (rho_1 / rho_base) * (alpha / k)
+    k = np.sqrt(KX**2 + KY**2 + KZ**2)
+    v1_lt = (rho_1 / rho_base) * (alpha / k) if k > 1e-12 else 0.0
 
     # Build x grid for PINN slice
     X = np.linspace(xmin, xmax, 1000).reshape(1000, 1)
     Y = y_fixed * np.ones_like(X)
+    z_fixed = SLICE_Z if DIMENSION >= 3 else None
+    if DIMENSION >= 3:
+        Z = z_fixed * np.ones_like(X)
+    else:
+        Z = None
 
     # Create 2 rows x T columns panel layout matching target style
     T = len(time_points)
@@ -6215,48 +6794,145 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
     grid = plt.GridSpec(4, T, figure=fig, hspace=0.12, wspace=0.18)
 
     for row_idx, t in enumerate(time_points):
-        # PINN predictions at fixed y
+        # PINN predictions at fixed y (and z for 3D)
         t_arr = t * np.ones_like(X)
         pt_x = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
         pt_y = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
+        pt_z = Variable(torch.from_numpy(Z).float(), requires_grad=True).to(device) if Z is not None else None
         pt_t = Variable(torch.from_numpy(t_arr).float(), requires_grad=True).to(device)
         if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN visualizations currently support up to 2D.")
             out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
         else:
-            out = nets[0]([pt_x, pt_y, pt_t])
+            # Use _build_input_list helper to ensure correct coordinate ordering
+            inputs = _build_input_list(pt_x, pt_t, pt_y, pt_z)
+            out = nets[0](inputs)
         rho_pinn = out[:, 0:1].data.cpu().numpy().reshape(-1)
         vx_pinn = out[:, 1:2].data.cpu().numpy().reshape(-1)
         # potential not used in cross-section plots
 
-        # 2D Linear Theory (only meaningful for KY == 0 in current comparison policy)
-        if np.isclose(KY, 0.0):
+        show_lt = np.isclose(KY, 0.0) and np.isclose(KZ, 0.0) and (a < 0.1)
+        if show_lt:
+            phase = KX * X[:, 0] + KY * y_fixed + (KZ * z_fixed if z_fixed is not None else 0.0)
             if lam >= jeans:
-                # Gravitational instability case
-                rho_lt = rho_base + rho_1*np.exp(alpha * t)*np.cos(KX * X[:, 0] + KY * y_fixed)
-                vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(KX * X[:, 0] + KY * y_fixed) * (KX / np.sqrt(KX**2 + KY**2))
+                rho_lt = rho_base + rho_1*np.exp(alpha * t)*np.cos(phase)
+                if k > 0:
+                    vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(phase) * (KX / k)
+                else:
+                    vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(phase)
             else:
-                # Oscillatory regime
-                omega = np.sqrt(cs**2 * (KX**2 + KY**2) - const*G*rho_base)
-                rho_lt = rho_base + rho_1*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed)
-                vx_lt = v1_lt*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed) * (KX / np.sqrt(KX**2 + KY**2))
+                omega = np.sqrt(cs**2 * (KX**2 + KY**2 + KZ**2) - const*G*rho_base)
+                rho_lt = rho_base + rho_1*np.cos(omega * t - phase)
+                if k > 0:
+                    vx_lt = v1_lt*np.cos(omega * t - phase) * (KX / k)
+                else:
+                    vx_lt = v1_lt*np.cos(omega * t - phase)
 
-        # 2D LAX solver - get full 2D solution then extract slice
-        x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, _phi_fd_2d, _n, _rho_max = lax_solution(
-            t, FD_N_2D, nu_fd, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True
-        )
-        
-        # Extract 1D slice from 2D solution at y = y_fixed
-        # Exclude right boundary for periodic domains to avoid double-counting
-        y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1], endpoint=False)
-        y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
-        
-        # Extract the slice
-        rho_fd = rho_fd_2d[:, y_idx]
-        v_fd = vx_fd_2d[:, y_idx]  # Use x-component of velocity
-        # Interpolate FD results to PINN X grid for comparison
         from scipy.interpolate import interp1d
-        rho_fd_interp = interp1d(x_fd_2d, rho_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
-        v_fd_interp = interp1d(x_fd_2d, v_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        
+        # Use cached data if available
+        if fd_cache is not None and t in fd_cache:
+            cache_data = fd_cache[t]
+            if DIMENSION == 3:
+                # For 3D, use the volume data from cache
+                if 'rho_vol' in cache_data:
+                    rho_fd_3d = cache_data['rho_vol']
+                    vx_fd_3d = cache_data['vx_vol']
+                    phi_fd_3d = cache_data['phi_vol']
+                    y_fd = cache_data['y']
+                    z_fd = cache_data['z']
+                    z_idx = cache_data.get('z_idx', np.argmin(np.abs(z_fd - SLICE_Z)))
+                else:
+                    # Fallback to 2D slice if volume not cached
+                    rho_fd_3d = cache_data['rho'][:, :, np.newaxis]
+                    vx_fd_3d = cache_data['vx'][:, :, np.newaxis]
+                    phi_fd_3d = cache_data['phi'][:, :, np.newaxis] if cache_data['phi'] is not None else None
+                    y_fd = cache_data['y']
+                    z_fd = np.array([SLICE_Z])
+                    z_idx = 0
+                y_idx = np.argmin(np.abs(y_fd - y_fixed))
+                rho_fd = rho_fd_3d[:, y_idx, z_idx]
+                v_fd = vx_fd_3d[:, y_idx, z_idx]
+                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx] if phi_fd_3d is not None else None
+                x_fd_line = cache_data['x']
+            else:
+                x_fd_2d = cache_data['x']
+                y_fd_2d = cache_data['y']
+                rho_fd_2d = cache_data['rho']
+                vx_fd_2d = cache_data['vx']
+                _phi_fd_2d = cache_data['phi'] if cache_data['phi'] is not None else np.zeros_like(rho_fd_2d)
+                y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
+                rho_fd = rho_fd_2d[:, y_idx]
+                v_fd = vx_fd_2d[:, y_idx]
+                phi_fd_slice = _phi_fd_2d[:, y_idx]
+                x_fd_line = x_fd_2d
+        else:
+            # Compute FD data if not cached
+            if DIMENSION == 3:
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    fd_result = _timed_call(
+                        "LAX 3D (torch)",
+                        lax_solution_3d_sinusoidal_torch,
+                        time_val=t, N=FD_N_3D, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, gravity=True
+                    )
+                    x_fd = fd_result[0]
+                    y_fd = fd_result[1]
+                    z_fd = fd_result[2]
+                    rho_fd_3d = fd_result[3]
+                    vx_fd_3d = fd_result[4]
+                    phi_fd_3d = fd_result[7]
+                else:
+                    fd_result = lax_solution_3d_sinusoidal(
+                        t, FD_N_3D, nu_fd, lam, num_of_waves, rho_1, gravity=True
+                    )
+                    x_fd = fd_result[0]
+                    y_fd = fd_result[1]
+                    z_fd = fd_result[2]
+                    rho_fd_3d = fd_result[3]
+                    vx_fd_3d = fd_result[4]
+                    phi_fd_3d = fd_result[7]
+                y_idx = np.argmin(np.abs(y_fd - y_fixed))
+                z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+                rho_fd = rho_fd_3d[:, y_idx, z_idx]
+                v_fd = vx_fd_3d[:, y_idx, z_idx]
+                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx]
+                x_fd_line = x_fd
+            else:
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    if row_idx == 0:
+                        print(f"Using GPU solver for 1D cross section plot (CUDA available)")
+                    use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+                    x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, phi_fd_2d_torch, _n, _rho_max = _timed_call(
+                        "LAX 2D slice (torch)",
+                        lax_solution_torch,
+                        time_val=t, N=FD_N_2D, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
+                        vel_rms=a*cs, random_seed=RANDOM_SEED
+                    )
+                    # Handle case where torch version returns None for phi (compute dummy phi if needed)
+                    if phi_fd_2d_torch is None:
+                        _phi_fd_2d = np.zeros_like(rho_fd_2d)
+                    else:
+                        _phi_fd_2d = phi_fd_2d_torch
+                else:
+                    x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, _phi_fd_2d, _n, _rho_max = _timed_call(
+                        "LAX 2D slice (cpu)",
+                        lax_solution,
+                        t, FD_N_2D, nu_fd, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True
+                    )
+                y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1], endpoint=False)
+                y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
+                rho_fd = rho_fd_2d[:, y_idx]
+                v_fd = vx_fd_2d[:, y_idx]
+                phi_fd_slice = _phi_fd_2d[:, y_idx]
+                x_fd_line = x_fd_2d
+
+        rho_fd_interp = interp1d(x_fd_line, rho_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        v_fd_interp = interp1d(x_fd_line, v_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        phi_fd_interp = interp1d(x_fd_line, phi_fd_slice, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
 
         # Column index
         c = row_idx
@@ -6264,7 +6940,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         ax_rho = fig.add_subplot(grid[0, c])
         ax_rho.plot(X[:, 0], rho_pinn, label="GRINN", color='c', linewidth=2)
         # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
-        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+        if SHOW_LINEAR_THEORY and show_lt:
             ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_rho.plot(X[:, 0], rho_fd_interp, label="FD", color='k', linewidth=1)
         ax_rho.set_title(f"t={t:.1f}")
@@ -6273,7 +6949,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
         # Collect all density values that are plotted
         rho_all = [rho_pinn, rho_fd_interp]
-        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+        if SHOW_LINEAR_THEORY and show_lt:
             rho_all.append(rho_lt)
         rho_min = min(np.min(rho) for rho in rho_all)
         rho_max = max(np.max(rho) for rho in rho_all)
@@ -6299,7 +6975,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         ax_eps_rho = fig.add_subplot(grid[1, c])
         ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
         # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
-        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+        if SHOW_LINEAR_THEORY and show_lt:
             eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-6)
             ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_rho.set_ylabel(r"$\varepsilon$")
@@ -6311,7 +6987,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         ax_v = fig.add_subplot(grid[2, c])
         ax_v.plot(X[:, 0], vx_pinn, label="GRINN", color='c', linewidth=2)
         # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
-        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+        if SHOW_LINEAR_THEORY and show_lt:
             ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
         ax_v.plot(X[:, 0], v_fd_interp, label="FD", color='k', linewidth=1)
         ax_v.set_ylabel(r"$v$")
@@ -6319,7 +6995,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
         # Collect all velocity values that are plotted
         v_all = [vx_pinn, v_fd_interp]
-        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+        if SHOW_LINEAR_THEORY and show_lt:
             v_all.append(vx_lt)
         v_min = min(np.min(v) for v in v_all)
         v_max = max(np.max(v) for v in v_all)
@@ -6347,7 +7023,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
         ax_eps_v = fig.add_subplot(grid[3, c])
         ax_eps_v.plot(X[:, 0], eps_v, color='k', linewidth=1, label='FD')
         # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
-        if SHOW_LINEAR_THEORY and np.isclose(KY, 0.0) and (a < 0.1):
+        if SHOW_LINEAR_THEORY and show_lt:
             eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
             ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
         ax_eps_v.set_xlabel("x")
@@ -6374,73 +7050,125 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
 
 
 def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="density",
-                           use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+                           use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                           fd_cache=None):
     """
     Create 2D surface plots with velocity vectors using the Finite Difference (LAX) solver
 
     Args:
         time: Time to plot
         initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
-        N: Grid resolution for LAX solver (Nx = Ny = N)
-        nu: Courant number for LAX solver
+        N: Grid resolution for LAX solver (Nx = Ny = N) - only used if fd_cache is None
+        nu: Courant number for LAX solver - only used if fd_cache is None
         ax: Optional matplotlib axis to plot on
         which: "density" or "velocity"
-        use_velocity_ps: Whether to use velocity power spectrum (defaults to config)
-        ps_index: Power spectrum index (defaults to POWER_EXPONENT)
-        vel_rms: Velocity RMS amplitude (defaults to a*cs)
-        random_seed: Random seed (defaults to 1234)
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config) - only used if fd_cache is None
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT) - only used if fd_cache is None
+        vel_rms: Velocity RMS amplitude (defaults to a*cs) - only used if fd_cache is None
+        random_seed: Random seed (defaults to 1234) - only used if fd_cache is None
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
 
     Returns:
         The QuadMesh object from pcolormesh
     """
     xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax = initial_params
 
-    # Use config defaults if not specified to ensure consistency with PINN training
-    if use_velocity_ps is None:
-        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
-    if ps_index is None:
-        ps_index = POWER_EXPONENT
-    if vel_rms is None:
-        vel_rms = a * cs
-    if random_seed is None:
-        random_seed = RANDOM_SEED
-
-    # Domain properties for LAX_2D (Lx = Ly and Nx = Ny in solver)
-    num_of_waves = (xmax - xmin) / lam
-
-    # Decide grid resolution policy: use N_GRID for power spectrum; FD_N_2D for sinusoidal when N is None
-    if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-        N_use = N_GRID
+    # Use cached data if available
+    if fd_cache is not None and time in fd_cache:
+        cache_data = fd_cache[time]
+        x_fd = cache_data['x']
+        y_fd = cache_data['y']
+        rho_fd = cache_data['rho']
+        vx_fd = cache_data['vx']
+        vy_fd = cache_data['vy']
+        X, Y = np.meshgrid(x_fd, y_fd, indexing='ij')
+        Nx = x_fd.shape[0]
+        Ny = y_fd.shape[0] if len(y_fd.shape) > 0 else rho_fd.shape[1]
     else:
-        N_use = FD_N_2D if N is None else N
+        # Use config defaults if not specified to ensure consistency with PINN training
+        if use_velocity_ps is None:
+            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+        if ps_index is None:
+            ps_index = POWER_EXPONENT
+        if vel_rms is None:
+            vel_rms = a * cs
+        if random_seed is None:
+            random_seed = RANDOM_SEED
 
-    # Run LAX solver (finite difference) with self-gravity enabled to obtain 2D fields
-    # Prefer using the exact shared velocity fields (if available) to ensure identical realization
-    # across PINN ICs and all FD visualizations.
-    # Returns (gravity=True, comparison=False, animation=True):
-    #   x (Nx,), rho (Nx,Ny), vx (Nx,Ny), vy (Nx,Ny), phi (Nx,Ny), n, rho_max
-    if (str(PERTURBATION_TYPE).lower() == "power_spectrum" \
-        and _shared_vx_np is not None and _shared_vy_np is not None):
-        # Use native resolution of shared fields to avoid resampling artifacts
-        n_fd_use = int(_shared_vx_np.shape[0])
-        x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
-            time, n_fd_use, nu, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
-            gravity=True, isplot=False, comparison=False, animation=True
-        )
-    else:
-        x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-            time, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-            use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
-        )
+        # Domain properties for LAX (Lx = Ly and Nx = Ny in solver)
+        num_of_waves = (xmax - xmin) / lam
 
-    # Build y-array consistent with solver setup (square domain with same resolution)
-    Lx = lam * num_of_waves
-    Nx = x_fd.shape[0]
-    Ny = rho_fd.shape[1]
-    y_fd = np.linspace(0.0, Lx, Ny)
+        # Decide grid resolution policy: use N_GRID for power spectrum; FD_N_2D for sinusoidal when N is None
+        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+            N_use = N_GRID
+        else:
+            N_use = FD_N_2D if N is None else N
 
-    # Create meshgrid for plotting
-    X, Y = np.meshgrid(x_fd, y_fd, indexing='ij')
+        # Run LAX solver (finite difference) with self-gravity enabled to obtain 2D fields
+        # Prefer using the exact shared velocity fields (if available) to ensure identical realization
+        # across PINN ICs and all FD visualizations.
+        # Returns (gravity=True, comparison=False, animation=True):
+        #   x (Nx,), rho (Nx,Ny), vx (Nx,Ny), vy (Nx,Ny), phi (Nx,Ny), n, rho_max
+        if DIMENSION == 3:
+            if torch.cuda.is_available():
+                _clear_cuda_cache()
+                fd_result = _timed_call(
+                    "LAX 3D (torch)",
+                    lax_solution_3d_sinusoidal_torch,
+                    time_val=time, N=FD_N_3D, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, gravity=True
+                )
+                x_fd = fd_result[0]
+                y_fd = fd_result[1]
+                z_fd = fd_result[2]
+                rho_vol = fd_result[3]
+                vx_vol = fd_result[4]
+                vy_vol = fd_result[5]
+            else:
+                x_fd, y_fd, z_fd, rho_vol, vx_vol, vy_vol, _vz, _phi_fd, _n, _rho_max = _timed_call(
+                    "LAX 3D (cpu)",
+                    lax_solution_3d_sinusoidal,
+                    time, FD_N_3D, nu, lam, num_of_waves, rho_1, gravity=True
+                )
+            z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+            rho_fd = rho_vol[:, :, z_idx]
+            vx_fd = vx_vol[:, :, z_idx]
+            vy_fd = vy_vol[:, :, z_idx]
+            X, Y = np.meshgrid(x_fd, y_fd, indexing='ij')
+        else:
+            if (str(PERTURBATION_TYPE).lower() == "power_spectrum" \
+                and _shared_vx_np is not None and _shared_vy_np is not None):
+                # Use native resolution of shared fields to avoid resampling artifacts
+                n_fd_use = int(_shared_vx_np.shape[0])
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                    "LAX 2D (shared-field cpu)",
+                    lax_solution_with_shared_velocity,
+                    time, n_fd_use, nu, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                    gravity=True, isplot=False, comparison=False, animation=True
+                )
+            else:
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
+                        "LAX 2D (torch)",
+                        lax_solution_torch,
+                        time_val=time, N=N_use, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=ps_index,
+                        vel_rms=vel_rms, random_seed=random_seed
+                    )
+                    _phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                else:
+                    x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                        "LAX 2D (cpu)",
+                        lax_solution,
+                        time, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                    )
+
+            Lx = lam * num_of_waves
+            Nx = x_fd.shape[0]
+            Ny = rho_fd.shape[1]
+            y_fd = np.linspace(0.0, Lx, Ny, endpoint=False)
+            X, Y = np.meshgrid(x_fd, y_fd, indexing='ij')
 
     if ax is None:  # for single plot
         plt.figure(figsize=(5, 5))
@@ -6485,7 +7213,8 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="
 
 
 def create_2d_surface_plots_FD(initial_params, time_points=None, which="density", N=200, nu=0.5,
-                               use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+                               use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                               fd_cache=None):
     """
     Create 2D surface plots at multiple time points using the LAX FD solver
 
@@ -6493,12 +7222,13 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
         initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
         time_points: list of times
         which: "density" or "velocity"
-        N: grid size
-        nu: Courant number
-        use_velocity_ps: Whether to use velocity power spectrum (defaults to config)
-        ps_index: Power spectrum index (defaults to POWER_EXPONENT)
-        vel_rms: Velocity RMS amplitude (defaults to a*cs)
-        random_seed: Random seed (defaults to 1234)
+        N: grid size (only used if fd_cache is None)
+        nu: Courant number (only used if fd_cache is None)
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config) - only used if fd_cache is None
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT) - only used if fd_cache is None
+        vel_rms: Velocity RMS amplitude (defaults to a*cs) - only used if fd_cache is None
+        random_seed: Random seed (defaults to 1234) - only used if fd_cache is None
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
     """
     if time_points is None:
         time_points = [0.0, 0.5, 1.0, 1.5, 2.0]
@@ -6527,7 +7257,8 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
             else:
                 N_call = N
             Two_D_surface_plots_FD(t, initial_params, N=N_call, nu=nu, ax=axes[i], which=which,
-                                   use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed)
+                                   use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed,
+                                   fd_cache=fd_cache)
 
     if len(time_points) < len(axes):
         fig.delaxes(axes[-1])
@@ -6545,7 +7276,8 @@ def create_2d_surface_plots_FD(initial_params, time_points=None, which="density"
 
 
 def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=0.5,
-                                use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+                                use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                                fd_cache=None):
     """
     Create 5x3 comparison table showing PINN, FD, and epsilon metric at 5 time snapshots
     
@@ -6553,12 +7285,13 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         net: Trained neural network
         initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
         which: "density" or "velocity"
-        N: Grid resolution for LAX solver
-        nu: Courant number for LAX solver
-        use_velocity_ps: Whether to use velocity power spectrum for FD (defaults to config)
-        ps_index: Power spectrum index for FD (defaults to POWER_EXPONENT)
-        vel_rms: Velocity RMS for FD (defaults to a*cs)
-        random_seed: Random seed for FD (defaults to 1234)
+        N: Grid resolution for LAX solver (only used if fd_cache is None)
+        nu: Courant number for LAX solver (only used if fd_cache is None)
+        use_velocity_ps: Whether to use velocity power spectrum for FD (defaults to config) - only used if fd_cache is None
+        ps_index: Power spectrum index for FD (defaults to POWER_EXPONENT) - only used if fd_cache is None
+        vel_rms: Velocity RMS for FD (defaults to a*cs) - only used if fd_cache is None
+        random_seed: Random seed for FD (defaults to 1234) - only used if fd_cache is None
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
     
@@ -6608,64 +7341,147 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
         
         pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
-        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z_collocation = Variable(torch.from_numpy(np.full((Q**2, 1), SLICE_Z)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
         pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
         
         if use_xpinn:
             output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
         else:
-            output_00 = nets[0]([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+            output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
         
+        rho_tensor, vx_tensor, vy_tensor, _, _ = _split_outputs(output_00)
         if which == "density":
-            pinn_field = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
-            # Extract velocity components for density plots too
-            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
-            pinn_vx = U
-            pinn_vy = V
-        else:  # velocity magnitude
-            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
-            pinn_field = np.sqrt(U**2 + V**2)
-            pinn_vx = U
-            pinn_vy = V
+            pinn_field = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
+        else:
+            vx_grid = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+            vy_grid = vy_tensor.detach().cpu().numpy().reshape(Q, Q) if vy_tensor is not None else np.zeros_like(vx_grid)
+            pinn_field = np.sqrt(vx_grid**2 + vy_grid**2)
+        pinn_vx = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+        pinn_vy = vy_tensor.detach().cpu().numpy().reshape(Q, Q) if vy_tensor is not None else np.zeros_like(pinn_vx)
         
         # Debug output (commented out to reduce noise)
         # print(f"  PINN {which} range: [{np.min(pinn_field):.6f}, {np.max(pinn_field):.6f}], std: {np.std(pinn_field):.6f}")
         
-        # Get FD data - use same parameters as PINN for power spectrum
+        # Get FD data - use cached data if available, otherwise compute
         num_of_waves = (xmax - xmin) / lam
-        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-            # For power spectrum, use shared velocity fields if available
-            if _shared_vx_np is not None and _shared_vy_np is not None:
-                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
-                    t, N, nu, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
-                    gravity=True, isplot=False, comparison=False, animation=True
-                )
+        
+        if fd_cache is not None and t in fd_cache:
+            # Use cached data
+            cache_data = fd_cache[t]
+            if DIMENSION == 3:
+                # For 3D, use volume data from cache if available, otherwise use 2D slice
+                if 'rho_vol' in cache_data:
+                    rho_vol = cache_data['rho_vol']
+                    vx_vol = cache_data['vx_vol']
+                    vy_vol = cache_data['vy_vol']
+                    phi_vol = cache_data.get('phi_vol')
+                    x_fd = cache_data['x']
+                    y_fd = cache_data['y']
+                    z_fd = cache_data['z']
+                    z_idx = cache_data.get('z_idx', np.argmin(np.abs(cache_data['z'] - SLICE_Z)))
+                else:
+                    # Fallback to 2D slice
+                    rho_vol = cache_data['rho'][:, :, np.newaxis]
+                    vx_vol = cache_data['vx'][:, :, np.newaxis]
+                    vy_vol = cache_data['vy'][:, :, np.newaxis]
+                    phi_vol = cache_data.get('phi')
+                    if phi_vol is not None:
+                        phi_vol = phi_vol[:, :, np.newaxis]
+                    x_fd = cache_data['x']
+                    y_fd = cache_data['y']
+                    z_fd = np.array([SLICE_Z])
+                    z_idx = 0
+                rho_fd = rho_vol[:, :, z_idx]
+                vx_fd = vx_vol[:, :, z_idx]
+                vy_fd = vy_vol[:, :, z_idx]
+                phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
             else:
-                # Fallback to original method
-                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                    t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
-                )
-            # Debug: Check FD density range (commented out to reduce output noise)
-            # print(f"  FD {which} range: [{np.min(rho_fd):.6f}, {np.max(rho_fd):.6f}], std: {np.std(rho_fd):.6f}")
+                x_fd = cache_data['x']
+                y_fd = cache_data['y']
+                rho_fd = cache_data['rho']
+                vx_fd = cache_data['vx']
+                vy_fd = cache_data['vy']
+                phi_fd = cache_data.get('phi')
+                if phi_fd is None:
+                    phi_fd = np.zeros_like(rho_fd)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
         else:
-            # For sinusoidal, use original parameters
-            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
-            )
-        
-        # Build y-array consistent with solver setup
-        # Exclude right boundary for periodic domains to avoid double-counting
-        Lx = lam * num_of_waves
-        Nx = x_fd.shape[0]
-        Ny = rho_fd.shape[1]
-        y_fd = np.linspace(0.0, Lx, Ny, endpoint=False)
-        
-        # Create meshgrid for FD data
-        X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+            # Compute FD data if not cached
+            if DIMENSION == 3:
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    fd_result = _timed_call(
+                        "LAX 3D (torch)",
+                        lax_solution_3d_sinusoidal_torch,
+                        time_val=t, N=FD_N_3D, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, gravity=True
+                    )
+                    x_fd = fd_result[0]
+                    y_fd = fd_result[1]
+                    z_fd = fd_result[2]
+                    rho_vol = fd_result[3]
+                    vx_vol = fd_result[4]
+                    vy_vol = fd_result[5]
+                    phi_vol = fd_result[7]
+                else:
+                    x_fd, y_fd, z_fd, rho_vol, vx_vol, vy_vol, _vz, phi_vol, _n, _rho_max = _timed_call(
+                        "LAX 3D (cpu)",
+                        lax_solution_3d_sinusoidal,
+                        t, FD_N_3D, nu, lam, num_of_waves, rho_1, gravity=True
+                    )
+                z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+                rho_fd = rho_vol[:, :, z_idx]
+                vx_fd = vx_vol[:, :, z_idx]
+                vy_fd = vy_vol[:, :, z_idx]
+                phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+            else:
+                if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                    if _shared_vx_np is not None and _shared_vy_np is not None:
+                        x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                            "LAX 2D (shared-field cpu)",
+                            lax_solution_with_shared_velocity,
+                            t, N, nu, lam, num_of_waves, rho_1, _shared_vx_np, _shared_vy_np,
+                            gravity=True, isplot=False, comparison=False, animation=True
+                        )
+                    else:
+                        if torch.cuda.is_available():
+                            _clear_cuda_cache()
+                            x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
+                                "LAX 2D (torch)",
+                                lax_solution_torch,
+                                time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                                gravity=True, use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                            )
+                            phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                        else:
+                            x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                                "LAX 2D (power cpu)",
+                                lax_solution,
+                                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                                use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                            )
+                else:
+                    if torch.cuda.is_available():
+                        _clear_cuda_cache()
+                        x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
+                            "LAX 2D (torch)",
+                            lax_solution_torch,
+                            time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                            gravity=True, use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                        )
+                        phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                    else:
+                        x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                            "LAX 2D (sinusoidal cpu)",
+                            lax_solution,
+                            t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                            use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                        )
+                Lx = lam * num_of_waves
+                y_fd = np.linspace(0.0, Lx, rho_fd.shape[1], endpoint=False)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
         
         if which == "density":
             fd_field = rho_fd
@@ -6815,7 +7631,7 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
     
     plt.show()
     return fig, axes
-_register_module('visualization.Plotting_2D', ['Two_D_surface_plots', 'Two_D_surface_plots_FD', '_shared_vx_np', '_shared_vy_np', 'add_interface_lines', 'create_1d_comparison_plots', 'create_1d_cross_sections_sinusoidal', 'create_2d_animation', 'create_2d_surface_plots', 'create_2d_surface_plots_FD', 'create_5x3_comparison_table', 'create_all_plots', 'create_density_growth_plot', 'create_growth_comparison_plot', 'device', 'get_fd_default_params', 'has_gpu', 'has_mps', 'plot_function', 'predict_xpinn', 'set_shared_velocity_fields'])
+_register_module('visualization.Plotting_2D', ['Two_D_surface_plots', 'Two_D_surface_plots_FD', '_build_input_list', '_clear_cuda_cache', '_shared_vx_np', '_shared_vy_np', '_split_outputs', '_timed_call', 'add_interface_lines', 'compute_fd_data_cache', 'create_1d_comparison_plots', 'create_1d_cross_sections_sinusoidal', 'create_2d_animation', 'create_2d_surface_plots', 'create_2d_surface_plots_FD', 'create_5x3_comparison_table', 'create_all_plots', 'create_density_growth_plot', 'create_growth_comparison_plot', 'device', 'get_fd_default_params', 'has_gpu', 'has_mps', 'plot_function', 'predict_xpinn', 'set_shared_velocity_fields'])
 
 # ==== Module: train (train.py) ====
 import os
@@ -6827,11 +7643,28 @@ import time
 from typing import Tuple, Optional, Dict
 import torch
 import torch.nn as nn
+
+# ==================== PyTorch Performance Optimizations ====================
+# Enable cuDNN autotuner - finds optimal convolution algorithms
+# This helps when input sizes are consistent (which they are in PINN training)
+torch.backends.cudnn.benchmark = True
+
+# Enable TF32 on Ampere GPUs (A100, RTX 3090, RTX 4090, etc.) for 20-30% speedup
+# TF32 provides faster matrix multiplication with minimal accuracy loss
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Prefer explicit device/dtype settings rather than deprecated tensor-type override
+    torch.set_default_dtype(torch.float32)
+    if hasattr(torch, "set_default_device"):
+        torch.set_default_device("cuda")
+    print("PyTorch performance optimizations enabled (cuDNN benchmark, TF32)")
+
 from core.data_generator import input_taker, req_consts_calc
 from training.trainer import train, train_xpinn
 from core.initial_conditions import initialize_shared_velocity_fields
 from config import BATCH_SIZE, NUM_BATCHES, N_0, N_r, DIMENSION
-from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o
+from config import a, wave, cs, xmin, ymin, zmin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o, SLICE_Y
 from config import num_neurons, num_layers, num_of_waves
 from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, DEFAULT_ACTIVATION, RANDOM_SEED
 from config import N_INTERFACE, XPINN_OPTIMIZER_STRATEGY, USE_MULTI_GPU, CACHE_IC_VALUES, STARTUP_DT
@@ -6854,6 +7687,25 @@ import methods.xpinn_decomposition as xpinn_utils
 from methods.xpinn_decomposition import (setup_xpinn_devices, setup_xpinn_networks,
                                          setup_xpinn_collocation, setup_xpinn_interfaces,
                                          cache_xpinn_initial_conditions)
+
+
+def _save_trained_models(nets, use_xpinn):
+    """Persist trained models immediately after training completes."""
+    try:
+        from config import SNAPSHOT_DIR
+        model_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+        os.makedirs(model_dir, exist_ok=True)
+        if not use_xpinn:
+            model_path = os.path.join(model_dir, "model.pth")
+            torch.save(nets[0].state_dict(), model_path)
+            print(f"Saved model to {model_path}")
+        else:
+            for i, net in enumerate(nets):
+                model_path = os.path.join(model_dir, f"model_subdomain_{i}.pth")
+                torch.save(net.state_dict(), model_path)
+            print(f"Saved {len(nets)} subdomain models to {model_dir}")
+    except Exception as e:
+        print(f"Warning: failed to save model: {e}")
 
 
 def load_fd_anchor_points(path: str, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -6952,6 +7804,7 @@ else:
 
 xmax = xmin + lam * num_of_waves
 ymax = ymin + lam * num_of_waves
+zmax = zmin + lam * num_of_waves
 
 # Initialize shared velocity fields for consistent PINN/FD initial conditions
 vx_np, vy_np = None, None  # Default values for sinusoidal case
@@ -6989,26 +7842,45 @@ if not USE_XPINN:
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
     optimizerL = torch.optim.LBFGS(net.parameters(), line_search_fn='strong_wolfe')
 
-    model_2D = ASTPN(rmin=[xmin, ymin, tmin], rmax=[xmax, ymax, tmax], N_0=N_0, N_b=0, N_r=N_r, dimension=DIMENSION)
+    if DIMENSION == 1:
+        astpn_rmin = [xmin, tmin]
+        astpn_rmax = [xmax, tmax]
+    elif DIMENSION == 2:
+        astpn_rmin = [xmin, ymin, tmin]
+        astpn_rmax = [xmax, ymax, tmax]
+    elif DIMENSION == 3:
+        astpn_rmin = [xmin, ymin, zmin, tmin]
+        astpn_rmax = [xmax, ymax, zmax, tmax]
+    else:
+        raise ValueError(f"Unsupported DIMENSION={DIMENSION}")
+    collocation_model = ASTPN(rmin=astpn_rmin, rmax=astpn_rmax, N_0=N_0, N_b=0, N_r=N_r, dimension=DIMENSION)
 
     # Set domain on the network so periodic embeddings enforce hard BCs
-    net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
+    spatial_rmin = [xmin]
+    spatial_rmax = [xmax]
+    if DIMENSION >= 2:
+        spatial_rmin.append(ymin)
+        spatial_rmax.append(ymax)
+    if DIMENSION >= 3:
+        spatial_rmin.append(zmin)
+        spatial_rmax.append(zmax)
+    net.set_domain(rmin=spatial_rmin, rmax=spatial_rmax, dimension=DIMENSION)
 
     # IC collocation stays at t=0 throughout
-    collocation_IC_2D = model_2D.geo_time_coord(option="IC")
+    collocation_IC = collocation_model.geo_time_coord(option="IC")
 
     start_time = time.time()
     
     if not USE_CAUSAL_TRAINING:
         # Standard training (no causal features)
         print("Using standard training (no causal curriculum)...")
-        collocation_domain_2D = model_2D.geo_time_coord(option="Domain")
+        collocation_domain = collocation_model.geo_time_coord(option="Domain")
         
         train(
             net=net,
-            model=model_2D,
-            collocation_domain=collocation_domain_2D,
-            collocation_IC=collocation_IC_2D,
+            model=collocation_model,
+            collocation_domain=collocation_domain,
+            collocation_IC=collocation_IC,
             optimizer=optimizer,
             optimizerL=optimizerL,
             closure=None,
@@ -7054,14 +7926,17 @@ if not USE_XPINN:
             'xmax': xmax,
             'ymin': ymin,
             'ymax': ymax,
+            'zmin': zmin,
+            'zmax': zmax,
             'tmin': tmin,
             'tmax': tmax,
-            'startup_dt': STARTUP_DT
+            'startup_dt': STARTUP_DT,
+            'dimension': DIMENSION
         }
         
         # Initialize causal trainer
         causal_trainer = CausalTrainer(
-            model=model_2D,
+            model=collocation_model,
             net=net,
             optimizer=optimizer,
             optimizerL=optimizerL,
@@ -7083,13 +7958,13 @@ if not USE_XPINN:
         }
         
         if USE_CAUSAL_CURRICULUM:
-            net = causal_trainer.train_with_curriculum(collocation_IC_2D, **train_kwargs)
+            net = causal_trainer.train_with_curriculum(collocation_IC, **train_kwargs)
         else:
-            net = causal_trainer.train_without_curriculum(collocation_IC_2D, **train_kwargs)
+            net = causal_trainer.train_without_curriculum(collocation_IC, **train_kwargs)
     
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"Training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+    print(f"[Timing] PINN training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
     
     # Store net in a list for compatibility with plotting functions
     nets = [net]
@@ -7192,7 +8067,10 @@ else:
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"XPINN training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+    print(f"[Timing] XPINN training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+
+# Save models immediately after training completes
+_save_trained_models(nets, USE_XPINN)
 
 # Clear GPU memory after training
 if device.startswith('cuda'):
@@ -7209,7 +8087,7 @@ if not USE_XPINN:
     anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=10, verbose=False)
 
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
+        create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=SLICE_Y, N_fd=600, nu_fd=0.5)
 
     if PLOT_DENSITY_GROWTH:
         try:
@@ -7222,13 +8100,16 @@ if not USE_XPINN:
 else:
     # XPINN multi-network visualization
     print("Creating XPINN visualizations...")
-    anim_density = create_2d_animation(nets, initial_params, which="density", fps=10, verbose=False)
-    anim_velocity = create_2d_animation(nets, initial_params, which="velocity", fps=10, verbose=False)
-    print("XPINN visualizations created successfully!")
+    if DIMENSION <= 2:
+        anim_density = create_2d_animation(nets, initial_params, which="density", fps=10, verbose=False)
+        anim_velocity = create_2d_animation(nets, initial_params, which="velocity", fps=10, verbose=False)
+        print("XPINN visualizations created successfully!")
+    else:
+        print("XPINN 3D animations are not yet supported.")
     
     # Sinusoidal cross-section plot for XPINN
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        create_1d_cross_sections_sinusoidal(nets, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
+        create_1d_cross_sections_sinusoidal(nets, initial_params, time_points=None, y_fixed=SLICE_Y, N_fd=600, nu_fd=0.5)
 
     # Density growth plot for XPINN as well
     if PLOT_DENSITY_GROWTH:
@@ -7239,29 +8120,9 @@ else:
         dt_growth = float(GROWTH_PLOT_DT)
         create_density_growth_plot(nets, initial_params, tmax=tmax_growth, dt=dt_growth)
 
-# ==================== MODEL SAVING ====================
-try:
-    from config import SNAPSHOT_DIR
-    model_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
-    os.makedirs(model_dir, exist_ok=True)
-    
-    if not USE_XPINN:
-        # Save single network
-        model_path = os.path.join(model_dir, "model.pth")
-        torch.save(nets[0].state_dict(), model_path)
-        print(f"Saved model to {model_path}")
-    else:
-        # Save all subdomain networks
-        for i, net in enumerate(nets):
-            model_path = os.path.join(model_dir, f"model_subdomain_{i}.pth")
-            torch.save(net.state_dict(), model_path)
-        print(f"Saved {len(nets)} subdomain models to {model_dir}")
-except Exception as e:
-    print(f"Warning: failed to save model: {e}")
-
 # ==================== FINAL CACHE CLEANUP ====================
 script_root = os.path.dirname(os.path.abspath(__file__))
 print("Performing final Python cache cleanup...")
 clean_pycache(script_root)
-_register_module('train', ['clean_pycache', 'device', 'fd_data_batch_size', 'fd_dataset', 'fd_weight_active', 'has_gpu', 'has_mps', 'initial_params', 'load_fd_anchor_points', 'script_root', 'xmax', 'ymax'])
+_register_module('train', ['_save_trained_models', 'clean_pycache', 'device', 'fd_data_batch_size', 'fd_dataset', 'fd_weight_active', 'has_gpu', 'has_mps', 'initial_params', 'load_fd_anchor_points', 'script_root', 'xmax', 'ymax', 'zmax'])
 

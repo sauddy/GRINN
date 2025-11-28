@@ -1,3 +1,4 @@
 # Numerical solvers for comparison
-# - LAX_2D: LAX finite difference solver for Jeans equations
+# - LAX: CPU LAX finite difference solver for Jeans equations
+# - LAX_torch: GPU-accelerated LAX solver
 

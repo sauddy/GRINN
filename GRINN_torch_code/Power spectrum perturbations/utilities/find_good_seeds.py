@@ -17,8 +17,8 @@ from tqdm import tqdm
 # Add parent directory to path to allow imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from numerical_solvers.LAX_2D import lax_solution as lax_solution_cpu
-from numerical_solvers.LAX_2D_torch import lax_solution_torch
+from numerical_solvers.LAX import lax_solution as lax_solution_cpu
+from numerical_solvers.LAX_torch import lax_solution_torch
 from config import (
     RANDOM_SEED, POWER_EXPONENT, cs, rho_o, num_of_waves,
     xmin, ymin, a, wave
@@ -48,8 +48,8 @@ BOUNDARY_THRESHOLD = 0.25  # 15% of domain size from edges
 # Seed search range
 NUM_SEEDS_TO_TEST = 100  # Number of seeds to test (from RANDOM_SEED to RANDOM_SEED + NUM_SEEDS_TO_TEST)
 
-# Solver backend selection: "cpu" uses numerical_solvers.LAX_2D (reference implementation),
-# "torch" uses numerical_solvers.LAX_2D_torch (experimental GPU version)
+# Solver backend selection: "cpu" uses numerical_solvers.LAX (reference implementation),
+# "torch" uses numerical_solvers.LAX_torch (experimental GPU version)
 SOLVER_BACKEND = "torch"
 
 # Plot mode selection

@@ -1,32 +1,33 @@
 import numpy as np
 
 # Random seed for reproducibility across all functions
-RANDOM_SEED = 77 #Note to self: Seed 11 and 70 present two unique cases which can be tested
+RANDOM_SEED = 77
 
 # Perturbation selection: "power_spectrum" or "sinusoidal"
-PERTURBATION_TYPE = "power_spectrum"
+PERTURBATION_TYPE = "sinusoidal"
 
 xmin = 0.0
 ymin = 0.0
+zmin = 0.0
 cs = 1.0
 rho_o = 1.0
 const = 1.0
 G = 1.0
 
 # Collocation point parameters
-N_0 = 70000  # Number of initial condition points
-N_r = 70000 # Number of residual/collocation points
-DIMENSION = 2  # Spatial dimension
+N_0 = 5000  # Number of initial condition points
+N_r = 20000 # Number of residual/collocation points
+DIMENSION = 3  # Spatial dimension
 
 # Number of collocation/IC points per mini-batch and
 # how many such mini-batches to aggregate in a single optimizer step
-BATCH_SIZE = 70000
+BATCH_SIZE = (N_0 + N_r) if PERTURBATION_TYPE == "sinusoidal" else 70000
 NUM_BATCHES = 1
 
-a = 0.1
+a = 0.03
 
 tmin = 0.
-tmax = 4.0
+tmax = 8.0
 
 num_neurons = 64
 harmonics = 3
@@ -48,18 +49,22 @@ SAVE_STATIC_SNAPSHOTS = False
 SNAPSHOT_DIR = "/kaggle/working/"
 
 # Training diagnostics
-ENABLE_TRAINING_DIAGNOSTICS = False  # Enable automatic training diagnostics plots and logging
+ENABLE_TRAINING_DIAGNOSTICS = True  # Enable automatic training diagnostics plots and logging
 
 # Density growth comparison plot controls
-PLOT_DENSITY_GROWTH = True
+PLOT_DENSITY_GROWTH = False
 GROWTH_PLOT_TMAX = 4.0
 GROWTH_PLOT_DT = 0.1
 
 KX = k
 KY = 0
-TIMES_1D = [3.0, 4.0, 5.0] # 1D cross-section times to plot (used for sinusoidal panel plots
-FD_N_1D = 400  # Grid points for 1D LAX (when used)
-FD_N_2D = 400  # Grid points per dimension for 2D LAX
+KZ = 0
+TIMES_1D = [2.5, 5.0, 7.5] # 1D cross-section times to plot (used for sinusoidal panel plots
+FD_N_1D = 300  # Grid points for 1D LAX (when used)
+FD_N_2D = 300  # Grid points per dimension for 2D LAX
+FD_N_3D = 300   # Grid points per dimension for 3D LAX slices
+SLICE_Y = 0.6  # Default y slice for visualization/cross-sections
+SLICE_Z = 0.6  # Default z slice for visualization/cross-sections
 SHOW_LINEAR_THEORY = False
 
 # Power spectrum parameters
@@ -71,15 +76,15 @@ CONTINUITY_IC_WEIGHT = 0.0 # Weight for enforcing continuity at t=0: rho_t(0) = 
 DECAY_PORTION = 0.5 # Fraction of total training steps over which to fully decay
 
 # ==================== Causal Training Configuration ====================
-USE_CAUSAL_TRAINING = False
+USE_CAUSAL_TRAINING = True
 
 CAUSAL_WEIGHTING_MODE = "static"  # "static" or "adaptive"
 
 USE_CAUSAL_CURRICULUM = True    # Enable temporal curriculum windows
 CAUSAL_NUM_WINDOWS = 2          # Number of progressive time windows
-CAUSAL_WINDOW_SCHEDULE = "linear"  # Time window schedule type: "linear" (automatic) or "custom" (user-specified)
+CAUSAL_WINDOW_SCHEDULE = "custom"  # Time window schedule type: "linear" (automatic) or "custom" (user-specified)
 CAUSAL_USE_RESTARTS = False      # Use restart marching [t_k, t_{k+1}] instead of expanding windows [0, t_k]
-CAUSAL_CUSTOM_WINDOWS = [[STARTUP_DT, 3.0], [STARTUP_DT, 3.5]]  # List of [t_min, t_max] pairs for each window
+CAUSAL_CUSTOM_WINDOWS = [[0.0, 6.0], [0.0, 8.0]]  # List of [t_min, t_max] pairs for each window
 
 CAUSAL_GAMMA_MAX = 0.0          # Maximum gamma for exp(-gamma*t) weighting (applied in early windows)
 CAUSAL_GAMMA_MIN = 0.0          # Minimum gamma (applied in final window, 0 = uniform weighting)
@@ -134,7 +139,7 @@ SHOW_INTERFACE_LINES = True  # Draw subdomain boundaries in plots
 INTERFACE_AVERAGING = 'mean'  # Combine overlapping predictions: 'mean', 'weighted', 'subdomain1', 'subdomain2'
 
 # ==================== FD Data Assisted Training Configuration ====================
-USE_FD_DATA = True
+USE_FD_DATA = False
 FD_DATA_PATH = "/kaggle/input/power-test184/anchor_points.json"
 FD_DATA_WEIGHT = 0.005
 FD_DATA_BATCH_SIZE = 512

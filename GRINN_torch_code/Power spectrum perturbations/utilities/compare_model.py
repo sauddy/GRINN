@@ -28,6 +28,9 @@ Example:
     # Use GPU-accelerated FD solver (faster for large grids, not used for 1D plots)
     python compare_model.py model.pth 1.5,2.0,3.0 --plot-type pdf --fd-backend gpu
     python compare_model.py model.pth 0.0,1.0,2.0 --fd-backend torch  # Same as gpu
+    
+    # 3D sinusoidal block plots (density + epsilon)
+    python compare_model.py model.pth 2.0 --plot-type 3d --N-fd 64
 """
 
 import numpy as np
@@ -38,15 +41,19 @@ import os
 import sys
 import argparse
 from scipy.optimize import curve_fit
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+from matplotlib.ticker import FormatStrFormatter
+from matplotlib.colors import LightSource
 
 # Add parent directory to path for imports when running from utilities directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import necessary modules
 from config import (
-    xmin, ymin, tmin, tmax, wave, a, cs, rho_o, harmonics, const, G,
+    xmin, ymin, zmin, tmin, tmax, wave, a, cs, rho_o, harmonics, const, G,
     PERTURBATION_TYPE, RANDOM_SEED, N_GRID, POWER_EXPONENT, DIMENSION, SNAPSHOT_DIR, FD_N_1D,
-    GROWTH_PLOT_TMAX, GROWTH_PLOT_DT
+    FD_N_3D, SLICE_Z, GROWTH_PLOT_TMAX, GROWTH_PLOT_DT
 )
 # Import num_of_waves with different name to avoid scoping conflict in main()
 from config import num_of_waves as num_of_waves_config
@@ -55,8 +62,16 @@ from core.data_generator import input_taker, req_consts_calc
 from core.initial_conditions import initialize_shared_velocity_fields
 from visualization.Plotting_2D import set_shared_velocity_fields, create_density_growth_plot
 import visualization.Plotting_2D as plotting_module
-from numerical_solvers.LAX_2D import lax_solution, lax_solution_with_shared_velocity, lax_solution1D_sinusoidal
-from numerical_solvers.LAX_2D_torch import lax_solution_torch
+from numerical_solvers.LAX import (
+    lax_solution,
+    lax_solution_with_shared_velocity,
+    lax_solution_3d_sinusoidal,
+    lax_solution1D_sinusoidal,
+)
+from numerical_solvers.LAX_torch import (
+    lax_solution_torch,
+    lax_solution_3d_sinusoidal_torch,
+)
 from scipy.interpolate import RegularGridInterpolator, interp1d
 from config import KX, KY, SHOW_LINEAR_THEORY
 
@@ -69,7 +84,157 @@ if device.startswith('cuda'):
     torch.cuda.empty_cache()
 
 
-def load_model(model_path, xmax, ymax):
+class FDSolutionManager:
+    """
+    Cache wrapper to avoid redundant FD solver executions across plot types.
+    Stores FD outputs keyed by (time, N, nu, backend, mode) so repeated requests
+    reuse existing solutions.
+    """
+
+    def __init__(self, initial_params, lam, num_of_waves, rho_1, perturbation_type, shared_vx=None, shared_vy=None):
+        xmin, xmax, ymin, ymax, *_ = initial_params
+        self.xmin = xmin
+        self.xmax = xmax
+        self.ymin = ymin
+        self.ymax = ymax
+        self.zmin = zmin
+        self.lam = lam
+        self.num_of_waves = num_of_waves
+        self.rho_1 = rho_1
+        self.perturbation_type = str(perturbation_type).lower()
+        self.dimension = DIMENSION
+        self.shared_vx = shared_vx
+        self.shared_vy = shared_vy
+        self.cache = {}
+
+    def _normalize_backend(self, backend):
+        backend_lower = backend.lower()
+        if backend_lower in ("gpu", "torch") and torch.cuda.is_available():
+            return "gpu"
+        return "cpu"
+
+    def get_solution(self, time_value, N=None, nu=0.5, backend="cpu"):
+        """
+        Retrieve FD solution for given parameters, computing it only once.
+        """
+        backend_key = self._normalize_backend(backend)
+        if N is None:
+            default_n = FD_N_3D if (self.dimension >= 3 and self.perturbation_type == "sinusoidal") else N_GRID
+            N_eff = default_n
+        else:
+            N_eff = int(N)
+
+        use_velocity_ps = (self.perturbation_type == "power_spectrum")
+        use_3d = self.dimension >= 3 and self.perturbation_type == "sinusoidal"
+        cache_key = (
+            round(float(time_value), 8),
+            int(N_eff),
+            round(float(nu), 6),
+            backend_key,
+            "3d" if use_3d else "2d",
+            use_velocity_ps
+        )
+
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        if use_3d:
+            solution = self._run_solver_3d(time_value, N_eff, nu, backend_key)
+        else:
+            solution = self._run_solver_2d(time_value, N_eff, nu, backend_key, use_velocity_ps)
+
+        self.cache[cache_key] = solution
+        return solution
+
+    def _run_solver_2d(self, time_value, N, nu, backend_key, use_velocity_ps):
+        """
+        Execute 2D FD solver (power spectrum or sinusoidal) and package results.
+        """
+        xmin, ymin = self.xmin, self.ymin
+        lam = self.lam
+        num_of_waves = self.num_of_waves
+        rho_1 = self.rho_1
+
+        if backend_key == "gpu":
+            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
+                time_val=time_value, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
+                vel_rms=a*cs, random_seed=RANDOM_SEED
+            )
+            x_fd = np.asarray(x_fd)
+        else:
+            if use_velocity_ps and self.shared_vx is not None and self.shared_vy is not None:
+                n_shared = int(self.shared_vx.shape[0])
+                if n_shared != N:
+                    print(f"Shared velocity fields available at resolution {n_shared}. Using that instead of N={N}.")
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
+                    time_value, n_shared, nu, lam, num_of_waves, rho_1, self.shared_vx, self.shared_vy,
+                    gravity=True, isplot=False, comparison=False, animation=True
+                )
+                N = n_shared
+            else:
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
+                    time_value, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False,
+                    comparison=False, animation=True, use_velocity_ps=use_velocity_ps,
+                    ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                )
+
+        x_coords = np.asarray(x_fd) + xmin
+        y_extent = lam * num_of_waves
+        y_coords = np.linspace(ymin, ymin + y_extent, np.asarray(rho_fd).shape[1], endpoint=False)
+
+        return {
+            "dimension": 2,
+            "x": x_coords,
+            "y": y_coords,
+            "rho": np.asarray(rho_fd),
+            "vx": np.asarray(vx_fd),
+            "vy": np.asarray(vy_fd),
+            "backend": backend_key,
+            "N": N
+        }
+
+    def _run_solver_3d(self, time_value, N, nu, backend_key):
+        """
+        Execute 3D sinusoidal FD solver (torch or numpy version) and package results.
+        """
+        xmin, ymin, zmin_local = self.xmin, self.ymin, self.zmin
+        lam = self.lam
+        num_of_waves = self.num_of_waves
+        rho_1 = self.rho_1
+
+        if backend_key == "gpu":
+            fd_result = lax_solution_3d_sinusoidal_torch(
+                time_val=time_value, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, gravity=True
+            )
+        else:
+            fd_result = lax_solution_3d_sinusoidal(
+                time_value, N, nu, lam, num_of_waves, rho_1, gravity=True
+            )
+
+        x_fd = np.asarray(fd_result[0]) + xmin
+        y_fd = np.asarray(fd_result[1]) + ymin
+        z_fd = np.asarray(fd_result[2]) + zmin_local
+        rho_fd = np.asarray(fd_result[3])
+        vx_fd = np.asarray(fd_result[4])
+        vy_fd = np.asarray(fd_result[5])
+        vz_fd = np.asarray(fd_result[6])
+
+        return {
+            "dimension": 3,
+            "x": x_fd,
+            "y": y_fd,
+            "z": z_fd,
+            "rho": rho_fd,
+            "vx": vx_fd,
+            "vy": vy_fd,
+            "vz": vz_fd,
+            "backend": backend_key,
+            "N": N
+        }
+
+
+def load_model(model_path, xmax, ymax, zmax=None):
     """
     Load a saved single PINN model from disk.
     
@@ -86,14 +251,25 @@ def load_model(model_path, xmax, ymax):
     
     net = PINN(n_harmonics=harmonics)
     net.load_state_dict(torch.load(model_path, map_location=device))
-    net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
+    rmin = [xmin]
+    rmax = [xmax]
+    if DIMENSION >= 2:
+        rmin.append(ymin)
+        rmax.append(ymax)
+    if DIMENSION >= 3:
+        if zmax is None:
+            raise ValueError("zmax must be provided when DIMENSION >= 3")
+        rmin.append(zmin)
+        rmax.append(zmax)
+    net.set_domain(rmin=rmin, rmax=rmax, dimension=DIMENSION)
     net = net.to(device)
     net.eval()
     print(f"Loaded PINN model from {model_path}")
     return net
 
 
-def create_comparison_plots(net, initial_params, time_points, which="density", N=None, nu=0.5, save_plots=True, fd_backend="cpu", show_plot=True):
+def create_comparison_plots(net, initial_params, time_points, which="density", N=None, nu=0.5,
+                            save_plots=True, fd_backend="cpu", show_plot=True, fd_cache=None):
     """
     Create comparison plots showing PINN, FD, and epsilon metric at custom time points.
     Based on create_5x3_comparison_table but accepts custom time points.
@@ -108,15 +284,24 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         save_plots: Whether to save the plots to disk (default: True)
         fd_backend: FD solver backend - "cpu" (default) or "gpu"/"torch" for GPU-accelerated solver
         show_plot: Whether to show the plot immediately (default: True). Set to False to show later.
+        fd_cache: Instance of FDSolutionManager for reusing FD solutions.
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    num_of_waves = (xmax - xmin) / lam
+    z_slice = SLICE_Z if DIMENSION >= 3 else None
+    if fd_cache is None:
+        raise ValueError("fd_cache is required for create_comparison_plots to reuse FD data.")
     
     # Use N_GRID by default to match training comparison plots
     if N is None:
-        N = N_GRID
-        print(f"2D spatial plot: N not provided, using default N_GRID={N_GRID} from config")
+        if DIMENSION >= 3 and str(PERTURBATION_TYPE).lower() == "sinusoidal":
+            N = FD_N_3D
+            print(f"3D spatial plot: N not provided, using default FD_N_3D={FD_N_3D} from config")
+        else:
+            N = N_GRID
+            print(f"2D spatial plot: N not provided, using default N_GRID={N_GRID} from config")
     else:
-        print(f"2D spatial plot: Using N={N} from command line argument")
+        print(f"Spatial plot: Using N={N} from command line argument")
     
     num_times = len(time_points)
     print(f"Creating {num_times}x3 comparison table for {which}...")
@@ -148,84 +333,69 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
         pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
         pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
-        
-        output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
-        
-        if which == "density":
-            # PINN already outputs actual density (not log density) due to _apply_density_constraint
-            pinn_field = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
-            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
-            pinn_vx = U
-            pinn_vy = V
-        else:  # velocity magnitude
-            U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
-            V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
-            pinn_field = np.sqrt(U**2 + V**2)
-            pinn_vx = U
-            pinn_vy = V
-        
-        # Get FD data - use same parameters as PINN for power spectrum
-        num_of_waves = (xmax - xmin) / lam
-        
-        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and torch.cuda.is_available():
-            # Use GPU-accelerated torch solver (supports both power_spectrum and sinusoidal)
-            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
-            print(f"Using GPU solver for 2D spatial plot at t={t:.4f} with N={N} (grid size: {N}x{N})")
-            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
-                time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
-                vel_rms=a*cs, random_seed=RANDOM_SEED
-            )
-            # Note: torch solver returns None for phi, but we don't use it in comparison plots
+        if DIMENSION >= 3:
+            z_values = np.full((Q**2, 1), z_slice, dtype=np.float32)
+            pt_z_collocation = Variable(torch.from_numpy(z_values).float(), requires_grad=True).to(device)
         else:
-            # Use CPU solver (default or when GPU not available)
-            if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch"):
-                print(f"Warning: GPU backend requested but CUDA not available. Using CPU solver.")
-            if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-                # For power spectrum, use shared velocity fields if available
-                shared_vx = getattr(plotting_module, '_shared_vx_np', None)
-                shared_vy = getattr(plotting_module, '_shared_vy_np', None)
-                if shared_vx is not None and shared_vy is not None:
-                    x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_with_shared_velocity(
-                        t, N, nu, lam, num_of_waves, rho_1, shared_vx, shared_vy,
-                        gravity=True, isplot=False, comparison=False, animation=True
-                    )
-                else:
-                    # Fallback to original method
-                    x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                        t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                        use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
-                    )
-            else:
-                # For sinusoidal, use original parameters
-                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution(
-                    t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=False, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
-                )
+            pt_z_collocation = None
         
-        # Build y-array consistent with solver setup
-        # Calculate domain boundaries from config
-        xmax_calc = xmin + lam * num_of_waves
-        ymax_calc = ymin + lam * num_of_waves
-        Lx = xmax_calc - xmin
-        Nx = x_fd.shape[0]
-        Ny = rho_fd.shape[1]
-        y_fd = np.linspace(ymin, ymax_calc, Ny, endpoint=False)
+        net_inputs = [pt_x_collocation]
+        if DIMENSION >= 2:
+            net_inputs.append(pt_y_collocation)
+        if DIMENSION >= 3 and pt_z_collocation is not None:
+            net_inputs.append(pt_z_collocation)
+        net_inputs.append(pt_t_collocation)
         
-        # Create meshgrid for FD data
-        X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+        output_00 = net(net_inputs)
+        
+        # Extract components
+        rho_pinn = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+        pinn_vx = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+        pinn_vy = output_00[:, 2].data.cpu().numpy().reshape(Q, Q) if DIMENSION >= 2 else None
+        pinn_vz = output_00[:, 3].data.cpu().numpy().reshape(Q, Q) if DIMENSION >= 3 else None
         
         if which == "density":
-            fd_field = rho_fd
+            pinn_field = rho_pinn
         else:  # velocity magnitude
-            fd_field = np.sqrt(vx_fd**2 + vy_fd**2)
+            vel_components = [comp for comp in (pinn_vx, pinn_vy, pinn_vz) if comp is not None]
+            if vel_components:
+                pinn_field = np.sqrt(np.sum([comp**2 for comp in vel_components], axis=0))
+            else:
+                pinn_field = np.zeros_like(pinn_vx)
+        
+        fd_solution = fd_cache.get_solution(t, N=N, nu=nu, backend=fd_backend)
+        if fd_solution["dimension"] == 3:
+            x_fd = fd_solution["x"]
+            y_fd = fd_solution["y"]
+            z_fd = fd_solution["z"]
+            z_idx = np.argmin(np.abs(z_fd - z_slice))
+            if np.abs(z_fd[z_idx] - z_slice) > 1e-6:
+                print(f"Using nearest z-slice at {z_fd[z_idx]:.4f} for requested z={z_slice:.4f}")
+            rho_fd = fd_solution["rho"][:, :, z_idx]
+            vx_fd = fd_solution["vx"][:, :, z_idx]
+            vy_fd = fd_solution["vy"][:, :, z_idx]
+            fd_slice_vz = fd_solution["vz"][:, :, z_idx]
+        else:
+            x_fd = fd_solution["x"]
+            y_fd = fd_solution["y"]
+            rho_fd = fd_solution["rho"]
+            vx_fd = fd_solution["vx"]
+            vy_fd = fd_solution["vy"]
+            fd_slice_vz = None
+        
+        if which == "density":
+            fd_field_native = rho_fd
+        else:
+            if fd_slice_vz is not None:
+                fd_field_native = np.sqrt(vx_fd**2 + vy_fd**2 + fd_slice_vz**2)
+            else:
+                fd_field_native = np.sqrt(vx_fd**2 + vy_fd**2)
         
         # Interpolate FD data to PINN grid
         points_pinn = np.column_stack([tau.ravel(), phi.ravel()])
         
         interpolator = RegularGridInterpolator(
-            (x_fd, y_fd), fd_field,
+            (x_fd, y_fd), fd_field_native,
             method='linear',
             bounds_error=False,
             fill_value=None
@@ -249,10 +419,21 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         )
         fd_vy_interp = vy_interpolator(points_pinn).reshape(Q, Q)
         
+        if fd_slice_vz is not None:
+            vz_interpolator = RegularGridInterpolator(
+                (x_fd, y_fd), fd_slice_vz,
+                method='linear',
+                bounds_error=False,
+                fill_value=None
+            )
+            fd_vz_interp = vz_interpolator(points_pinn).reshape(Q, Q)
+        else:
+            fd_vz_interp = None
+        
         pinn_data.append(pinn_field)
         fd_data.append(fd_field_interp)
-        pinn_velocity_data.append((pinn_vx, pinn_vy))
-        fd_velocity_data.append((fd_vx_interp, fd_vy_interp))
+        pinn_velocity_data.append((pinn_vx, pinn_vy, pinn_vz))
+        fd_velocity_data.append((fd_vx_interp, fd_vy_interp, fd_vz_interp))
     
     # Second pass: create plots
     for i, t in enumerate(time_points):
@@ -260,8 +441,8 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         fd_field = fd_data[i]
         
         # Extract velocity components
-        pinn_vx, pinn_vy = pinn_velocity_data[i]
-        fd_vx, fd_vy = fd_velocity_data[i]
+        pinn_vx, pinn_vy, pinn_vz = pinn_velocity_data[i]
+        fd_vx, fd_vy, fd_vz = fd_velocity_data[i]
         
         # Calculate epsilon metric: ε = 2 * |PINN - FD| / (PINN + FD) * 100
         eps = 1e-6
@@ -347,11 +528,252 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
     return fig, axes
 
 
-def create_1d_cross_section_plot(net, initial_params, time_points, y_fixed=0.6, N_fd=None, nu_fd=0.5, save_plots=True, fd_backend="cpu"):
+def _evaluate_pinn_density_3d(net, x_coords, y_coords, z_coords, time_value, batch_size=200000):
+    """
+    Evaluate the PINN density field on a full 3D grid using batched inference.
+    """
+    if DIMENSION < 3:
+        raise ValueError("3D PINN evaluation requested but DIMENSION < 3.")
+    
+    X, Y, Z = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
+    coords = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+    total_points = coords.shape[0]
+    rho_values = np.zeros(total_points, dtype=np.float32)
+    time_column = np.full((total_points, 1), time_value, dtype=np.float32)
+    
+    net.eval()
+    with torch.no_grad():
+        for start in range(0, total_points, batch_size):
+            end = min(total_points, start + batch_size)
+            chunk = coords[start:end]
+            t_chunk = time_column[start:end]
+            
+            pt_x = torch.from_numpy(chunk[:, 0:1]).float().to(device)
+            pt_y = torch.from_numpy(chunk[:, 1:2]).float().to(device)
+            pt_z = torch.from_numpy(chunk[:, 2:3]).float().to(device)
+            pt_t = torch.from_numpy(t_chunk).float().to(device)
+            
+            outputs = net([pt_x, pt_y, pt_z, pt_t])
+            rho_chunk = outputs[:, 0:1].detach().cpu().numpy().reshape(-1)
+            rho_values[start:end] = rho_chunk
+    
+    return rho_values.reshape(len(x_coords), len(y_coords), len(z_coords))
+
+
+def _plot_cube_surface(ax, x_coords, y_coords, z_coords, values, cmap, norm):
+    """
+    Render a cube using opaque surfaces with proper lighting.
+    """
+    from matplotlib.colors import LightSource
+    
+    interp = RegularGridInterpolator(
+        (x_coords, y_coords, z_coords),
+        values,
+        bounds_error=False,
+        fill_value=None
+    )
+
+    def _sample_plane(axis, const_val, grid_a, grid_b):
+        if axis == "z":
+            A, B = np.meshgrid(grid_a, grid_b, indexing='ij')
+            pts = np.column_stack([A.ravel(), B.ravel(), np.full(A.size, const_val)])
+            data = interp(pts).reshape(A.shape)
+            return A, B, np.full_like(A, const_val), data
+        if axis == "y":
+            A, B = np.meshgrid(grid_a, grid_b, indexing='ij')
+            pts = np.column_stack([A.ravel(), np.full(A.size, const_val), B.ravel()])
+            data = interp(pts).reshape(A.shape)
+            return A, np.full_like(A, const_val), B, data
+        A, B = np.meshgrid(grid_a, grid_b, indexing='ij')
+        pts = np.column_stack([np.full(A.size, const_val), A.ravel(), B.ravel()])
+        data = interp(pts).reshape(A.shape)
+        return np.full_like(A, const_val), A, B, data
+
+    # Higher density = smoother surfaces
+    dense = 250
+    xs = np.linspace(x_coords[0], x_coords[-1], dense)
+    ys = np.linspace(y_coords[0], y_coords[-1], dense)
+    zs = np.linspace(z_coords[0], z_coords[-1], dense)
+
+    # Create light source with better parameters
+    # Lower altdeg = less harsh lighting, blend controls color saturation
+    ls = LightSource(azdeg=315, altdeg=35)
+    
+    planes = [
+        ("z", z_coords[0], xs, ys),
+        ("z", z_coords[-1], xs, ys),
+        ("y", y_coords[0], xs, zs),
+        ("y", y_coords[-1], xs, zs),
+        ("x", x_coords[0], ys, zs),
+        ("x", x_coords[-1], ys, zs),
+    ]
+
+    for axis_id, const_val, grid_a, grid_b in planes:
+        Xa, Ya, Za, data_plane = _sample_plane(axis_id, const_val, grid_a, grid_b)
+        
+        # Map data to colors
+        colors = cmap(norm(data_plane))
+        
+        # Apply lighting with blend mode to preserve color saturation
+        # blend_mode='soft' or 'hsv' preserves colors better than default 'overlay'
+        # fraction controls how much lighting vs original color (lower = more original color)
+        rgb = np.array(colors[..., :3])
+        shaded_rgb = ls.shade_rgb(rgb, elevation=Za, blend_mode='soft', fraction=0.7)
+        
+        # Reconstruct with alpha if present
+        if colors.shape[-1] == 4:
+            shaded_colors = np.dstack([shaded_rgb, colors[..., 3]])
+        else:
+            shaded_colors = shaded_rgb
+        
+        ax.plot_surface(Xa, Ya, Za, 
+                       facecolors=shaded_colors,
+                       rstride=1, cstride=1,
+                       linewidth=0,
+                       antialiased=True,
+                       shade=False)
+
+    # Set limits and aspect
+    ax.set_xlim(x_coords[0], x_coords[-1])
+    ax.set_ylim(y_coords[0], y_coords[-1])
+    ax.set_zlim(z_coords[0], z_coords[-1])
+    ax.set_box_aspect((
+        x_coords[-1] - x_coords[0],
+        y_coords[-1] - y_coords[0],
+        z_coords[-1] - z_coords[0]
+    ))
+    
+    # View settings
+    ax.set_proj_type('persp')
+    ax.view_init(elev=20, azim=-135)
+    ax.dist = 10
+
+    # Labels
+    ax.set_xlabel("x", fontsize=11, labelpad=10)
+    ax.set_ylabel("y", fontsize=11, labelpad=10)
+    ax.set_zlabel("z", fontsize=11, labelpad=10)
+
+    # Ticks
+    tick_count = 5
+    ax.set_xticks(np.linspace(x_coords[0], x_coords[-1], tick_count))
+    ax.set_yticks(np.linspace(y_coords[0], y_coords[-1], tick_count))
+    ax.set_zticks(np.linspace(z_coords[0], z_coords[-1], tick_count))
+    
+    formatter = FormatStrFormatter('%.2f')
+    ax.xaxis.set_major_formatter(formatter)
+    ax.yaxis.set_major_formatter(formatter)
+    ax.zaxis.set_major_formatter(formatter)
+    ax.tick_params(labelsize=9, pad=5)
+
+    # Clean panes
+    for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+        axis.pane.fill = False
+        axis.pane.set_edgecolor('lightgray')
+        axis.pane.set_alpha(0.2)
+        axis._axinfo["grid"]["linewidth"] = 0.4
+        axis._axinfo["grid"]["linestyle"] = ':'
+        axis._axinfo["grid"]["color"] = (0.6, 0.6, 0.6, 0.3)
+
+    ax.grid(True, linestyle=':', linewidth=0.4, alpha=0.3)
+
+
+def create_3d_sinusoidal_case_plot(net, initial_params, time_points, N=None, nu=0.5,
+                                   save_plots=True, fd_backend="cpu", fd_cache=None):
+    """
+    Generate 3D block plots (density + epsilon) for sinusoidal 3D configurations.
+    """
+    if DIMENSION < 3 or str(PERTURBATION_TYPE).lower() != "sinusoidal":
+        print("3D sinusoidal plotting is only available when DIMENSION=3 and PERTURBATION_TYPE='sinusoidal'.")
+        return None
+    if fd_cache is None:
+        raise ValueError("fd_cache is required for 3D sinusoidal plotting.")
+    
+    xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax = initial_params
+    num_of_waves = (xmax - xmin) / lam
+    n_fd = int(N if N is not None else FD_N_3D)
+    if fd_backend.lower() in ("gpu", "torch") and not torch.cuda.is_available():
+        print("Warning: GPU backend requested for 3D plot but CUDA not available. Falling back to CPU.")
+    
+    cases = []
+    density_min = np.inf
+    density_max = -np.inf
+    epsilon_max = 0.0
+    
+    for idx, t in enumerate(time_points):
+        print(f"Collecting 3D data for case {idx+1} at t={t:.4f} (N={n_fd})")
+        fd_solution = fd_cache.get_solution(t, N=n_fd, nu=nu, backend=fd_backend)
+        if fd_solution["dimension"] != 3:
+            raise ValueError("3D sinusoidal plot requested but FD cache did not return 3D data.")
+        x_fd = fd_solution["x"]
+        y_fd = fd_solution["y"]
+        z_fd = fd_solution["z"]
+        rho_fd = fd_solution["rho"]
+        
+        rho_pinn = _evaluate_pinn_density_3d(net, x_fd, y_fd, z_fd, t)
+        epsilon_field = 200.0 * np.abs(rho_pinn - rho_fd) / (rho_pinn + rho_fd + 1e-6)
+        
+        cases.append({
+            "rho": rho_pinn,
+            "epsilon": epsilon_field,
+            "x": x_fd,
+            "y": y_fd,
+            "z": z_fd,
+            "label": f"Case {idx+1} (t={t:.2f})"
+        })
+        density_min = min(density_min, np.min(rho_pinn))
+        density_max = max(density_max, np.max(rho_pinn))
+        epsilon_max = max(epsilon_max, np.max(epsilon_field))
+    
+    if np.isclose(density_min, density_max):
+        density_norm = Normalize(vmin=density_min - 1e-3, vmax=density_max + 1e-3)
+    else:
+        density_norm = Normalize(vmin=density_min, vmax=density_max)
+    epsilon_norm = Normalize(vmin=0.0, vmax=epsilon_max if epsilon_max > 0 else 1.0)
+    
+    num_cases = len(cases)
+    fig = plt.figure(figsize=(7 * num_cases, 10))
+    grid = fig.add_gridspec(2, num_cases, hspace=0.22, wspace=0.15)
+    density_axes = []
+    epsilon_axes = []
+    
+    for idx, case in enumerate(cases):
+        ax_density = fig.add_subplot(grid[0, idx], projection='3d')
+        _plot_cube_surface(ax_density, case["x"], case["y"], case["z"], case["rho"], plt.get_cmap('YlOrBr'), density_norm)
+        ax_density.set_title(case["label"])
+        density_axes.append(ax_density)
+        
+        ax_eps = fig.add_subplot(grid[1, idx], projection='3d')
+        _plot_cube_surface(ax_eps, case["x"], case["y"], case["z"], case["epsilon"], plt.get_cmap('Greys'), epsilon_norm)
+        ax_eps.set_title(r"$\varepsilon$ (\%)", fontsize=12)
+        epsilon_axes.append(ax_eps)
+    
+    density_sm = ScalarMappable(norm=density_norm, cmap='YlOrBr')
+    density_sm.set_array([])
+    fig.colorbar(density_sm, ax=density_axes, orientation='horizontal', fraction=0.05, pad=0.08, label=r"$\rho$")
+    
+    epsilon_sm = ScalarMappable(norm=epsilon_norm, cmap='Greys')
+    epsilon_sm.set_array([])
+    fig.colorbar(epsilon_sm, ax=epsilon_axes, orientation='horizontal', fraction=0.05, pad=0.12, label=r"$\varepsilon$ (\%)")
+    
+    if save_plots:
+        desktop_path = r"C:\Users\tirth\OneDrive\Desktop"
+        output_dir = os.path.join(desktop_path, "model test plots")
+        os.makedirs(output_dir, exist_ok=True)
+        time_str = "_".join([f"{t:.4f}" for t in time_points])
+        save_path = os.path.join(output_dir, f"3d_sinusoidal_cases_t{time_str}.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved 3D sinusoidal plot to {save_path}")
+    
+    plt.show()
+    return fig
+
+
+def create_1d_cross_section_plot(net, initial_params, time_points, y_fixed=0.6, N_fd=None, nu_fd=0.5,
+                                 save_plots=True, fd_backend="cpu", fd_cache=None):
     """
     Create 1D cross-section plots at fixed y, comparing PINN vs FD solver.
-    Always uses sinusoidal initial conditions regardless of PERTURBATION_TYPE.
-    Can use GPU-accelerated 2D solver and extract 1D slice, or CPU 1D solver.
+    Always uses the dedicated 1D sinusoidal LAX solver (deterministic) to ensure clean references
+    regardless of the global perturbation type or FD cache contents.
     
     Args:
         net: Trained neural network
@@ -361,15 +783,20 @@ def create_1d_cross_section_plot(net, initial_params, time_points, y_fixed=0.6, 
         N_fd: grid size for FD solver
         nu_fd: Courant number for FD solver
         save_plots: Whether to save plots to disk
-        fd_backend: FD solver backend - "cpu" (default) or "gpu"/"torch" for GPU-accelerated solver
+        fd_backend: Retained for CLI compatibility (not used; 1D solver is CPU-only).
+        fd_cache: Retained for CLI compatibility (not used in the new 1D workflow).
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, _output_folder, _tmax = initial_params
     num_of_waves = (xmax - xmin) / lam
     
-    # Set default N_fd: use FD_N_1D from config.py if not provided
+    # Set default N_fd to match spatial plots so FD cache can be reused
     if N_fd is None:
-        N_fd = FD_N_1D
-        print(f"1D cross-section: N_fd not provided, using default FD_N_1D={FD_N_1D} from config")
+        if DIMENSION >= 3 and str(PERTURBATION_TYPE).lower() == "sinusoidal":
+            N_fd = FD_N_3D
+            print(f"1D cross-section: N_fd not provided, using default FD_N_3D={FD_N_3D} from config")
+        else:
+            N_fd = N_GRID
+            print(f"1D cross-section: N_fd not provided, using default N_GRID={N_GRID} from config")
     else:
         print(f"1D cross-section: Using N_fd={N_fd} from command line argument")
     
@@ -382,20 +809,36 @@ def create_1d_cross_section_plot(net, initial_params, time_points, y_fixed=0.6, 
     # Build x grid for PINN slice
     X = np.linspace(xmin, xmax, 1000).reshape(1000, 1)
     Y = y_fixed * np.ones_like(X)
+    if DIMENSION >= 3:
+        z_fixed = SLICE_Z
+        Z = z_fixed * np.ones_like(X)
+    else:
+        Z = None
     
     # Create 4 rows x T columns panel layout
     T = len(time_points)
     fig = plt.figure(figsize=(6*T, 8), constrained_layout=False)
     grid = plt.GridSpec(4, T, figure=fig, hspace=0.12, wspace=0.18)
     
+    # Cache for reused 1D FD solutions
+    fd_1d_cache = {}
+
     for row_idx, t in enumerate(time_points):
         # PINN predictions at fixed y
         t_arr = t * np.ones_like(X)
         pt_x = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
         pt_y = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
+        pt_z = Variable(torch.from_numpy(Z).float(), requires_grad=True).to(device) if Z is not None else None
         pt_t = Variable(torch.from_numpy(t_arr).float(), requires_grad=True).to(device)
         
-        output_00 = net([pt_x, pt_y, pt_t])
+        net_inputs = [pt_x]
+        if DIMENSION >= 2:
+            net_inputs.append(pt_y)
+        if DIMENSION >= 3 and pt_z is not None:
+            net_inputs.append(pt_z)
+        net_inputs.append(pt_t)
+        
+        output_00 = net(net_inputs)
         rho_pinn = output_00[:, 0:1].data.cpu().numpy().reshape(-1)
         vx_pinn = output_00[:, 1:2].data.cpu().numpy().reshape(-1)
         
@@ -413,45 +856,22 @@ def create_1d_cross_section_plot(net, initial_params, time_points, y_fixed=0.6, 
                 rho_lt = rho_base + rho_1*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed)
                 vx_lt = v1_lt*np.cos(omega * t - KX * X[:, 0] - KY * y_fixed) * (KX / k) if k > 0 else 0.0
         
-        # Get FD solution - use GPU 2D solver if requested, otherwise use CPU 1D solver
-        # Always use sinusoidal initial conditions (use_velocity_ps=False)
-        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and torch.cuda.is_available():
-            # Use GPU-accelerated 2D torch solver and extract 1D slice
-            # Use N_fd as provided (or FD_N_1D from config if not specified)
-            print(f"Using GPU solver for 1D cross-section at t={t:.4f} with N={N_fd} (grid size: {N_fd}x{N_fd})")
-            x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, _phi_fd_2d, _n, _rho_max = lax_solution_torch(
-                time_val=t, N=N_fd, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                gravity=True, use_velocity_ps=False, ps_index=POWER_EXPONENT, 
-                vel_rms=a*cs, random_seed=RANDOM_SEED
-            )
-            
-            # Extract 1D slice from 2D solution at y = y_fixed
-            # Calculate y coordinates for FD solution
-            ymax_calc = ymin + lam * num_of_waves
-            y_fd_2d = np.linspace(ymin, ymax_calc, rho_fd_2d.shape[1], endpoint=False)
-            y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
-            
-            # Extract the slice
-            rho_fd_1d = rho_fd_2d[:, y_idx]
-            v_fd_1d = vx_fd_2d[:, y_idx]  # Use x-component of velocity
-            
-            # Offset x_fd_2d by xmin to match domain
-            x_fd_1d_offset = x_fd_2d + xmin
-        else:
-            # Use CPU 1D sinusoidal LAX solver
-            if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch"):
-                print(f"Warning: GPU backend requested but CUDA not available. Using CPU 1D solver.")
+        # Get FD 1D sinusoidal solution (always, to ensure clean comparison)
+        cache_key = (round(float(t), 8), int(N_fd), round(float(nu_fd), 6))
+        if cache_key not in fd_1d_cache:
             x_fd_1d, rho_fd_1d, v_fd_1d, _phi_fd_1d, _n, _rho_max = lax_solution1D_sinusoidal(
-                time=t, N=N_fd, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, 
+                time=t, N=N_fd, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
                 gravity=True, isplot=False, comparison=False, animation=True
             )
-            
-            # Offset x_fd_1d by xmin to match domain
-            x_fd_1d_offset = x_fd_1d + xmin
+            fd_1d_cache[cache_key] = (
+                (x_fd_1d + xmin),
+                rho_fd_1d,
+                v_fd_1d
+            )
+        x_fd_line, rho_fd_1d, v_fd_1d = fd_1d_cache[cache_key]
         
-        # Interpolate FD results to PINN X grid for comparison
-        rho_fd_interp = interp1d(x_fd_1d_offset, rho_fd_1d, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
-        v_fd_interp = interp1d(x_fd_1d_offset, v_fd_1d, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        rho_fd_interp = interp1d(x_fd_line, rho_fd_1d, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        v_fd_interp = interp1d(x_fd_line, v_fd_1d, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
         
         # Column index
         c = row_idx
@@ -746,8 +1166,9 @@ def fit_powerlaw(bin_centers, pdf_values, threshold=None):
         return None, None, None
 
 
-def create_density_pdf_plot(net, initial_params, time_points, N=None, nu=0.5, save_plots=True, 
-                            fit_lognorm=True, fit_powerlaw_tail=True, powerlaw_threshold=0.8, fd_backend="cpu"):
+def create_density_pdf_plot(net, initial_params, time_points, N=None, nu=0.5, save_plots=True,
+                            fit_lognorm=True, fit_powerlaw_tail=True, powerlaw_threshold=0.8,
+                            fd_backend="cpu", fd_cache=None):
     """
     Create density PDF plots comparing PINN and FD solutions.
     
@@ -762,11 +1183,17 @@ def create_density_pdf_plot(net, initial_params, time_points, N=None, nu=0.5, sa
         fit_powerlaw_tail: Whether to fit power-law tail
         powerlaw_threshold: Minimum log density for power-law fit
         fd_backend: FD solver backend - "cpu" (default) or "gpu"/"torch" for GPU-accelerated solver
+        fd_cache: Instance of FDSolutionManager for reusing FD solutions.
     """
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    if fd_cache is None:
+        raise ValueError("fd_cache is required for density PDF plots.")
     
     if N is None:
-        N = N_GRID
+        if DIMENSION >= 3 and str(PERTURBATION_TYPE).lower() == "sinusoidal":
+            N = FD_N_3D
+        else:
+            N = N_GRID
     
     num_times = len(time_points)
     print(f"Creating density PDF plots for {num_times} time points...")
@@ -799,44 +1226,19 @@ def create_density_pdf_plot(net, initial_params, time_points, N=None, nu=0.5, sa
         # PINN already outputs actual density (not log density) due to _apply_density_constraint
         rho_pinn = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
         
-        # Get FD density field
-        if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch") and torch.cuda.is_available():
-            # Use GPU-accelerated torch solver (supports both power_spectrum and sinusoidal)
-            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
-            x_fd, rho_fd, _, _, _, _, _ = lax_solution_torch(
-                time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
-                vel_rms=a*cs, random_seed=RANDOM_SEED
-            )
+        # Get FD density field from cache and interpolate to PINN grid
+        fd_solution = fd_cache.get_solution(t, N=N, nu=nu, backend=fd_backend)
+        x_fd = fd_solution["x"]
+        y_fd = fd_solution["y"]
+        if fd_solution["dimension"] == 3:
+            z_fd = fd_solution["z"]
+            z_slice = SLICE_Z
+            z_idx = np.argmin(np.abs(z_fd - z_slice))
+            if np.abs(z_fd[z_idx] - z_slice) > 1e-6:
+                print(f"Density PDF: using nearest z-slice {z_fd[z_idx]:.4f} for requested z={z_slice:.4f}")
+            rho_fd = fd_solution["rho"][:, :, z_idx]
         else:
-            # Use CPU solver (default or when GPU not available)
-            if (fd_backend.lower() == "gpu" or fd_backend.lower() == "torch"):
-                print(f"Warning: GPU backend requested but CUDA not available. Using CPU solver.")
-            if str(PERTURBATION_TYPE).lower() == "power_spectrum":
-                shared_vx = getattr(plotting_module, '_shared_vx_np', None)
-                shared_vy = getattr(plotting_module, '_shared_vy_np', None)
-                if shared_vx is not None and shared_vy is not None:
-                    x_fd, rho_fd, _, _, _, _, _ = lax_solution_with_shared_velocity(
-                        t, N, nu, lam, num_of_waves, rho_1, shared_vx, shared_vy,
-                        gravity=True, isplot=False, comparison=False, animation=True
-                    )
-                else:
-                    x_fd, rho_fd, _, _, _, _, _ = lax_solution(
-                        t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                        use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
-                    )
-            else:
-                x_fd, rho_fd, _, _, _, _, _ = lax_solution(
-                    t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
-                    use_velocity_ps=False
-                )
-        
-        # Interpolate FD to PINN grid for consistent comparison
-        xmax_calc = xmin + lam * num_of_waves
-        ymax_calc = ymin + lam * num_of_waves
-        Nx = x_fd.shape[0]
-        Ny = rho_fd.shape[1]
-        y_fd = np.linspace(ymin, ymax_calc, Ny, endpoint=False)
+            rho_fd = fd_solution["rho"]
         X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
         
         points_pinn = np.column_stack([tau.ravel(), phi.ravel()])
@@ -911,8 +1313,8 @@ def main():
     parser.add_argument('model_path', type=str, nargs='?', default=None,
                        help='Path to model file (optional: defaults to SNAPSHOT_DIR/GRINN/model.pth)')
     parser.add_argument('time_points', type=str, help='Comma-separated time points (e.g., "0.0,1.0,2.0,3.0")')
-    parser.add_argument('--plot-type', type=str, default='spatial', choices=['spatial', 'pdf', '1d', 'cross-section'],
-                       help='Type of plot: spatial (PINN/FD/epsilon comparison only), pdf (density PDF only), or 1d/cross-section (spatial + 1D cross-section plots) (default: spatial)')
+    parser.add_argument('--plot-type', type=str, default='spatial', choices=['spatial', 'pdf', '1d', 'cross-section', '3d'],
+                       help='Plot selection: spatial (default), pdf (adds density PDF), 1d/cross-section (adds 1D plots), or 3d (adds 3D sinusoidal cubes).')
     parser.add_argument('--which', type=str, default='both', choices=['density', 'velocity', 'both'],
                        help='Which field to plot for spatial plots: density, velocity, or both (default: both)')
     parser.add_argument('--nu', type=float, default=0.5, help='Courant number for FD solver (default: 0.5)')
@@ -941,7 +1343,7 @@ def main():
     if args.N_fd is not None:
         print(f"Command line: --N-fd argument parsed as args.N_fd = {args.N_fd} (for all plots)")
     else:
-        print(f"Command line: --N-fd not provided, will use defaults (FD_N_1D={FD_N_1D} for 1D plots, N_GRID={N_GRID} for 2D spatial plots)")
+        print(f"Command line: --N-fd not provided, will use defaults (N_GRID={N_GRID} for 2D runs, FD_N_3D={FD_N_3D} for 3D sinusoidal runs)")
     
     # Parse time points (handle spaces around commas)
     try:
@@ -959,6 +1361,7 @@ def main():
     
     xmax = xmin + lam * num_of_waves
     ymax = ymin + lam * num_of_waves
+    zmax = zmin + lam * num_of_waves if DIMENSION >= 3 else None
     
     # Determine model path (use default if not provided)
     if args.model_path is None:
@@ -971,18 +1374,21 @@ def main():
     
     # Load model
     try:
-        net = load_model(model_path, xmax, ymax)
+        net = load_model(model_path, xmax, ymax, zmax=zmax)
     except Exception as e:
         print(f"Error loading model: {e}")
         sys.exit(1)
     
     # Initialize shared velocity fields for consistent PINN/FD initial conditions
+    shared_vx_np = None
+    shared_vy_np = None
     if str(PERTURBATION_TYPE).lower() == "power_spectrum":
         v_1 = a * cs
-        vx_np, vy_np = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
-        set_shared_velocity_fields(vx_np, vy_np)
+        shared_vx_np, shared_vy_np = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
+        set_shared_velocity_fields(shared_vx_np, shared_vy_np)
     
     initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)
+    fd_cache = FDSolutionManager(initial_params, lam, num_of_waves, rho_1, PERTURBATION_TYPE, shared_vx_np, shared_vy_np)
     
     # Generate plots
     save_plots = not args.no_save
@@ -1002,8 +1408,9 @@ def main():
     # The --plot-type flag only determines what ADDITIONAL plots to generate
     create_spatial_plots = True
     
-    # Determine if we should create PDF plots
+    # Determine if we should create PDF or 3D plots
     create_pdf_plots = (args.plot_type == 'pdf')
+    create_3d_plots = (args.plot_type == '3d')
     
     # Use --N-fd for all plots if provided, otherwise use defaults
     N_for_all = args.N_fd if args.N_fd is not None else None
@@ -1013,21 +1420,31 @@ def main():
         if args.which == 'both':
             print(f"\nGenerating density and velocity comparison plots...")
             # Create both plots without showing them immediately
-            fig_density, _ = create_comparison_plots(net, initial_params, time_points, which='density', N=N_for_all, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend, show_plot=False)
-            fig_velocity, _ = create_comparison_plots(net, initial_params, time_points, which='velocity', N=N_for_all, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend, show_plot=False)
+            fig_density, _ = create_comparison_plots(
+                net, initial_params, time_points, which='density', N=N_for_all, nu=args.nu,
+                save_plots=save_plots, fd_backend=args.fd_backend, show_plot=False, fd_cache=fd_cache
+            )
+            fig_velocity, _ = create_comparison_plots(
+                net, initial_params, time_points, which='velocity', N=N_for_all, nu=args.nu,
+                save_plots=save_plots, fd_backend=args.fd_backend, show_plot=False, fd_cache=fd_cache
+            )
             # Show both plots together
             plt.show()
         else:
             print(f"\nGenerating {args.which} comparison plots...")
-            create_comparison_plots(net, initial_params, time_points, which=args.which, N=N_for_all, nu=args.nu, save_plots=save_plots, fd_backend=args.fd_backend)
+            create_comparison_plots(
+                net, initial_params, time_points, which=args.which, N=N_for_all, nu=args.nu,
+                save_plots=save_plots, fd_backend=args.fd_backend, fd_cache=fd_cache
+            )
     
     # Generate 1D cross-section plots (if requested, as additional plots)
     if create_1d_plots:
         print(f"\nGenerating 1D cross-section plots (additional)...")
         print(f"Note: Using sinusoidal initial conditions regardless of PERTURBATION_TYPE setting")
         create_1d_cross_section_plot(
-            net, initial_params, time_points, y_fixed=args.y_fixed, 
-            N_fd=args.N_fd, nu_fd=args.nu_fd, save_plots=save_plots, fd_backend=args.fd_backend
+            net, initial_params, time_points, y_fixed=args.y_fixed,
+            N_fd=N_for_all, nu_fd=args.nu_fd, save_plots=save_plots,
+            fd_backend=args.fd_backend, fd_cache=fd_cache
         )
     
     # Generate PDF plots (if requested)
@@ -1036,7 +1453,16 @@ def main():
         create_density_pdf_plot(
             net, initial_params, time_points, N=N_for_all, nu=args.nu, save_plots=save_plots,
             fit_lognorm=not args.no_fit, fit_powerlaw_tail=not args.no_fit,
-            powerlaw_threshold=args.powerlaw_threshold, fd_backend=args.fd_backend
+            powerlaw_threshold=args.powerlaw_threshold, fd_backend=args.fd_backend,
+            fd_cache=fd_cache
+        )
+    
+    # Generate 3D sinusoidal plots (if requested)
+    if create_3d_plots:
+        print(f"\nGenerating 3D sinusoidal comparison plots (additional)...")
+        create_3d_sinusoidal_case_plot(
+            net, initial_params, time_points, N=N_for_all, nu=args.nu, save_plots=save_plots,
+            fd_backend=args.fd_backend, fd_cache=fd_cache
         )
     
     # Generate density growth plot (additional plot when --plot-growth is given, only for power spectrum case)

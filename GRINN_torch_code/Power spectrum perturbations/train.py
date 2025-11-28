@@ -7,11 +7,28 @@ import time
 from typing import Tuple, Optional, Dict
 import torch
 import torch.nn as nn
+
+# ==================== PyTorch Performance Optimizations ====================
+# Enable cuDNN autotuner - finds optimal convolution algorithms
+# This helps when input sizes are consistent (which they are in PINN training)
+torch.backends.cudnn.benchmark = True
+
+# Enable TF32 on Ampere GPUs (A100, RTX 3090, RTX 4090, etc.) for 20-30% speedup
+# TF32 provides faster matrix multiplication with minimal accuracy loss
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Prefer explicit device/dtype settings rather than deprecated tensor-type override
+    torch.set_default_dtype(torch.float32)
+    if hasattr(torch, "set_default_device"):
+        torch.set_default_device("cuda")
+    print("PyTorch performance optimizations enabled (cuDNN benchmark, TF32)")
+
 from core.data_generator import input_taker, req_consts_calc
 from training.trainer import train, train_xpinn
 from core.initial_conditions import initialize_shared_velocity_fields
 from config import BATCH_SIZE, NUM_BATCHES, N_0, N_r, DIMENSION
-from config import a, wave, cs, xmin, ymin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o
+from config import a, wave, cs, xmin, ymin, zmin, tmin, tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, harmonics, PERTURBATION_TYPE, rho_o, SLICE_Y
 from config import num_neurons, num_layers, num_of_waves
 from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, DEFAULT_ACTIVATION, RANDOM_SEED
 from config import N_INTERFACE, XPINN_OPTIMIZER_STRATEGY, USE_MULTI_GPU, CACHE_IC_VALUES, STARTUP_DT
@@ -34,6 +51,25 @@ import methods.xpinn_decomposition as xpinn_utils
 from methods.xpinn_decomposition import (setup_xpinn_devices, setup_xpinn_networks,
                                          setup_xpinn_collocation, setup_xpinn_interfaces,
                                          cache_xpinn_initial_conditions)
+
+
+def _save_trained_models(nets, use_xpinn):
+    """Persist trained models immediately after training completes."""
+    try:
+        from config import SNAPSHOT_DIR
+        model_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+        os.makedirs(model_dir, exist_ok=True)
+        if not use_xpinn:
+            model_path = os.path.join(model_dir, "model.pth")
+            torch.save(nets[0].state_dict(), model_path)
+            print(f"Saved model to {model_path}")
+        else:
+            for i, net in enumerate(nets):
+                model_path = os.path.join(model_dir, f"model_subdomain_{i}.pth")
+                torch.save(net.state_dict(), model_path)
+            print(f"Saved {len(nets)} subdomain models to {model_dir}")
+    except Exception as e:
+        print(f"Warning: failed to save model: {e}")
 
 
 def load_fd_anchor_points(path: str, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -132,6 +168,7 @@ else:
 
 xmax = xmin + lam * num_of_waves
 ymax = ymin + lam * num_of_waves
+zmax = zmin + lam * num_of_waves
 
 # Initialize shared velocity fields for consistent PINN/FD initial conditions
 vx_np, vy_np = None, None  # Default values for sinusoidal case
@@ -169,26 +206,45 @@ if not USE_XPINN:
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
     optimizerL = torch.optim.LBFGS(net.parameters(), line_search_fn='strong_wolfe')
 
-    model_2D = ASTPN(rmin=[xmin, ymin, tmin], rmax=[xmax, ymax, tmax], N_0=N_0, N_b=0, N_r=N_r, dimension=DIMENSION)
+    if DIMENSION == 1:
+        astpn_rmin = [xmin, tmin]
+        astpn_rmax = [xmax, tmax]
+    elif DIMENSION == 2:
+        astpn_rmin = [xmin, ymin, tmin]
+        astpn_rmax = [xmax, ymax, tmax]
+    elif DIMENSION == 3:
+        astpn_rmin = [xmin, ymin, zmin, tmin]
+        astpn_rmax = [xmax, ymax, zmax, tmax]
+    else:
+        raise ValueError(f"Unsupported DIMENSION={DIMENSION}")
+    collocation_model = ASTPN(rmin=astpn_rmin, rmax=astpn_rmax, N_0=N_0, N_b=0, N_r=N_r, dimension=DIMENSION)
 
     # Set domain on the network so periodic embeddings enforce hard BCs
-    net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
+    spatial_rmin = [xmin]
+    spatial_rmax = [xmax]
+    if DIMENSION >= 2:
+        spatial_rmin.append(ymin)
+        spatial_rmax.append(ymax)
+    if DIMENSION >= 3:
+        spatial_rmin.append(zmin)
+        spatial_rmax.append(zmax)
+    net.set_domain(rmin=spatial_rmin, rmax=spatial_rmax, dimension=DIMENSION)
 
     # IC collocation stays at t=0 throughout
-    collocation_IC_2D = model_2D.geo_time_coord(option="IC")
+    collocation_IC = collocation_model.geo_time_coord(option="IC")
 
     start_time = time.time()
     
     if not USE_CAUSAL_TRAINING:
         # Standard training (no causal features)
         print("Using standard training (no causal curriculum)...")
-        collocation_domain_2D = model_2D.geo_time_coord(option="Domain")
+        collocation_domain = collocation_model.geo_time_coord(option="Domain")
         
         train(
             net=net,
-            model=model_2D,
-            collocation_domain=collocation_domain_2D,
-            collocation_IC=collocation_IC_2D,
+            model=collocation_model,
+            collocation_domain=collocation_domain,
+            collocation_IC=collocation_IC,
             optimizer=optimizer,
             optimizerL=optimizerL,
             closure=None,
@@ -234,14 +290,17 @@ if not USE_XPINN:
             'xmax': xmax,
             'ymin': ymin,
             'ymax': ymax,
+            'zmin': zmin,
+            'zmax': zmax,
             'tmin': tmin,
             'tmax': tmax,
-            'startup_dt': STARTUP_DT
+            'startup_dt': STARTUP_DT,
+            'dimension': DIMENSION
         }
         
         # Initialize causal trainer
         causal_trainer = CausalTrainer(
-            model=model_2D,
+            model=collocation_model,
             net=net,
             optimizer=optimizer,
             optimizerL=optimizerL,
@@ -263,13 +322,13 @@ if not USE_XPINN:
         }
         
         if USE_CAUSAL_CURRICULUM:
-            net = causal_trainer.train_with_curriculum(collocation_IC_2D, **train_kwargs)
+            net = causal_trainer.train_with_curriculum(collocation_IC, **train_kwargs)
         else:
-            net = causal_trainer.train_without_curriculum(collocation_IC_2D, **train_kwargs)
+            net = causal_trainer.train_without_curriculum(collocation_IC, **train_kwargs)
     
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"Training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+    print(f"[Timing] PINN training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
     
     # Store net in a list for compatibility with plotting functions
     nets = [net]
@@ -372,7 +431,10 @@ else:
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"XPINN training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+    print(f"[Timing] XPINN training completed in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+
+# Save models immediately after training completes
+_save_trained_models(nets, USE_XPINN)
 
 # Clear GPU memory after training
 if device.startswith('cuda'):
@@ -389,7 +451,7 @@ if not USE_XPINN:
     anim_velocity = create_2d_animation(net, initial_params, which="velocity", fps=10, verbose=False)
 
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
+        create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=SLICE_Y, N_fd=600, nu_fd=0.5)
 
     if PLOT_DENSITY_GROWTH:
         try:
@@ -402,13 +464,16 @@ if not USE_XPINN:
 else:
     # XPINN multi-network visualization
     print("Creating XPINN visualizations...")
-    anim_density = create_2d_animation(nets, initial_params, which="density", fps=10, verbose=False)
-    anim_velocity = create_2d_animation(nets, initial_params, which="velocity", fps=10, verbose=False)
-    print("XPINN visualizations created successfully!")
+    if DIMENSION <= 2:
+        anim_density = create_2d_animation(nets, initial_params, which="density", fps=10, verbose=False)
+        anim_velocity = create_2d_animation(nets, initial_params, which="velocity", fps=10, verbose=False)
+        print("XPINN visualizations created successfully!")
+    else:
+        print("XPINN 3D animations are not yet supported.")
     
     # Sinusoidal cross-section plot for XPINN
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        create_1d_cross_sections_sinusoidal(nets, initial_params, time_points=None, y_fixed=0.6, N_fd=600, nu_fd=0.5)
+        create_1d_cross_sections_sinusoidal(nets, initial_params, time_points=None, y_fixed=SLICE_Y, N_fd=600, nu_fd=0.5)
 
     # Density growth plot for XPINN as well
     if PLOT_DENSITY_GROWTH:
@@ -418,26 +483,6 @@ else:
             tmax_growth = float(TMAX_CFG)
         dt_growth = float(GROWTH_PLOT_DT)
         create_density_growth_plot(nets, initial_params, tmax=tmax_growth, dt=dt_growth)
-
-# ==================== MODEL SAVING ====================
-try:
-    from config import SNAPSHOT_DIR
-    model_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
-    os.makedirs(model_dir, exist_ok=True)
-    
-    if not USE_XPINN:
-        # Save single network
-        model_path = os.path.join(model_dir, "model.pth")
-        torch.save(nets[0].state_dict(), model_path)
-        print(f"Saved model to {model_path}")
-    else:
-        # Save all subdomain networks
-        for i, net in enumerate(nets):
-            model_path = os.path.join(model_dir, f"model_subdomain_{i}.pth")
-            torch.save(net.state_dict(), model_path)
-        print(f"Saved {len(nets)} subdomain models to {model_dir}")
-except Exception as e:
-    print(f"Warning: failed to save model: {e}")
 
 # ==================== FINAL CACHE CLEANUP ====================
 script_root = os.path.dirname(os.path.abspath(__file__))

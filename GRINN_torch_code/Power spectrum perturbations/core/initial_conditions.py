@@ -17,11 +17,17 @@ Functions:
 import numpy as np
 import torch
 from config import (cs, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, 
-                    PERTURBATION_TYPE, KX, KY, RANDOM_SEED)
+                    PERTURBATION_TYPE, KX, KY, KZ, RANDOM_SEED)
 
 # Global shared velocity fields for consistent initial conditions
 _shared_vx_interp = None
 _shared_vy_interp = None
+
+def _ensure_column_tensor(tensor):
+    return tensor if tensor.dim() > 1 else tensor.unsqueeze(-1)
+
+def _extract_spatial_coords(coords):
+    return coords[:-1] if len(coords) > 1 else coords
 
 
 def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
@@ -47,8 +53,8 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
     if seed is None:
         seed = RANDOM_SEED
     
-    # Import LAX_2D functions
-    from numerical_solvers.LAX_2D import generate_shared_velocity_field
+    # Import LAX functions
+    from numerical_solvers.LAX import generate_shared_velocity_field
     
     # Calculate domain size to match FD solver
     Lx = lam * num_of_waves
@@ -234,77 +240,62 @@ def generate_power_spectrum_field_vy(lam, v_1, x, seed=None):
     return _generate_power_spectrum_fallback(lam, v_1, x, seed)
 
 
-def _sinusoidal_component(coord, lam, jeans, v_1, k_component=None):
+def _compute_wave_phase(spatial_coords, lam):
     """
-    Helper function to generate sinusoidal velocity component.
-    
-    Args:
-        coord: Coordinate tensor [N,1] or [N]
-        lam: Wavelength
-        jeans: Jeans length
-        v_1: Velocity amplitude
-        k_component: Wave vector component (for 2D case)
-    
-    Returns:
-        Sinusoidal velocity component
+    Compute wave phase and wave-vector components for sinusoidal perturbations.
     """
-    u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
+    if not spatial_coords:
+        raise ValueError("Spatial coordinates are required to compute wave phase.")
     
-    if k_component is not None:
-        # Use specific k component for 2D case
-        wave_phase = k_component * u
-    else:
-        # Fallback to original behavior for 1D case
-        wave_phase = 2*np.pi*u/lam
+    x_coord = _ensure_column_tensor(spatial_coords[0])
+    zeros = torch.zeros_like(x_coord)
+    y_coord = _ensure_column_tensor(spatial_coords[1]) if len(spatial_coords) >= 2 else zeros
+    z_coord = _ensure_column_tensor(spatial_coords[2]) if len(spatial_coords) >= 3 else zeros
     
-    if lam > jeans:
-        return -v_1 * torch.sin(wave_phase)
-    else:
-        return v_1 * torch.cos(wave_phase)
+    device = x_coord.device
+    dtype = x_coord.dtype
+    kx = torch.as_tensor(float(KX), device=device, dtype=dtype)
+    ky = torch.as_tensor(float(KY), device=device, dtype=dtype)
+    kz = torch.as_tensor(float(KZ), device=device, dtype=dtype)
+    
+    phase = kx * x_coord + ky * y_coord + kz * z_coord
+    
+    # Fallback to fundamental wavelength if wave-vector is zero (e.g., user-specified)
+    if torch.allclose(kx.abs() + ky.abs() + kz.abs(), torch.tensor(0.0, device=device, dtype=dtype)):
+        fundamental = torch.as_tensor(2 * np.pi / lam, device=device, dtype=dtype)
+        phase = fundamental * x_coord
+        kx, ky, kz = fundamental, torch.zeros_like(fundamental), torch.zeros_like(fundamental)
+    
+    return phase, kx, ky, kz, x_coord, y_coord, z_coord
 
 
-def _coupled_2d_velocity_components(x, lam, jeans, v_1):
+def _coupled_velocity_components(coords, lam, jeans, v_1):
     """
-    Generate coupled 2D velocity components from the same wave pattern.
-    
-    Args:
-        x: Coordinates [x, y, ...]
-        lam: Wavelength
-        jeans: Jeans length
-        v_1: Velocity amplitude
-    
-    Returns:
-        Tuple (vx, vy) of velocity components
+    Generate coupled velocity components from the same wave pattern (supports 1D/2D/3D).
     """
-    if len(x) < 2:
-        # Fallback to 1D case
-        return _sinusoidal_component(x[0], lam, jeans, v_1), torch.zeros_like(x[0])
-    
-    x_coord = x[0] if x[0].dim() > 1 else x[0].unsqueeze(-1)
-    y_coord = x[1] if x[1].dim() > 1 else x[1].unsqueeze(-1)
-    
-    # Calculate wave vector magnitude (convert to tensor)
-    k_magnitude = torch.sqrt(torch.tensor(KX**2 + KY**2, device=x_coord.device, dtype=x_coord.dtype))
-    
-    # Generate the coupled wave pattern
-    wave_phase = KX * x_coord + KY * y_coord
+    spatial_coords = _extract_spatial_coords(coords)
+    phase, kx, ky, kz, _, _, _ = _compute_wave_phase(spatial_coords, lam)
+    dtype = phase.dtype
+    device = phase.device
+    v_scale = torch.as_tensor(float(v_1), device=device, dtype=dtype)
     
     if lam > jeans:
-        # Gravitational instability case
-        wave_field = -v_1 * torch.sin(wave_phase)
+        wave_field = -v_scale * torch.sin(phase)
     else:
-        # Oscillatory case
-        wave_field = v_1 * torch.cos(wave_phase)
+        wave_field = v_scale * torch.cos(phase)
     
-    # Coupled velocity components
-    if k_magnitude > 0:
-        vx = wave_field * (KX / k_magnitude)
-        vy = wave_field * (KY / k_magnitude)
-    else:
+    k_mag = torch.sqrt(kx**2 + ky**2 + kz**2)
+    if k_mag <= torch.tensor(1e-12, device=device, dtype=dtype):
         vx = wave_field
         vy = torch.zeros_like(wave_field)
+        vz = torch.zeros_like(wave_field)
+    else:
+        inv_mag = 1.0 / k_mag
+        vx = wave_field * (kx * inv_mag)
+        vy = wave_field * (ky * inv_mag)
+        vz = wave_field * (kz * inv_mag)
     
-    return vx, vy
+    return vx, vy, vz
 
 
 def fun_rho_0(rho_1, lam, x):
@@ -320,15 +311,9 @@ def fun_rho_0(rho_1, lam, x):
         rho_0: Initial density field
     """
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        # Use separate kx and ky components for 2D wave vector
-        if len(x) >= 2:  # 2D case
-            x_coord = x[0] if x[0].dim() > 1 else x[0].unsqueeze(-1)
-            y_coord = x[1] if x[1].dim() > 1 else x[1].unsqueeze(-1)
-            rho_0 = rho_o + rho_1 * torch.cos(KX * x_coord + KY * y_coord)
-        else:  # 1D case - fallback to original behavior
-            coord = x[0]
-            u = coord if coord.dim() > 1 else coord.unsqueeze(-1)
-            rho_0 = rho_o + rho_1 * torch.cos(2*np.pi*u/lam)
+        spatial_coords = _extract_spatial_coords(x)
+        phase, *_ = _compute_wave_phase(spatial_coords, lam)
+        rho_0 = rho_o + rho_1 * torch.cos(phase)
     else:
         # Power spectrum: uniform initial density
         rho_0 = torch.full_like(x[0], rho_o)
@@ -353,12 +338,8 @@ def fun_vx_0(lam, jeans, v_1, x):
         vx_0: Initial x-velocity field
     """
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        # Use coupled 2D velocity components for proper 2D wave physics
-        if len(x) >= 2:  # 2D case
-            vx, _ = _coupled_2d_velocity_components(x, lam, jeans, v_1)
-            return vx
-        else:  # 1D case
-            return _sinusoidal_component(x[0], lam, jeans, v_1)
+        vx, _, _ = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vx
     else:
         # Power spectrum case
         return generate_power_spectrum_field(lam, v_1, x, seed=RANDOM_SEED)
@@ -378,16 +359,23 @@ def fun_vy_0(lam, jeans, v_1, x):
         vy_0: Initial y-velocity field
     """
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        # Use coupled 2D velocity components for proper 2D wave physics
-        if len(x) >= 2:  # 2D case
-            _, vy = _coupled_2d_velocity_components(x, lam, jeans, v_1)
-            return vy
-        else:
-            # Fallback to x if y is unavailable (1D)
-            return _sinusoidal_component(x[0], lam, jeans, v_1)
+        _, vy, _ = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vy
     else:
         # Power spectrum case
         return generate_power_spectrum_field_vy(lam, v_1, x, seed=RANDOM_SEED)
+
+
+def fun_vz_0(lam, jeans, v_1, x):
+    """
+    Initial condition for z-velocity (used in 3D sinusoidal runs).
+    """
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        _, _, vz = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vz
+    else:
+        # Power spectrum setup is currently 2D; default to zero
+        return func(x)
 
 
 def func(x):
