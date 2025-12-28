@@ -26,13 +26,12 @@ def fft_solver_torch(rho, Lx, nx, Ly, ny):
     kx = 2 * np.pi * torch.fft.fftfreq(nx, d=dx).to(device)
     ky = 2 * np.pi * torch.fft.fftfreq(ny, d=dy).to(device)
     
-    # Construct the Laplacian operator in Fourier space
-    # Match NumPy exactly: default meshgrid uses 'xy' which gives (ny, nx)
-    # But we need to transpose to match FFT2 output (nx, ny)
-    kx2, ky2 = torch.meshgrid(kx**2, ky**2, indexing='xy')
-    # NumPy meshgrid('xy') creates (ny, nx), but FFT2 output is (nx, ny)
-    # So we transpose to match the FFT layout
-    laplace = -(kx2.T + ky2.T)
+    # Construct the discrete Laplacian operator in Fourier space
+    # This ensures consistency with finite-difference gradients used in LAX scheme
+    kx_mesh, ky_mesh = torch.meshgrid(kx, ky, indexing='xy')
+    # Transpose to match FFT2 output layout (nx, ny)
+    laplace = (2*(torch.cos(kx_mesh.T*dx)-1)/(dx**2) + 
+               2*(torch.cos(ky_mesh.T*dy)-1)/(dy**2))
     
     # Handle zero mode (k=0) - set to small value to avoid division by zero
     laplace = torch.where(laplace == 0, torch.tensor(1e-9, device=device, dtype=dtype), laplace)
@@ -53,8 +52,11 @@ def fft_solver_torch_3d(rho, Lx, nx, Ly, ny, Lz, nz):
     kx = 2 * np.pi * torch.fft.fftfreq(nx, d=dx).to(device)
     ky = 2 * np.pi * torch.fft.fftfreq(ny, d=dy).to(device)
     kz = 2 * np.pi * torch.fft.fftfreq(nz, d=dz).to(device)
-    kx2, ky2, kz2 = torch.meshgrid(kx**2, ky**2, kz**2, indexing='ij')
-    laplace = -(kx2 + ky2 + kz2)
+    kx_mesh, ky_mesh, kz_mesh = torch.meshgrid(kx, ky, kz, indexing='ij')
+    # Use discrete Laplacian for consistency with finite-difference scheme
+    laplace = (2*(torch.cos(kx_mesh*dx)-1)/(dx**2) + 
+               2*(torch.cos(ky_mesh*dy)-1)/(dy**2) + 
+               2*(torch.cos(kz_mesh*dz)-1)/(dz**2))
     laplace = torch.where(laplace == 0, torch.tensor(1e-9, device=device, dtype=dtype), laplace)
     phihat = rhohat / laplace
     phi = torch.real(torch.fft.ifftn(phihat))

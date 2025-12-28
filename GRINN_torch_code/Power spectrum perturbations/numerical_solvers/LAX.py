@@ -135,12 +135,10 @@ def fft_solver(rho, Lx, nx, Ly, ny, dim = None):
     kx = 2 * np.pi * np.fft.fftfreq(nx, dx)
     ky = 2 * np.pi * np.fft.fftfreq(ny, dy)
 
-    # Construct the Laplacian operator in Fourier space
-    kx2, ky2 = np.meshgrid(kx**2, ky**2)
-    laplace = -(kx2 + ky2)
-
-    ## Correction for the dicrete FFT.  Need to check the calculations
-#     laplace = 2*(np.cos(kx*dx)-1)/(dx**2) +  2*(np.cos(ky*dx)-1)/(dy**2)
+    # Construct the discrete Laplacian operator in Fourier space
+    # This ensures consistency with finite-difference gradients used in LAX scheme
+    kx_mesh, ky_mesh = np.meshgrid(kx, ky)
+    laplace = 2*(np.cos(kx_mesh*dx)-1)/(dx**2) + 2*(np.cos(ky_mesh*dy)-1)/(dy**2)
 
     laplace[laplace == 0] = 1e-9
 
@@ -165,8 +163,9 @@ def fft_solver_3d(rho, Lx, nx, Ly, ny, Lz, nz):
     kx = 2 * np.pi * np.fft.fftfreq(nx, dx)
     ky = 2 * np.pi * np.fft.fftfreq(ny, dy)
     kz = 2 * np.pi * np.fft.fftfreq(nz, dz)
-    kx2, ky2, kz2 = np.meshgrid(kx**2, ky**2, kz**2, indexing='ij')
-    laplace = -(kx2 + ky2 + kz2)
+    kx_mesh, ky_mesh, kz_mesh = np.meshgrid(kx, ky, kz, indexing='ij')
+    # Use discrete Laplacian for consistency with finite-difference scheme
+    laplace = 2*(np.cos(kx_mesh*dx)-1)/(dx**2) + 2*(np.cos(ky_mesh*dy)-1)/(dy**2) + 2*(np.cos(kz_mesh*dz)-1)/(dz**2)
     laplace[laplace == 0] = 1e-9
     phihat = rhohat / laplace
     phi = np.real(ifftn(phihat))

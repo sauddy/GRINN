@@ -54,8 +54,9 @@ Thumbs.db
 *.log
 
 # Data files (optional - uncomment if you don't want to track large data files)
-# *.npy
-# *.npz
-# *.h5
-# *.hdf5
+*.npy
+*.npz
+*.h5
+*.hdf5
 
+.cursor
