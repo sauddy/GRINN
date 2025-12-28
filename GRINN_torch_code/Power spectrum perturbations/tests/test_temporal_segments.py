@@ -7,7 +7,6 @@ The script trains separate PINNs on overlapping temporal intervals:
 visualization/analysis without touching the main training pipeline.
 """
 import argparse
-import json
 import os
 import sys
 from contextlib import contextmanager
@@ -34,9 +33,6 @@ for _root in _CANDIDATE_ROOTS:
 
 from config import (
     DIMENSION,
-    FD_DATA_BATCH_SIZE,
-    FD_DATA_PATH,
-    FD_DATA_WEIGHT,
     N_0,
     N_r,
     PERTURBATION_TYPE,
@@ -150,18 +146,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory to store diagnostic logs and plots.",
     )
     parser.add_argument(
-        "--use-fd-data",
-        action="store_true",
-        default=False,
-        help="Optionally include FD anchor loss using config paths/weights.",
-    )
-    parser.add_argument(
-        "--fd-batch-size",
-        type=int,
-        default=FD_DATA_BATCH_SIZE,
-        help="Batch size for FD anchor points when enabled.",
-    )
-    parser.add_argument(
         "--overlap-samples",
         type=int,
         default=20000,
@@ -180,33 +164,6 @@ def parse_args() -> argparse.Namespace:
         help="Batch size used when sampling overlap data during training.",
     )
     return parser.parse_args()
-
-
-def load_fd_dataset(device: torch.device) -> Optional[dict]:
-    """Load FD anchor dataset if requested."""
-    if not os.path.exists(FD_DATA_PATH):
-        raise FileNotFoundError(f"FD anchor path not found: {FD_DATA_PATH}")
-    with open(FD_DATA_PATH, "r", encoding="utf-8") as handle:
-        raw = json.load(handle)
-    if not raw:
-        raise ValueError("FD anchor dataset is empty.")
-
-    def tensor_for(key: str) -> Optional[torch.Tensor]:
-        if key not in raw[0]:
-            return None
-        values = [float(entry[key]) for entry in raw]
-        return torch.tensor(values, dtype=torch.float32, device=device).unsqueeze(-1)
-
-    dataset = {
-        "x": tensor_for("x"),
-        "y": tensor_for("y"),
-        "t": tensor_for("t"),
-        "rho": tensor_for("rho"),
-        "vx": tensor_for("vx"),
-        "vy": tensor_for("vy"),
-    }
-    dataset["count"] = dataset["x"].shape[0]
-    return dataset
 
 
 def build_windows(
@@ -377,8 +334,6 @@ def train_segment(
     adam_iters: int,
     lbfgs_iters: int,
     prev_net: Optional[PINN],
-    fd_dataset: Optional[dict],
-    fd_batch_size: Optional[int],
     data_terms: Optional[List[Dict[str, object]]] = None,
 ) -> PINN:
     """Train a PINN on a single temporal window."""
@@ -428,9 +383,6 @@ def train_segment(
             jeans=jeans,
             v_1=v_1,
             device=device,
-            fd_data=fd_dataset,
-            fd_weight=(FD_DATA_WEIGHT if fd_dataset is not None else 0.0),
-            fd_batch_size=fd_batch_size if fd_dataset is not None else None,
             data_terms=data_terms,
         )
 
@@ -536,14 +488,6 @@ def main():
         )
         set_shared_velocity_fields(vx_np, vy_np)
 
-    fd_dataset = None
-    fd_batch_size = None
-    if args.use_fd_data:
-        fd_dataset = load_fd_dataset(device)
-        fd_batch_size = int(
-            max(1, min(args.fd_batch_size, fd_dataset["count"])) if fd_dataset else 0
-        )
-
     segments: List[TrainedSegment] = []
     prev_net: Optional[PINN] = None
     for idx, window in enumerate(windows):
@@ -587,8 +531,6 @@ def main():
             adam_iters=args.adam_iters,
             lbfgs_iters=args.lbfgs_iters,
             prev_net=prev_net,
-            fd_dataset=fd_dataset,
-            fd_batch_size=fd_batch_size,
             data_terms=data_terms if data_terms else None,
         )
         segments.append(TrainedSegment(net=net, window=window))

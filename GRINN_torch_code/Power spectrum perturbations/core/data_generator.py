@@ -1,25 +1,26 @@
 import numpy as np
-
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from config import STARTUP_DT
+from config import N_r_PER_SUBDOMAIN, N_0_PER_SUBDOMAIN
+from config import cs, const, G, rho_o
 
-def diff(u,var,order=1): #The derivative of a variable with respect to another.
+def diff(u, var, order = 1): #The derivative of a variable with respect to another.
     
     u.requires_grad_()
     var.requires_grad_()
     ones = torch.ones_like(u)
-    der, = torch.autograd.grad(u, var, create_graph=True, grad_outputs=ones, allow_unused=True)
+    der, = torch.autograd.grad(u, var, create_graph = True, grad_outputs = ones, allow_unused = True)
     if der is None:
-        return torch.zeros_like(var, requires_grad=True)
+        return torch.zeros_like(var, requires_grad = True)
     else:
         der.requires_grad_()
     for i in range(1, order):
         ones = torch.ones_like(der)
-        der, = torch.autograd.grad(der, var, create_graph=True, grad_outputs=ones, allow_unused=True)
+        der, = torch.autograd.grad(der, var, create_graph = True, grad_outputs = ones, allow_unused = True)
         if der is None:
-            return torch.zeros_like(var, requires_grad=True)
+            return torch.zeros_like(var, requires_grad = True)
         else:
             der.requires_grad_()
     return der
@@ -43,7 +44,7 @@ class col_gen(object):
         dimension: Spatial dimension (1, 2, or 3)
     """
 
-    def __init__(self,rmin=[0,0,0,0],rmax=[1,1,1,1], N_0 = 1000,N_b=1000,N_r = 3000, dimension=1):
+    def __init__(self, rmin = [0, 0, 0, 0], rmax = [1, 1, 1, 1], N_0 = 1000, N_b = 1000, N_r = 3000, dimension = 1):
         self.rmin = rmin
         self.rmax = rmax
         self.N_0 = N_0
@@ -51,7 +52,7 @@ class col_gen(object):
         self.N_r = N_r
         self.dimension = dimension
     
-    def _generate_uniform_tensor(self, n_points, lower, upper, device='cuda', requires_grad=True):
+    def _generate_uniform_tensor(self, n_points, lower, upper, device = 'cuda', requires_grad = True):
         """
         Helper function to generate uniformly distributed tensor.
         
@@ -65,7 +66,7 @@ class col_gen(object):
         Returns:
             Tensor of shape [n_points, 1]
         """
-        tensor = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(lower, upper)
+        tensor = torch.empty(n_points, 1, device = device, dtype = torch.float32).uniform_(lower, upper)
         if requires_grad:
             tensor = tensor.requires_grad_()
         return tensor
@@ -324,7 +325,6 @@ def req_consts_calc(lam, rho_1):
         - jeans_length: Jeans wavelength (critical wavelength for instability)
         - alpha: Growth rate or oscillation frequency depending on lam vs jeans_length
     """
-    from config import cs, const, G, rho_o
     
     if rho_o != 0:
         jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_o))
@@ -358,7 +358,6 @@ def distribute_collocation_points(n_total, num_subdomains):
     Returns:
         List of point counts per subdomain
     """
-    from config import N_r_PER_SUBDOMAIN, N_0_PER_SUBDOMAIN
     
     # If per-subdomain count is specified, use it
     if n_total == N_r_PER_SUBDOMAIN and N_r_PER_SUBDOMAIN is not None:

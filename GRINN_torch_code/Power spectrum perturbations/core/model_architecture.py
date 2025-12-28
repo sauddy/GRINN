@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from torch.autograd import Variable
-from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, STARTUP_DT
+from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, STARTUP_DT, USE_PARAMETERIZATION
 
 class Sin(nn.Module):
     def forward(self, input):
@@ -76,11 +76,6 @@ class PINN(nn.Module):
     # 3D branch (periodic x,y,z features + t)
         in_dim_3d = 6*self.n_harmonics + 1
         self.branch_3d = _make_branch(in_dim_3d, 5)
-        
-        # Output layers per branch
-        #self.output_layer_1d = nn.Linear(3, 1)
-        #self.output_layer_2d = nn.Linear(4, 1)
-        #self.output_layer_3d = nn.Linear(5, 1)
 
 
     def set_domain(self, rmin, rmax, dimension):
@@ -159,37 +154,65 @@ class PINN(nn.Module):
         
         For power spectrum (non-sinusoidal):
         - For t < STARTUP_DT: Density is frozen at ρ₀ (causality - information hasn't propagated)
-        - For t >= STARTUP_DT: Density evolves via ρ = ρ₀ + (t - STARTUP_DT) × ρ̂
+        - For t >= STARTUP_DT: Density evolves based on USE_PARAMETERIZATION:
+          * "exponential": ρ = ρ₀ × exp(clamp((t - STARTUP_DT) × ρ̂, -10, 10))
+            (ensures strictly positive density)
+          * "linear": ρ = ρ₀ + (t - STARTUP_DT) × ρ̂
+            (linear growth from initial condition)
+          * "none": ρ = ρ̂
+            (direct network prediction, no transformation)
         
-        This enforces that density remains at initial conditions until information has had time
+        The causality constraint (STARTUP_DT) is enforced for all parameterizations.
+        This ensures density remains at initial conditions until information has had time
         to propagate across the domain (finite signal speed).
         
         For sinusoidal: No constraint (returns as-is).
         
         Args:
-            outputs: Raw network outputs
+            outputs: Raw network outputs [ρ̂, vx, vy?, vz?, phi]
             t: Time tensor
         
         Returns:
-            Modified outputs with density constraint applied
+            Modified outputs with density constraint applied [ρ, vx, vy?, vz?, phi]
         """
         if str(PERTURBATION_TYPE).lower() == "sinusoidal":
             return outputs
         
         # Causality constraint for power spectrum:
         # Density frozen at ρ₀ for t < STARTUP_DT (information propagation delay)
-        # Density evolves after t >= STARTUP_DT
         rho_hat = outputs[:, 0:1]
         other = outputs[:, 1:]
         
+        # Create mask for causality: 1.0 where t >= STARTUP_DT, 0.0 where t < STARTUP_DT
+        causal_mask = (t >= STARTUP_DT).float()
+        
         # Effective time: zero for t < STARTUP_DT, (t - STARTUP_DT) for t >= STARTUP_DT
-        # This ensures continuity at t = STARTUP_DT: ρ(STARTUP_DT) = ρ₀
         t_effective = torch.clamp(t - STARTUP_DT, min=0.0)
         
-        # Density evolution: ρ = ρ₀ + t_effective × ρ̂
-        # For t < STARTUP_DT: t_effective = 0, so ρ = ρ₀ (frozen)
-        # For t >= STARTUP_DT: t_effective = t - STARTUP_DT, so ρ evolves
-        rho = rho_o + t_effective * rho_hat
+        # Apply parameterization based on config
+        parameterization = str(USE_PARAMETERIZATION).lower()
+        
+        if parameterization == "exponential":
+            # Exponential parameterization: ρ = ρ₀ * exp(t_eff * ρ̂)
+            # For t < STARTUP_DT: t_eff = 0, so exp(0) = 1, thus ρ = ρ₀
+            # For t >= STARTUP_DT: ρ evolves exponentially
+            rho = rho_o * torch.exp(torch.clamp(t_effective * rho_hat, min=-10, max=10))
+            
+        elif parameterization == "linear":
+            # Linear parameterization: ρ = ρ₀ + t_eff * ρ̂
+            # For t < STARTUP_DT: t_eff = 0, so ρ = ρ₀
+            # For t >= STARTUP_DT: ρ grows linearly
+            rho = rho_o + t_effective * rho_hat
+            
+        elif parameterization == "none":
+            # No parameterization: direct prediction with causality enforcement
+            # For t < STARTUP_DT: ρ = ρ₀ (frozen at initial condition)
+            # For t >= STARTUP_DT: ρ = ρ̂ (network output directly)
+            rho = causal_mask * rho_hat + (1 - causal_mask) * rho_o
+            
+        else:
+            raise ValueError(f"Invalid USE_PARAMETERIZATION: '{USE_PARAMETERIZATION}'. "
+                           f"Choose from: 'exponential', 'linear', 'none'")
         
         return torch.cat([rho, other], dim=1)
     

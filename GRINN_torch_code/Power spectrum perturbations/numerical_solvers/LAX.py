@@ -1,18 +1,11 @@
 import numpy as np
 import os
-
-# Import TensorFlow and NumPy
-# import tensorflow as tf
-import numpy as np
-
 import matplotlib.pyplot as plt
 import scipy
-
 
 ## For the FFT solver
 
 from numpy.fft import fft, ifft, fft2, ifft2, fftn, ifftn
-from scipy import signal
 
 from config import RANDOM_SEED
 
@@ -21,7 +14,7 @@ try:
     from config import KX, KY, KZ, cs, rho_o, const, G
 except ImportError:
     # Fallback if config not available
-    KX = 2*np.pi/5.0  # Default wavelength
+    KX = 2*np.pi/7.0  # Default wavelength
     KY = 0.0
     KZ = 0.0
     cs = 1.0
@@ -100,7 +93,8 @@ def generate_shared_velocity_field(nx, ny, Lx, Ly, power_index=-4.0, amplitude=0
     
     return vx_np, vy_np, vx_interp, vy_interp
 
-def lax_solution_with_shared_velocity(time, N, nu, lam, num_of_waves, rho_1, vx0_shared, vy0_shared, gravity=False, isplot=None, comparison=None, animation=None):
+def lax_solution_with_shared_velocity(time, N, nu, lam, num_of_waves, rho_1, vx0_shared, vy0_shared, 
+                                      gravity=False, isplot=None, comparison=None, animation=None):
     """
     Modified LAX solver that uses pre-generated shared velocity fields for consistent initial conditions.
     This ensures PINN and FD use identical velocity fields at t=0.
@@ -114,7 +108,7 @@ def lax_solution_with_shared_velocity(time, N, nu, lam, num_of_waves, rho_1, vx0
     
     return result
 
-def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
+def fft_solver(rho, Lx, nx, Ly, ny, dim = None):
     
     '''
     A FFT solver that uses discrete Fast Fourier Transform to

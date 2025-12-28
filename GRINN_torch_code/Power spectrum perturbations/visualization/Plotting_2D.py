@@ -23,7 +23,7 @@ def _timed_call(label, fn, *args, **kwargs):
     return result
 
 from config import (SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, 
-                    TIMES_1D, a, KX, KY, KZ, FD_N_1D, FD_N_2D, FD_N_3D, POWER_EXPONENT, FILTER_SCALE, 
+                    TIMES_1D, a, KX, KY, KZ, FD_N_1D, FD_N_2D, FD_N_3D, POWER_EXPONENT, 
                     N_GRID, DIMENSION, SLICE_Y, SLICE_Z)
 from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED, SHOW_LINEAR_THEORY
 

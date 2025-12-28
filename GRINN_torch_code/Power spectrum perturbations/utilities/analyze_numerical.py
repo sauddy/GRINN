@@ -29,23 +29,12 @@ from config import (
     xmin, ymin, cs, rho_o, const, G, a, wave, PERTURBATION_TYPE, KX, KY
 )
 
-# =============================================================================
-# CONFIGURATION SECTION - MODIFY THESE PARAMETERS FOR ANALYSIS
-# =============================================================================
-
-# Grid & Domain Parameters
 N = 400                    # Grid resolution (Nx = Ny)
-nu = 0.3                   # Courant number for stability (typically 0.1-0.9)
+nu = 0.1                   # Courant number for stability (typically 0.1-0.9)
 lam = wave                  # Wavelength (from config.py)
 num_of_waves = NUM_OF_WAVES_CONFIG  # Number of wavelengths in domain (from config.py)
-time_points = [1.0, 1.5, 2.0]  # Times to plot
+time_points = [2.0, 3.0]  # Times to plot
 
-# Physical Constants (all from config.py)
-# cs, rho_o, const, G, a, xmin, ymin are imported from config.py above
-
-# Perturbation Parameters (from config.py)
-# Note: The perturbation type is automatically determined from config.py
-# Set PERTURBATION_TYPE in config.py to "power_spectrum" or "sinusoidal"
 perturbation_type = PERTURBATION_TYPE  # "power_spectrum" or "sinusoidal" (from config.py)
 power_index = POWER_EXPONENT  # Power spectrum exponent (only used for power_spectrum perturbations)
 vel_rms = a * cs          # RMS velocity amplitude (only used for power_spectrum perturbations)
@@ -53,8 +42,6 @@ random_seed = RANDOM_SEED         # Seed for reproducibility (from config.py)
 kx = KX  # Wave vector x-component for sinusoidal perturbations (only used for sinusoidal perturbations)
 ky = KY  # Wave vector y-component for sinusoidal perturbations (only used for sinusoidal perturbations)
 
-# Solver backend selection: "cpu" uses numerical_solvers.LAX (reference implementation),
-# "torch" uses numerical_solvers.LAX_torch (GPU version, supports both power spectrum and sinusoidal)
 SOLVER_BACKEND = "torch"      # Options: "cpu" or "torch"
 
 # Output Settings
@@ -65,8 +52,8 @@ gravity = True              # Whether to include self-gravity
 plot_density = True        # Generate density plots
 plot_velocity = True       # Generate velocity magnitude plots
 show_vectors = True         # Show velocity vectors on plots
-save_plots = True          # Save plots to files
-show_plots = False          # Display plots on screen
+save_plots = False          # Save plots to files
+show_plots = True          # Display plots on screen
 
 # Collapse Time Settings
 find_collapse_time = False   # Whether to find collapse time (set to False for faster execution)
@@ -74,10 +61,6 @@ collapse_method = "full_lax"    # Method: "fast" (integrated solver) or "full_la
 target_density_ratio = 10.0  # Target density ratio (times initial density)
 max_search_time = 10.0     # Maximum time to search for collapse
 collapse_dt = 0.1          # Time step for collapse search (used by full_lax method)
-
-# =============================================================================
-# END CONFIGURATION SECTION
-# =============================================================================
 
 def run_lax_solver(time, N, nu, lam, num_of_waves, a, gravity, 
                    power_index, vel_rms, random_seed):

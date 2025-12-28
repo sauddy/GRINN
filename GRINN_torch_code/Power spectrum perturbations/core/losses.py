@@ -22,42 +22,6 @@ class ASTPN(col_gen):
         if dimension == 3:
             self.coord_Ly, self.coord_Ry = self.geo_time_coord(option="BC",coordinate=2)
             self.coord_Lz, self.coord_Rz = self.geo_time_coord(option="BC",coordinate=3)
-    
-    
-    
-    def periodic_BC(self,net,coordinate=1,derivative_order=0,component=0):
-        
-        '''
-           INPUT: geomtime: The collocatin grids
-           since it is BC the derivative always wrt to spacial coordinate: coordinate =1 is the first x coordinate
-           derivative order: what order derivative
-           component: output component's derivative is taken component = 0 is the First output fron the network
-           default is set to 0,i.e., the first output
-           coordinate : 1: xaxis (default), 2: with y axis 3: with zaxis
-         '''
-
-        if coordinate==1:   
-            coord_L, coord_R = self.coord_Lx, self.coord_Rx
-        if coordinate==2:       
-            coord_L, coord_R = self.coord_Ly, self.coord_Ry
-        if coordinate==3:       
-            coord_L, coord_R = self.coord_Lz, self.coord_Rz
-        
-        
-        # return coord_L, coord_R
-          
-        variable_l = net(coord_L)[:,component:component+1] 
-        variable_r = net(coord_R)[:,component:component+1] 
-        
-        if derivative_order == 0:
-
-            return torch.mean((variable_l - variable_r)**2)
-
-        elif derivative_order == 1:        
-            der_l = diff(variable_l,coord_L[coordinate-1],order=derivative_order)
-            der_r = diff(variable_r,coord_R[coordinate-1],order=derivative_order)
-
-            return torch.mean((der_l-der_r)**2)
 
 
 def pde_residue(colloc, net, dimension = 1):

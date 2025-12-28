@@ -16,8 +16,9 @@ Functions:
 
 import numpy as np
 import torch
-from config import (cs, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, 
+from config import (cs, rho_o, N_GRID, POWER_EXPONENT, 
                     PERTURBATION_TYPE, KX, KY, KZ, RANDOM_SEED)
+from numerical_solvers.LAX import generate_shared_velocity_field
 
 # Global shared velocity fields for consistent initial conditions
 _shared_vx_interp = None
@@ -52,9 +53,6 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
     
     if seed is None:
         seed = RANDOM_SEED
-    
-    # Import LAX functions
-    from numerical_solvers.LAX import generate_shared_velocity_field
     
     # Calculate domain size to match FD solver
     Lx = lam * num_of_waves
@@ -151,9 +149,9 @@ def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
     # Calculate magnitude of wave number
     K = torch.sqrt(KX_grid**2 + KY_grid**2)
     
-    # Power spectrum: P(k) ~ k^expon * exp((-k*Rf)^2)
+    # Power spectrum: P(k) ~ k^expon
     K_safe = torch.where(K == 0, torch.tensor(1e-10, device=x[0].device), K)
-    power_spectrum = K_safe**POWER_EXPONENT * torch.exp(-(K_safe * FILTER_SCALE)**2)
+    power_spectrum = K_safe**POWER_EXPONENT
     
     # Remove DC (uniform) mode to avoid bulk drift
     power_spectrum[K == 0] = 0.0
@@ -389,4 +387,3 @@ def func(x):
         Zero tensor matching the shape of x[0]
     """
     return x[0] * 0
-

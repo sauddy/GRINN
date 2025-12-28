@@ -1,10 +1,9 @@
 import os
 import sys
-import json
 import shutil
 import numpy as np
 import time
-from typing import Tuple, Optional, Dict
+from typing import Tuple
 import torch
 import torch.nn as nn
 
@@ -39,7 +38,6 @@ from config import CAUSAL_GAMMA_MAX, CAUSAL_GAMMA_MIN
 from config import CAUSAL_EPSILON, CAUSAL_EPSILON_FLOOR, CAUSAL_NUM_TIME_BINS
 from config import USE_EPSILON_ANNEALING, CAUSAL_EPSILON_MIN, CAUSAL_EPSILON_MAX
 from config import CAUSAL_ADAM_PER_WINDOW, CAUSAL_LBFGS_PER_WINDOW
-from config import USE_FD_DATA, FD_DATA_PATH, FD_DATA_WEIGHT, FD_DATA_BATCH_SIZE
 from core.losses import ASTPN, XPINN_Loss
 from core.model_architecture import PINN
 from visualization.Plotting_2D import create_2d_animation
@@ -70,39 +68,6 @@ def _save_trained_models(nets, use_xpinn):
             print(f"Saved {len(nets)} subdomain models to {model_dir}")
     except Exception as e:
         print(f"Warning: failed to save model: {e}")
-
-
-def load_fd_anchor_points(path: str, device: torch.device) -> Dict[str, torch.Tensor]:
-    """Load FD anchor points generated in Phase 1 as tensors on the target device."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"FD anchor file not found: {path}")
-
-    with open(path, "r") as f:
-        raw_data = json.load(f)
-
-    if not raw_data:
-        raise ValueError(f"FD anchor file {path} is empty.")
-
-    device_obj = torch.device(device)
-
-    def tensor_from_key(key: str) -> torch.Tensor:
-        return torch.tensor(
-            [float(entry[key]) for entry in raw_data],
-            dtype=torch.float32,
-            device=device_obj,
-        ).unsqueeze(-1)
-
-    dataset: Dict[str, Optional[torch.Tensor]] = {
-        "x": tensor_from_key("x"),
-        "y": tensor_from_key("y"),
-        "t": tensor_from_key("t"),
-        "rho": tensor_from_key("rho"),
-        "vx": tensor_from_key("vx") if "vx" in raw_data[0] else None,
-        "vy": tensor_from_key("vy") if "vy" in raw_data[0] else None,
-    }
-
-    dataset["count"] = dataset["x"].size(0)
-    return dataset
 
 
 def clean_pycache(root_dir: str) -> Tuple[int, int]:
@@ -179,21 +144,6 @@ if str(PERTURBATION_TYPE).lower() == "power_spectrum":
     from visualization.Plotting_2D import set_shared_velocity_fields
     set_shared_velocity_fields(vx_np, vy_np)
 
-# Load FD anchor dataset if enabled
-fd_dataset: Optional[Dict[str, Optional[torch.Tensor]]] = None
-fd_data_batch_size: Optional[int] = None
-if USE_FD_DATA:
-    try:
-        fd_dataset = load_fd_anchor_points(FD_DATA_PATH, device)
-        fd_data_batch_size = int(max(1, min(FD_DATA_BATCH_SIZE, fd_dataset["count"])))
-        print(f"Loaded FD anchor dataset with {fd_dataset['count']} points from {FD_DATA_PATH}")
-    except Exception as fd_err:
-        print(f"[WARN] Unable to load FD anchor dataset: {fd_err}")
-        fd_dataset = None
-        fd_data_batch_size = None
-
-fd_weight_active = FD_DATA_WEIGHT if (USE_FD_DATA and fd_dataset is not None) else 0.0
-
 # ==================== MODE SWITCHING: ORIGINAL PINN vs XPINN ====================
 
 if not USE_XPINN:
@@ -257,10 +207,7 @@ if not USE_XPINN:
             v_1=v_1,
             device=device,
             causal_gamma=0.0,
-            causal_mode="none",
-            fd_data=fd_dataset if fd_dataset is not None else None,
-            fd_weight=fd_weight_active,
-            fd_batch_size=fd_data_batch_size
+            causal_mode="none"
         )
     else:
         # Causal training using CausalTrainer module
@@ -315,10 +262,7 @@ if not USE_XPINN:
             'rho_1': rho_1,
             'lam': lam,
             'jeans': jeans,
-            'v_1': v_1,
-            'fd_data': fd_dataset if fd_dataset is not None else None,
-            'fd_weight': fd_weight_active,
-            'fd_batch_size': fd_data_batch_size
+            'v_1': v_1
         }
         
         if USE_CAUSAL_CURRICULUM:

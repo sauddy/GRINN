@@ -11,13 +11,13 @@ from core.model_architecture import PINN
 from methods.causal_training import compute_causal_weights_static
 from core.initial_conditions import (initialize_shared_velocity_fields, generate_power_spectrum_field, 
                                      generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0, func)
-from config import cs, const, G, rho_o, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
+from config import cs, const, G, rho_o, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
 from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
 
 
 # ==================== Physics Calculations and Loss Functions ====================
 
-def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, fd_data=None, fd_weight=0.0, fd_batch_size=None, data_terms=None):
+def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, data_terms=None):
 
     ############## Loss based on initial conditions ###############
     rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
@@ -63,69 +63,6 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
         mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
         mse_vz_ic  =  mse_cost_function(vz_ic_out, vz_0)
 
-    ############## Continuity at t=0 to seed early-time evolution ###############
-    # Enforce rho_t(0) = -rho0 * div v0 at IC points
-    x_ic = collocation_IC[0]
-    if model.dimension == 1:
-        t_ic = collocation_IC[1]
-    elif model.dimension == 2:
-        y_ic = collocation_IC[1]
-        t_ic = collocation_IC[2]
-    elif model.dimension == 3:
-        y_ic = collocation_IC[1]
-        z_ic = collocation_IC[2]
-        t_ic = collocation_IC[3]
-
-    # For sinusoidal testing, do not apply continuity seeding at t=0
-    t_ic = t_ic.clone().detach().requires_grad_(not is_sin)
-    ic_inputs = [x_ic]
-    if model.dimension >= 2:
-        ic_inputs.append(y_ic)
-    if model.dimension == 3:
-        ic_inputs.append(z_ic)
-    ic_inputs.append(t_ic)
-    ic_outputs = net(ic_inputs)
-    rho_ic = ic_outputs[:,0:1]
-    if model.dimension == 1:
-        vx_ic = ic_outputs[:,1:2]
-        if is_sin:
-            continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
-        else:
-            rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-            vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
-            div_v0 = diff(vx0, x_ic, order=1)
-            # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-    elif model.dimension == 2:
-        if is_sin:
-            continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
-        else:
-            rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-            vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
-            vy0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
-            dvx_dx = diff(vx0, x_ic, order=1)
-            dvy_dy = diff(vy0, y_ic, order=1)
-            div_v0 = dvx_dx + dvy_dy
-            # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-    else: # dimension == 3
-        if is_sin:
-            continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
-        else:
-            rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-            vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
-            vy0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
-            vz0 = fun_vz_0(lam, jeans, v_1, collocation_IC)
-            dvx_dx = diff(vx0, x_ic, order=1)
-            dvy_dy = diff(vy0, y_ic, order=1)
-            dvz_dz = diff(vz0, z_ic, order=1)
-            div_v0 = dvx_dx + dvy_dy + dvz_dz
-            # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-
     ############## Loss based on PDE ###################################
     
     # Apply startup time offset to PDE collocation time only (IC remains at t=0)
@@ -167,15 +104,15 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
 
     ################### Combining the loss functions ####################
     if model.dimension == 1:
-        base = ic_weight * mse_vx_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_phi
+        base = ic_weight * mse_vx_ic + mse_rho + mse_velx + mse_phi
         loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
     elif model.dimension == 2:
-        base = ic_weight * (mse_vx_ic + mse_vy_ic) + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_phi
+        base = ic_weight * (mse_vx_ic + mse_vy_ic) + mse_rho + mse_velx + mse_vely + mse_phi
         loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
     elif model.dimension == 3:
-        base = ic_weight * (mse_vx_ic + mse_vy_ic + mse_vz_ic) + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
+        base = ic_weight * (mse_vx_ic + mse_vy_ic + mse_vz_ic) + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
         loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
     
@@ -202,10 +139,6 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     
     loss_breakdown['IC'] = ic_loss
     
-    # Continuity loss
-    if continuity_weight > 0 and continuity_ic_loss.item() > 0:
-        loss_breakdown['Continuity'] = (continuity_weight * continuity_ic_loss).item()
-    
     # PDE losses (grouped together)
     pde_loss = mse_rho.item() + mse_velx.item()
     
@@ -218,18 +151,7 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
 
-    data_terms_full = []
-    if fd_data is not None and fd_weight > 0:
-        data_terms_full.append({
-            'dataset': fd_data,
-            'weight': fd_weight,
-            'batch_size': fd_batch_size,
-            'label': 'FD_DATA'
-        })
-    if data_terms:
-        data_terms_full.extend(data_terms)
-
-    data_loss_tensor, data_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms_full)
+    data_loss_tensor, data_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms if data_terms else [])
     if data_loss_tensor is not None:
         loss = loss + data_loss_tensor
         for label, value in data_breakdown.items():
@@ -337,7 +259,7 @@ def _evaluate_data_terms(net, mse_cost_function, data_terms):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, fd_data=None, fd_weight=0.0, fd_batch_size=None, use_fft_poisson=None, data_terms=None):
+                    rho_1, lam, jeans, v_1, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None, data_terms=None):
     """
     Batched closure function for training with optional causal weighting.
     
@@ -357,17 +279,6 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         device = collocation_domain.device
     
     ic_n = collocation_IC[0].size(0)
-
-    data_terms_full = []
-    if fd_data is not None and fd_weight > 0:
-        data_terms_full.append({
-            'dataset': fd_data,
-            'weight': fd_weight,
-            'batch_size': fd_batch_size if fd_batch_size is not None else batch_size,
-            'label': 'FD_DATA'
-        })
-    if data_terms:
-        data_terms_full.extend(data_terms)
 
     last_data_breakdown = {}
 
@@ -419,66 +330,6 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         elif model.dimension == 3:
             mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
             mse_vz_ic = mse_cost_function(vz_ic_out, vz_0)
-
-        # Continuity seeding at t=0 on IC points
-        x_ic = batch_ic[0]
-        if model.dimension == 1:
-            t_ic = batch_ic[1]
-        elif model.dimension == 2:
-            y_ic = batch_ic[1]
-            t_ic = batch_ic[2]
-        elif model.dimension == 3:
-            y_ic = batch_ic[1]
-            z_ic = batch_ic[2]
-            t_ic = batch_ic[3]
-
-        t_ic = t_ic.clone().detach().requires_grad_(not is_sin)
-        ic_inputs = [x_ic]
-        if model.dimension >= 2:
-            ic_inputs.append(y_ic)
-        if model.dimension == 3:
-            ic_inputs.append(z_ic)
-        ic_inputs.append(t_ic)
-        ic_outputs = net(ic_inputs)
-        rho_ic = ic_outputs[:,0:1]
-        if model.dimension == 1:
-            if is_sin:
-                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
-            else:
-                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
-                div_v0 = diff(vx0, x_ic, order=1)
-                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-        elif model.dimension == 2:
-            if is_sin:
-                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
-            else:
-                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
-                vy0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-                dvx_dx = diff(vx0, x_ic, order=1)
-                dvy_dy = diff(vy0, y_ic, order=1)
-                div_v0 = dvx_dx + dvy_dy
-                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-        else:
-            if is_sin:
-                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
-            else:
-                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
-                vy0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-                vz0 = fun_vz_0(lam, jeans, v_1, batch_ic)
-                dvx_dx = diff(vx0, x_ic, order=1)
-                dvy_dy = diff(vy0, y_ic, order=1)
-                dvz_dz = diff(vz0, z_ic, order=1)
-                div_v0 = dvx_dx + dvy_dy + dvz_dz
-                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
 
         # PDE residuals on batched domain with startup shift
         if isinstance(batch_dom, (list, tuple)):
@@ -535,13 +386,13 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
             mse_phi  = torch.mean(phi_r ** 2)
 
         if model.dimension == 1:
-            base = mse_vx_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_phi
+            base = mse_vx_ic + mse_rho + mse_velx + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
         elif model.dimension == 2:
-            base = mse_vx_ic + mse_vy_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_phi
+            base = mse_vx_ic + mse_vy_ic + mse_rho + mse_velx + mse_vely + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
         else:
-            base = mse_vx_ic + mse_vy_ic + mse_vz_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
+            base = mse_vx_ic + mse_vy_ic + mse_vz_ic + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
         # Update residual tracker AFTER computing loss (only during Adam)
@@ -555,8 +406,8 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 else:
                     residual_tracker.update_residuals(t_dom, [rho_r, vx_r, vy_r, vz_r, phi_r])
 
-        if data_terms_full:
-            data_loss_batch, batch_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms_full)
+        if data_terms:
+            data_loss_batch, batch_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms)
             if data_loss_batch is not None:
                 loss = loss + data_loss_batch
                 last_data_breakdown = batch_breakdown
@@ -589,10 +440,6 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         ic_loss += mse_vz_ic.item()
     
     loss_breakdown['IC'] = ic_loss
-    
-    # Continuity loss
-    if continuity_weight > 0 and continuity_ic_loss.item() > 0:
-        loss_breakdown['Continuity'] = (continuity_weight * continuity_ic_loss).item()
     
     # PDE losses (grouped together)
     pde_loss = mse_rho.item() + mse_velx.item()

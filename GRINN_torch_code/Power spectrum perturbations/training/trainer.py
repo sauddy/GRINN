@@ -7,11 +7,11 @@ single PINN and XPINN decomposition training.
 import numpy as np
 import torch
 from utilities.training_diagnostics import TrainingDiagnostics
-from config import DECAY_PORTION, BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGNOSTICS
+from config import BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGNOSTICS
 from training.physics import closure_batched
 
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, fd_data=None, fd_weight=0.0, fd_batch_size=None, data_terms=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, data_terms=None):
     """
     Standard training loop for single PINN.
     
@@ -40,17 +40,6 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         window_idx: Current curriculum window index
         data_terms: Optional list of additional supervised datasets with weights
     """
-    # Batched training is the default
-    total_steps = iteration_adam + iterationL
-    total_for_decay = max(1, int(total_steps * DECAY_PORTION))
-
-    def cosine_schedule(step, total, start_value, end_value):
-        if total_for_decay <= 1:
-            return end_value
-        s = min(step, total_for_decay - 1)
-        cos_term = (1 + np.cos(np.pi * s / (total_for_decay - 1))) / 2.0
-        return end_value + (start_value - end_value) * cos_term
-
     bs = int(BATCH_SIZE)
     nb = int(NUM_BATCHES)
 
@@ -58,12 +47,8 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
 
     for i in range(iteration_adam):
         optimizer.zero_grad()
-        global_step = i
-        from config import CONTINUITY_IC_WEIGHT, STARTUP_DT
-        continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
-        startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=True, data_terms=data_terms))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True, data_terms=data_terms))
 
         with torch.autograd.no_grad():
             # Diagnostics logging every 50 iterations
@@ -93,16 +78,13 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
     for i in range(iterationL):
         optimizer.zero_grad()
         global_step = iteration_adam + i
-        from config import CONTINUITY_IC_WEIGHT, STARTUP_DT
-        continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
-        startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
         # L-BFGS expects a closure that returns only scalar loss
         # Store loss_breakdown in a list so we can access it after the step
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=False, data_terms=data_terms)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False, data_terms=data_terms)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         

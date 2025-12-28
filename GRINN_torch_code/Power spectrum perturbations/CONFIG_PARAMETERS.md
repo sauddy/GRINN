@@ -40,10 +40,7 @@
 ## Power Spectrum Parameters
 - `N_GRID`: Grid resolution for power spectrum generation
 - `POWER_EXPONENT`: Power spectrum slope exponent
-- `FILTER_SCALE`: Filter scale parameter (Rf)
 - `STARTUP_DT`: Time offset after which PDE is enforced (ICs remain at t=0)
-- `CONTINUITY_IC_WEIGHT`: Weight for enforcing continuity at t=0
-- `DECAY_PORTION`: Fraction of training steps over which to fully decay
 
 ## Density Growth Plotting
 - `PLOT_DENSITY_GROWTH`: Whether to plot PINN vs LAX density growth comparison

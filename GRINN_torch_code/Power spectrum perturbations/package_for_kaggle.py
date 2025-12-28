@@ -27,13 +27,13 @@ PACKAGE_NAMES = [
 # Order matters: parents before dependants so imports succeed in the packed file.
 MODULE_SPECS: List[Tuple[str, str]] = [
     ("core/data_generator.py", "core.data_generator"),
+    ("numerical_solvers/LAX.py", "numerical_solvers.LAX"),
+    ("numerical_solvers/LAX_torch.py", "numerical_solvers.LAX_torch"),
     ("core/initial_conditions.py", "core.initial_conditions"),
     ("core/losses.py", "core.losses"),
     ("core/model_architecture.py", "core.model_architecture"),
     ("methods/causal_training.py", "methods.causal_training"),
     ("methods/xpinn_decomposition.py", "methods.xpinn_decomposition"),
-    ("numerical_solvers/LAX.py", "numerical_solvers.LAX"),
-    ("numerical_solvers/LAX_torch.py", "numerical_solvers.LAX_torch"),
     ("utilities/training_diagnostics.py", "utilities.training_diagnostics"),
     ("training/physics.py", "training.physics"),
     ("training/trainer.py", "training.trainer"),

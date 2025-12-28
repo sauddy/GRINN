@@ -74,27 +74,28 @@ if 'visualization' not in sys.modules:
 
 # ==== Module: core.data_generator (core/data_generator.py) ====
 import numpy as np
-
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from config import STARTUP_DT
+from config import N_r_PER_SUBDOMAIN, N_0_PER_SUBDOMAIN
+from config import cs, const, G, rho_o
 
-def diff(u,var,order=1): #The derivative of a variable with respect to another.
+def diff(u, var, order = 1): #The derivative of a variable with respect to another.
     
     u.requires_grad_()
     var.requires_grad_()
     ones = torch.ones_like(u)
-    der, = torch.autograd.grad(u, var, create_graph=True, grad_outputs=ones, allow_unused=True)
+    der, = torch.autograd.grad(u, var, create_graph = True, grad_outputs = ones, allow_unused = True)
     if der is None:
-        return torch.zeros_like(var, requires_grad=True)
+        return torch.zeros_like(var, requires_grad = True)
     else:
         der.requires_grad_()
     for i in range(1, order):
         ones = torch.ones_like(der)
-        der, = torch.autograd.grad(der, var, create_graph=True, grad_outputs=ones, allow_unused=True)
+        der, = torch.autograd.grad(der, var, create_graph = True, grad_outputs = ones, allow_unused = True)
         if der is None:
-            return torch.zeros_like(var, requires_grad=True)
+            return torch.zeros_like(var, requires_grad = True)
         else:
             der.requires_grad_()
     return der
@@ -118,7 +119,7 @@ class col_gen(object):
         dimension: Spatial dimension (1, 2, or 3)
     """
 
-    def __init__(self,rmin=[0,0,0,0],rmax=[1,1,1,1], N_0 = 1000,N_b=1000,N_r = 3000, dimension=1):
+    def __init__(self, rmin = [0, 0, 0, 0], rmax = [1, 1, 1, 1], N_0 = 1000, N_b = 1000, N_r = 3000, dimension = 1):
         self.rmin = rmin
         self.rmax = rmax
         self.N_0 = N_0
@@ -126,7 +127,7 @@ class col_gen(object):
         self.N_r = N_r
         self.dimension = dimension
     
-    def _generate_uniform_tensor(self, n_points, lower, upper, device='cuda', requires_grad=True):
+    def _generate_uniform_tensor(self, n_points, lower, upper, device = 'cuda', requires_grad = True):
         """
         Helper function to generate uniformly distributed tensor.
         
@@ -140,7 +141,7 @@ class col_gen(object):
         Returns:
             Tensor of shape [n_points, 1]
         """
-        tensor = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(lower, upper)
+        tensor = torch.empty(n_points, 1, device = device, dtype = torch.float32).uniform_(lower, upper)
         if requires_grad:
             tensor = tensor.requires_grad_()
         return tensor
@@ -399,7 +400,6 @@ def req_consts_calc(lam, rho_1):
         - jeans_length: Jeans wavelength (critical wavelength for instability)
         - alpha: Growth rate or oscillation frequency depending on lam vs jeans_length
     """
-    from config import cs, const, G, rho_o
     
     if rho_o != 0:
         jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_o))
@@ -433,7 +433,6 @@ def distribute_collocation_points(n_total, num_subdomains):
     Returns:
         List of point counts per subdomain
     """
-    from config import N_r_PER_SUBDOMAIN, N_0_PER_SUBDOMAIN
     
     # If per-subdomain count is specified, use it
     if n_total == N_r_PER_SUBDOMAIN and N_r_PER_SUBDOMAIN is not None:
@@ -453,2012 +452,15 @@ def distribute_collocation_points(n_total, num_subdomains):
     return counts
 _register_module('core.data_generator', ['col_gen', 'diff', 'distribute_collocation_points', 'input_taker', 'req_consts_calc'])
 
-# ==== Module: core.initial_conditions (core/initial_conditions.py) ====
-"""
-Initial Conditions Module
-
-This module contains all initial condition functions and power spectrum generation
-for PINNs training. Extracted from solver.py for better code organization.
-
-Functions:
-- initialize_shared_velocity_fields: Setup shared velocity fields for PINN/FD consistency
-- generate_power_spectrum_field: Generate vx component using power spectrum
-- generate_power_spectrum_field_vy: Generate vy component using power spectrum
-- fun_rho_0: Initial density condition
-- fun_vx_0: Initial x-velocity condition
-- fun_vy_0: Initial y-velocity condition
-- func: Placeholder function for phi initial condition
-"""
-
-import numpy as np
-import torch
-from config import (cs, rho_o, N_GRID, POWER_EXPONENT, FILTER_SCALE, 
-                    PERTURBATION_TYPE, KX, KY, KZ, RANDOM_SEED)
-
-# Global shared velocity fields for consistent initial conditions
-_shared_vx_interp = None
-_shared_vy_interp = None
-
-def _ensure_column_tensor(tensor):
-    return tensor if tensor.dim() > 1 else tensor.unsqueeze(-1)
-
-def _extract_spatial_coords(coords):
-    return coords[:-1] if len(coords) > 1 else coords
-
-
-def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
-    """
-    Initialize shared velocity fields for consistent PINN/FD initial conditions.
-    This should be called once at the beginning of training.
-    
-    IMPORTANT: The parameters used here (POWER_EXPONENT, v_1=a*cs, seed) MUST match
-    the parameters used in FD plotting functions to ensure identical initial conditions.
-    All FD visualization functions should use the same defaults.
-    
-    Args:
-        lam: Wavelength
-        num_of_waves: Number of waves in domain
-        v_1: Velocity amplitude
-        seed: Random seed for reproducibility
-    
-    Returns:
-        Tuple (vx_np, vy_np): Velocity field arrays
-    """
-    global _shared_vx_interp, _shared_vy_interp
-    
-    if seed is None:
-        seed = RANDOM_SEED
-    
-    # Import LAX functions
-    from numerical_solvers.LAX import generate_shared_velocity_field
-    
-    # Calculate domain size to match FD solver
-    Lx = lam * num_of_waves
-    Ly = lam * num_of_waves
-    
-    # Generate shared velocity fields
-    vx_np, vy_np, vx_interp, vy_interp = generate_shared_velocity_field(
-        N_GRID, N_GRID, Lx, Ly, 
-        power_index=POWER_EXPONENT, 
-        amplitude=v_1, 
-        random_seed=seed
-    )
-    
-    # Store interpolation functions globally
-    _shared_vx_interp = vx_interp
-    _shared_vy_interp = vy_interp
-    
-    return vx_np, vy_np
-
-
-def _interpolate_shared_field(x, field_interp):
-    """
-    Helper function to interpolate shared velocity field to collocation points.
-    
-    Args:
-        x: Collocation coordinates [x, y, ...]
-        field_interp: Interpolation function from shared fields
-    
-    Returns:
-        Interpolated field values as torch tensor
-    """
-    # Convert tensor coordinates to numpy for interpolation
-    x_np = x[0].detach().cpu().numpy()
-    y_np = x[1].detach().cpu().numpy()
-    
-    # Create coordinate pairs for interpolation
-    coords = np.stack([x_np.flatten(), y_np.flatten()], axis=1)
-    
-    # Interpolate shared velocity field
-    field_interp_values = field_interp(coords)
-    
-    # Convert back to tensor and reshape
-    field_tensor = torch.from_numpy(field_interp_values).float().to(x[0].device)
-    
-    # Ensure correct shape [N, 1]
-    if field_tensor.dim() == 1:
-        return field_tensor.unsqueeze(-1)
-    else:
-        return field_tensor
-
-
-def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
-    """
-    Fallback power spectrum generation when shared fields are not available.
-    
-    Args:
-        lam: Wavelength (unused for domain sizing in fallback)
-        v_1: Velocity amplitude
-        x: Collocation coordinates
-        seed: Random seed
-    
-    Returns:
-        Generated power spectrum field
-    """
-    if seed is None:
-        seed = RANDOM_SEED
-    
-    # Infer domain extents directly from the collocation coordinates to support arbitrary num_of_waves
-    # Use conservative defaults if tensors are degenerate (e.g., single point during a unit test)
-    x_coords = x[0].detach()
-    y_coords = x[1].detach() if len(x) > 1 else x[0].detach()
-
-    xmin_val = torch.min(x_coords).item() if x_coords.numel() > 0 else 0.0
-    xmax_val = torch.max(x_coords).item() if x_coords.numel() > 0 else float(lam * 2.0)
-    ymin_val = torch.min(y_coords).item() if y_coords.numel() > 0 else 0.0
-    ymax_val = torch.max(y_coords).item() if y_coords.numel() > 0 else float(lam * 2.0)
-
-    # Ensure positive lengths; fall back to 2*lam if bounds collapse
-    Lx = float(max(xmax_val - xmin_val, 1e-6))
-    Ly = float(max(ymax_val - ymin_val, 1e-6))
-    if not torch.isfinite(torch.tensor(Lx)) or Lx < 1e-6:
-        Lx = float(lam * 2.0)
-    if not torch.isfinite(torch.tensor(Ly)) or Ly < 1e-6:
-        Ly = float(lam * 2.0)
-
-    dx = Lx / N_GRID
-    dy = Ly / N_GRID
-    
-    # Calculate wave numbers
-    kx = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
-    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dy, device=x[0].device)
-    KX_grid, KY_grid = torch.meshgrid(kx, ky, indexing='ij')
-    
-    # Calculate magnitude of wave number
-    K = torch.sqrt(KX_grid**2 + KY_grid**2)
-    
-    # Power spectrum: P(k) ~ k^expon * exp((-k*Rf)^2)
-    K_safe = torch.where(K == 0, torch.tensor(1e-10, device=x[0].device), K)
-    power_spectrum = K_safe**POWER_EXPONENT * torch.exp(-(K_safe * FILTER_SCALE)**2)
-    
-    # Remove DC (uniform) mode to avoid bulk drift
-    power_spectrum[K == 0] = 0.0
-    
-    # Safety check: limit extreme values
-    power_spectrum = torch.clamp(power_spectrum, 0, 1e6)
-    
-    # Generate random phases
-    torch.manual_seed(seed)
-    random_phases = torch.randn(N_GRID, N_GRID, device=x[0].device) + 1j * torch.randn(N_GRID, N_GRID, device=x[0].device)
-    
-    # Create complex field in Fourier space and transform to real space
-    field_fourier = torch.sqrt(power_spectrum) * random_phases
-    field_real = torch.real(torch.fft.ifft2(field_fourier))
-    
-    # Remove any residual mean (bulk flow) and normalize rms to v_1
-    field_real = field_real - torch.mean(field_real)
-    field_real = field_real / torch.std(field_real) * v_1
-    
-    # Interpolate to the actual collocation points
-    x_norm = torch.clamp(((x[0] - xmin_val) / Lx) * (N_GRID - 1), 0, N_GRID - 1)
-    if len(x) > 1:
-        y_norm = torch.clamp(((x[1] - ymin_val) / Ly) * (N_GRID - 1), 0, N_GRID - 1)
-    else:
-        # 1D fallback: mirror x for y to preserve shape
-        y_norm = x_norm.clone()
-    
-    x_idx = torch.round(x_norm).long()
-    y_idx = torch.round(y_norm).long()
-    
-    # Ensure correct tensor shape [N, 1]
-    result = field_real[x_idx, y_idx]
-    if result.dim() == 1:
-        return result.unsqueeze(-1)
-    else:
-        return result
-
-
-def generate_power_spectrum_field(lam, v_1, x, seed=None):
-    """
-    Generate 2D Gaussian random field with power spectrum using shared fields if available.
-    
-    Args:
-        lam: Wavelength
-        v_1: Velocity amplitude
-        x: Collocation coordinates [x, y, ...]
-        seed: Random seed for reproducibility
-    
-    Returns:
-        vx component of velocity field
-    """
-    if seed is None:
-        seed = RANDOM_SEED
-    
-    # Use shared velocity fields if available
-    if _shared_vx_interp is not None:
-        return _interpolate_shared_field(x, _shared_vx_interp)
-    
-    # Fallback to original method if shared fields not available
-    return _generate_power_spectrum_fallback(lam, v_1, x, seed)
-
-
-def generate_power_spectrum_field_vy(lam, v_1, x, seed=None):
-    """
-    Generate vy component using shared fields if available.
-    
-    Args:
-        lam: Wavelength
-        v_1: Velocity amplitude
-        x: Collocation coordinates [x, y, ...]
-        seed: Random seed for reproducibility
-    
-    Returns:
-        vy component of velocity field
-    """
-    if seed is None:
-        seed = RANDOM_SEED
-    
-    # Use shared velocity fields if available
-    if _shared_vy_interp is not None:
-        return _interpolate_shared_field(x, _shared_vy_interp)
-    
-    # Fallback to original method if shared fields not available
-    return _generate_power_spectrum_fallback(lam, v_1, x, seed)
-
-
-def _compute_wave_phase(spatial_coords, lam):
-    """
-    Compute wave phase and wave-vector components for sinusoidal perturbations.
-    """
-    if not spatial_coords:
-        raise ValueError("Spatial coordinates are required to compute wave phase.")
-    
-    x_coord = _ensure_column_tensor(spatial_coords[0])
-    zeros = torch.zeros_like(x_coord)
-    y_coord = _ensure_column_tensor(spatial_coords[1]) if len(spatial_coords) >= 2 else zeros
-    z_coord = _ensure_column_tensor(spatial_coords[2]) if len(spatial_coords) >= 3 else zeros
-    
-    device = x_coord.device
-    dtype = x_coord.dtype
-    kx = torch.as_tensor(float(KX), device=device, dtype=dtype)
-    ky = torch.as_tensor(float(KY), device=device, dtype=dtype)
-    kz = torch.as_tensor(float(KZ), device=device, dtype=dtype)
-    
-    phase = kx * x_coord + ky * y_coord + kz * z_coord
-    
-    # Fallback to fundamental wavelength if wave-vector is zero (e.g., user-specified)
-    if torch.allclose(kx.abs() + ky.abs() + kz.abs(), torch.tensor(0.0, device=device, dtype=dtype)):
-        fundamental = torch.as_tensor(2 * np.pi / lam, device=device, dtype=dtype)
-        phase = fundamental * x_coord
-        kx, ky, kz = fundamental, torch.zeros_like(fundamental), torch.zeros_like(fundamental)
-    
-    return phase, kx, ky, kz, x_coord, y_coord, z_coord
-
-
-def _coupled_velocity_components(coords, lam, jeans, v_1):
-    """
-    Generate coupled velocity components from the same wave pattern (supports 1D/2D/3D).
-    """
-    spatial_coords = _extract_spatial_coords(coords)
-    phase, kx, ky, kz, _, _, _ = _compute_wave_phase(spatial_coords, lam)
-    dtype = phase.dtype
-    device = phase.device
-    v_scale = torch.as_tensor(float(v_1), device=device, dtype=dtype)
-    
-    if lam > jeans:
-        wave_field = -v_scale * torch.sin(phase)
-    else:
-        wave_field = v_scale * torch.cos(phase)
-    
-    k_mag = torch.sqrt(kx**2 + ky**2 + kz**2)
-    if k_mag <= torch.tensor(1e-12, device=device, dtype=dtype):
-        vx = wave_field
-        vy = torch.zeros_like(wave_field)
-        vz = torch.zeros_like(wave_field)
-    else:
-        inv_mag = 1.0 / k_mag
-        vx = wave_field * (kx * inv_mag)
-        vy = wave_field * (ky * inv_mag)
-        vz = wave_field * (kz * inv_mag)
-    
-    return vx, vy, vz
-
-
-def fun_rho_0(rho_1, lam, x):
-    """
-    Define initial condition for density.
-    
-    Args:
-        rho_1: Perturbation amplitude
-        lam: Wavelength
-        x: Spatial coordinates [x, y, t] or [x, t]
-    
-    Returns:
-        rho_0: Initial density field
-    """
-    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        spatial_coords = _extract_spatial_coords(x)
-        phase, *_ = _compute_wave_phase(spatial_coords, lam)
-        rho_0 = rho_o + rho_1 * torch.cos(phase)
-    else:
-        # Power spectrum: uniform initial density
-        rho_0 = torch.full_like(x[0], rho_o)
-        # Ensure correct shape [N, 1]
-        if rho_0.dim() == 1:
-            rho_0 = rho_0.unsqueeze(-1)
-    
-    return rho_0
-
-
-def fun_vx_0(lam, jeans, v_1, x):
-    """
-    Initial condition for x-velocity.
-    
-    Args:
-        lam: Wavelength
-        jeans: Jeans length
-        v_1: Velocity amplitude
-        x: Spatial coordinates
-    
-    Returns:
-        vx_0: Initial x-velocity field
-    """
-    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        vx, _, _ = _coupled_velocity_components(x, lam, jeans, v_1)
-        return vx
-    else:
-        # Power spectrum case
-        return generate_power_spectrum_field(lam, v_1, x, seed=RANDOM_SEED)
-
-
-def fun_vy_0(lam, jeans, v_1, x):
-    """
-    Initial condition for y-velocity.
-    
-    Args:
-        lam: Wavelength
-        jeans: Jeans length
-        v_1: Velocity amplitude
-        x: Spatial coordinates
-    
-    Returns:
-        vy_0: Initial y-velocity field
-    """
-    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        _, vy, _ = _coupled_velocity_components(x, lam, jeans, v_1)
-        return vy
-    else:
-        # Power spectrum case
-        return generate_power_spectrum_field_vy(lam, v_1, x, seed=RANDOM_SEED)
-
-
-def fun_vz_0(lam, jeans, v_1, x):
-    """
-    Initial condition for z-velocity (used in 3D sinusoidal runs).
-    """
-    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-        _, _, vz = _coupled_velocity_components(x, lam, jeans, v_1)
-        return vz
-    else:
-        # Power spectrum setup is currently 2D; default to zero
-        return func(x)
-
-
-def func(x):
-    """
-    Placeholder function for phi initial condition (zero potential).
-    
-    Args:
-        x: Spatial coordinates
-    
-    Returns:
-        Zero tensor matching the shape of x[0]
-    """
-    return x[0] * 0
-_register_module('core.initial_conditions', ['_compute_wave_phase', '_coupled_velocity_components', '_ensure_column_tensor', '_extract_spatial_coords', '_generate_power_spectrum_fallback', '_interpolate_shared_field', '_shared_vx_interp', '_shared_vy_interp', 'fun_rho_0', 'fun_vx_0', 'fun_vy_0', 'fun_vz_0', 'func', 'generate_power_spectrum_field', 'generate_power_spectrum_field_vy', 'initialize_shared_velocity_fields'])
-
-# ==== Module: core.losses (core/losses.py) ====
-from core.data_generator import col_gen
-from core.data_generator import diff
-
-import numpy as np
-
-import torch
-import torch.nn as nn
-from torch.autograd import Variable
-from config import cs, const, G, rho_o
-
-class ASTPN(col_gen):
-    
-    def __init__(self, rmin=[0,0,0,0], rmax=[1,1,1,1], N_0 = 1000, N_b=1000, N_r=3000, dimension=1):
-        super().__init__(rmin,rmax, N_0,0,N_r, dimension)  # N_b set to 0 due to hard constraints
-        
-       
-        self.coord_Lx, self.coord_Rx = self.geo_time_coord(option="BC",coordinate=1)
-        
-        if dimension == 2:
-            self.coord_Ly, self.coord_Ry = self.geo_time_coord(option="BC",coordinate=2)
-
-        if dimension == 3:
-            self.coord_Ly, self.coord_Ry = self.geo_time_coord(option="BC",coordinate=2)
-            self.coord_Lz, self.coord_Rz = self.geo_time_coord(option="BC",coordinate=3)
-    
-    
-    
-    def periodic_BC(self,net,coordinate=1,derivative_order=0,component=0):
-        
-        '''
-           INPUT: geomtime: The collocatin grids
-           since it is BC the derivative always wrt to spacial coordinate: coordinate =1 is the first x coordinate
-           derivative order: what order derivative
-           component: output component's derivative is taken component = 0 is the First output fron the network
-           default is set to 0,i.e., the first output
-           coordinate : 1: xaxis (default), 2: with y axis 3: with zaxis
-         '''
-
-        if coordinate==1:   
-            coord_L, coord_R = self.coord_Lx, self.coord_Rx
-        if coordinate==2:       
-            coord_L, coord_R = self.coord_Ly, self.coord_Ry
-        if coordinate==3:       
-            coord_L, coord_R = self.coord_Lz, self.coord_Rz
-        
-        
-        # return coord_L, coord_R
-          
-        variable_l = net(coord_L)[:,component:component+1] 
-        variable_r = net(coord_R)[:,component:component+1] 
-        
-        if derivative_order == 0:
-
-            return torch.mean((variable_l - variable_r)**2)
-
-        elif derivative_order == 1:        
-            der_l = diff(variable_l,coord_L[coordinate-1],order=derivative_order)
-            der_r = diff(variable_r,coord_R[coordinate-1],order=derivative_order)
-
-            return torch.mean((der_l-der_r)**2)
-
-
-def pde_residue(colloc, net, dimension = 1):
-    
-    '''
-    This is the main function that returns all the PDE residue
-    
-    Args:
-        colloc: Collocation points
-        net: Neural network
-        dimension: Spatial dimension (1, 2, or 3)
-    '''
-    
-    return pde_residue_standard(colloc, net, dimension)
-
-
-def pde_residue_standard(colloc, net, dimension = 1):
-    
-    '''
-    Standard PDE residues (network predicts rho directly)
-    '''
-    net_outputs = net(colloc)
-    
-    x = colloc[0]
-    
-    if dimension == 1:
-        t = colloc[1]
-
-    elif dimension == 2:
-        y = colloc[1]
-        t = colloc[2]
-
-    elif dimension == 3:
-        y = colloc[1]
-        z = colloc[2]
-        t = colloc[3]
-    
-    rho, vx = net_outputs[:,0:1], net_outputs[:,1:2]
-
-    if dimension == 1:
-
-        phi = net_outputs[:,2:3]
-
-        rho_t = diff(rho,t,order=1)  
-        rho_x = diff(rho,x,order=1)
-
-        vx_t = diff(vx, t,order=1)
-        vx_x = diff(vx, x,order=1)
-        
-        phi_x = diff(phi,x,order=1)
-        phi_x_x = diff(phi,x,order=2)
-
-    elif dimension == 2:
-
-        vy = net_outputs[:,2:3]
-        phi = net_outputs[:,3:4]
-
-        rho_t = diff(rho,t,order=1)  
-        rho_x = diff(rho,x,order=1)
-        rho_y = diff(rho,y,order=1)
-
-        vx_t = diff(vx, t,order=1)
-        vy_t = diff(vy, t,order=1)
-
-        vx_x = diff(vx, x,order=1)
-        vx_y = diff(vx, y,order=1)
-        vy_x = diff(vy, x,order=1)
-        vy_y = diff(vy, y,order=1)
-        
-        phi_x = diff(phi,x,order=1)
-        phi_x_x = diff(phi,x,order=2)
-
-        phi_y = diff(phi,y,order=1)
-        phi_y_y = diff(phi,y,order=2)
-
-    elif dimension == 3:
-        vy = net_outputs[:,2:3]
-        vz = net_outputs[:,3:4]
-        phi = net_outputs[:,4:5]
-
-        rho_t = diff(rho,t,order=1)  
-        rho_x = diff(rho,x,order=1)
-        rho_y = diff(rho,y,order=1)
-        rho_z = diff(rho,z,order=1)
-
-        vx_t = diff(vx, t,order=1)
-        vy_t = diff(vy, t,order=1)
-        vz_t = diff(vz, t,order=1)
-
-        vx_x = diff(vx, x,order=1)
-        vy_x = diff(vy, x,order=1)
-        vz_x = diff(vz, x,order=1)
-
-        vx_y = diff(vx, y,order=1)
-        vy_y = diff(vy, y,order=1)
-        vz_y = diff(vz, y,order=1)
-        
-        vx_z = diff(vx, z,order=1)
-        vy_z = diff(vy, z,order=1)
-        vz_z = diff(vz, z,order=1)
-        
-        phi_x = diff(phi,x,order=1)
-        phi_x_x = diff(phi,x,order=2)
-
-        phi_y = diff(phi,y,order=1)
-        phi_y_y = diff(phi,y,order=2)
-    
-        phi_z = diff(phi,z,order=1)
-        phi_z_z = diff(phi,z,order=2)
-
-    
-    ## The residues from the equations
-
-    if dimension == 1:
-        rho_r = rho_t + vx * rho_x + rho * vx_x
-        vx_r = rho*vx_t + rho*(vx*vx_x) + cs*cs*rho_x +rho*phi_x
-        phi_r = phi_x_x - const*(rho - rho_o)
-
-        return rho_r, vx_r, phi_r
-
-    elif dimension == 2:
-        rho_r = rho_t + vx * rho_x + vy * rho_y + rho * vx_x + rho * vy_y
-        vx_r = rho*vx_t + rho*(vx*vx_x + vy*vx_y) + cs*cs*rho_x + rho*phi_x
-        vy_r = rho*vy_t + rho*(vy*vy_y + vx*vy_x) + cs*cs*rho_y + rho*phi_y
-        phi_r = phi_x_x + phi_y_y - const*(rho - rho_o)
-
-        return rho_r, vx_r, vy_r, phi_r
-    
-    elif dimension == 3:
-        rho_r = rho_t + vx * rho_x + rho * vx_x + vy *rho_y + rho * vy_y + vz *rho_z +rho * vz_z
-        vx_r = rho*vx_t + rho*(vx*vx_x + vy*vx_y+vz*vx_z) + cs*cs*rho_x + rho*phi_x
-        vy_r = rho*vy_t + rho*(vy*vy_y + vx*vy_x+vz*vy_z) + cs*cs*rho_y + rho*phi_y
-        vz_r = rho*vz_t + rho*(vz*vz_z + vx*vz_x+vy*vz_y) + cs*cs*rho_z + rho*phi_z
-        phi_r = phi_x_x + phi_y_y +phi_z_z - const*(rho - rho_o)
-        
-        return rho_r,vx_r,vy_r,vz_r,phi_r
-
-
-class XPINN_Loss:
-    """
-    XPINN Loss computation for domain decomposition.
-    
-    Computes:
-    - PDE residual loss per subdomain
-    - Initial condition loss per subdomain
-    - Periodic BC loss (only exterior boundaries)
-    - Interface continuity losses (solution + residual)
-    """
-    
-    def __init__(self, rmin, rmax, dimension=2):
-        """
-        Initialize XPINN loss computer.
-        
-        Args:
-            rmin: List of minimum values [xmin, ymin, tmin] (for 2D)
-            rmax: List of maximum values [xmax, ymax, tmax] (for 2D)
-            dimension: Spatial dimension (default 2)
-        """
-        self.rmin = rmin
-        self.rmax = rmax
-        self.dimension = dimension
-        
-        # Import config values
-        from config import (INTERFACE_SOLUTION_WEIGHT, INTERFACE_RESIDUAL_WEIGHT,
-                           INTERFACE_SOLUTION_COMPONENTS)
-        self.interface_solution_weight = INTERFACE_SOLUTION_WEIGHT
-        self.interface_residual_weight = INTERFACE_RESIDUAL_WEIGHT
-        self.interface_components = INTERFACE_SOLUTION_COMPONENTS
-        
-        # Component name to index mapping
-        self.component_map = {'rho': 0, 'vx': 1, 'vy': 2, 'phi': 3}
-    
-    def compute_pde_loss(self, colloc, net):
-        """
-        Compute PDE residual loss for a subdomain.
-        
-        Args:
-            colloc: Collocation points [x, y, t]
-            net: Neural network for this subdomain
-        
-        Returns:
-            PDE residual loss (scalar)
-        """
-        residuals = pde_residue(colloc, net, dimension=self.dimension)
-        
-        # Sum squared residuals
-        loss = sum(torch.mean(r**2) for r in residuals)
-        return loss
-    
-    def compute_ic_loss(self, colloc_ic, net, ic_functions, cached_ic=None):
-        """
-        Compute initial condition loss for a subdomain.
-        
-        Args:
-            colloc_ic: Initial condition collocation points [x, y, t=0]
-            net: Neural network for this subdomain
-            ic_functions: Dictionary of initial condition functions
-                          {'rho': func, 'vx': func, 'vy': func, 'phi': func}
-            cached_ic: Precomputed IC values (optional)
-        
-        Returns:
-            IC loss (scalar)
-        """
-        # Get network predictions at t=0
-        u_pred = net(colloc_ic)
-        
-        # Use cached IC values if available, otherwise compute them
-        if cached_ic is not None:
-            ic_rho = cached_ic['rho']
-            ic_vx = cached_ic['vx']
-            ic_vy = cached_ic['vy']
-            ic_phi = cached_ic['phi']
-        else:
-            # Compute initial conditions
-            ic_rho = ic_functions['rho'](colloc_ic)
-            ic_vx = ic_functions['vx'](colloc_ic)
-            ic_vy = ic_functions['vy'](colloc_ic)
-            ic_phi = ic_functions['phi'](colloc_ic)
-        
-        # Compute MSE for each component
-        loss_rho = torch.mean((u_pred[:, 0:1] - ic_rho)**2)
-        loss_vx = torch.mean((u_pred[:, 1:2] - ic_vx)**2)
-        loss_vy = torch.mean((u_pred[:, 2:3] - ic_vy)**2)
-        loss_phi = torch.mean((u_pred[:, 3:4] - ic_phi)**2)
-        
-        total_ic_loss = loss_rho + loss_vx + loss_vy + loss_phi
-        return total_ic_loss
-    
-    def compute_interface_solution_loss(self, colloc_interface, net1, net2, grad_to='both'):
-        """
-        Compute solution continuity loss at interface.
-        
-        Enforces: u_avg = (u1 + u2)/2 for both networks.
-        Minimizes: |u1 - u_avg|^2 + |u2 - u_avg|^2
-        
-        Args:
-            colloc_interface: Interface collocation points [x, y, t]
-            net1, net2: Neural networks for adjacent subdomains
-            grad_to: 'both' (default), 'net1', or 'net2' - controls which network receives gradients
-        
-        Returns:
-            Solution continuity loss (scalar)
-        """
-        # Move interface points to each network's device
-        device1 = next(net1.parameters()).device
-        device2 = next(net2.parameters()).device
-        
-        colloc_interface_1 = [t.to(device1) for t in colloc_interface]
-        colloc_interface_2 = [t.to(device2) for t in colloc_interface]
-        
-        # Get predictions from both networks at interface
-        u1 = net1(colloc_interface_1)
-        u2 = net2(colloc_interface_2)
-        
-        # Detach neighbor network BEFORE any device transfers to avoid graph sharing
-        if grad_to == 'net1':
-            u2 = u2.detach()
-        elif grad_to == 'net2':
-            u1 = u1.detach()
-        
-        # Compute loss on the device of the network we're training
-        if grad_to == 'net2':
-            # Backprop only to net2; compute on device2
-            # u1 is already detached, so moving it won't create gradients
-            u1_on_device2 = u1.to(device2)
-            u_avg = (u1_on_device2 + u2) / 2.0
-            loss = 0.0
-            for comp_name in self.interface_components:
-                if comp_name in self.component_map:
-                    idx = self.component_map[comp_name]
-                    if idx < u2.shape[1]:
-                        u2_comp = u2[:, idx:idx+1]
-                        u_avg_comp = u_avg[:, idx:idx+1]
-                        loss += torch.mean((u2_comp - u_avg_comp)**2)
-        else:
-            # Backprop to net1 (or both); compute on device1
-            # u2 is already detached, so moving it won't create gradients
-            u2_on_device1 = u2.to(device1)
-            u_avg = (u1 + u2_on_device1) / 2.0
-            loss = 0.0
-            for comp_name in self.interface_components:
-                if comp_name in self.component_map:
-                    idx = self.component_map[comp_name]
-                    if idx < u1.shape[1]:
-                        u1_comp = u1[:, idx:idx+1]
-                        u_avg_comp = u_avg[:, idx:idx+1]
-                        loss += torch.mean((u1_comp - u_avg_comp)**2)
-                        if grad_to == 'both':
-                            u2_comp = u2_on_device1[:, idx:idx+1]
-                            loss += torch.mean((u2_comp - u_avg_comp)**2)
-        
-        return self.interface_solution_weight * loss
-    
-    def compute_interface_residual_loss(self, colloc_interface, net1, net2, grad_to='both'):
-        """
-        Compute residual continuity loss at interface.
-        
-        Enforces: R1(interface) = R2(interface)
-        
-        Args:
-            colloc_interface: Interface collocation points [x, y, t]
-            net1, net2: Neural networks for adjacent subdomains
-            grad_to: 'both' (default), 'net1', or 'net2' - controls which network receives gradients
-        
-        Returns:
-            Residual continuity loss (scalar)
-        """
-        # Move interface points to each network's device
-        device1 = next(net1.parameters()).device
-        device2 = next(net2.parameters()).device
-        
-        colloc_interface_1 = [t.to(device1) for t in colloc_interface]
-        colloc_interface_2 = [t.to(device2) for t in colloc_interface]
-        
-        # Compute PDE residuals from both networks at interface
-        residuals1 = pde_residue(colloc_interface_1, net1, dimension=self.dimension)
-        residuals2 = pde_residue(colloc_interface_2, net2, dimension=self.dimension)
-        
-        # Enforce residual matching for all PDE components
-        loss = 0.0
-        if grad_to == 'net2':
-            # Backprop only to net2; compute on device2
-            for r1, r2 in zip(residuals1, residuals2):
-                r1_detached = r1.detach().to(device2)
-                loss += torch.mean((r2 - r1_detached)**2)
-        elif grad_to == 'net1':
-            # Backprop only to net1; compute on device1
-            for r1, r2 in zip(residuals1, residuals2):
-                r2_detached = r2.detach().to(device1)
-                loss += torch.mean((r1 - r2_detached)**2)
-        else:
-            # Backprop to both (original behavior); compute on device1
-            for r1, r2 in zip(residuals1, residuals2):
-                r2_on_device1 = r2.to(device1)
-                loss += torch.mean((r1 - r2_on_device1)**2)
-        
-        return self.interface_residual_weight * loss
-    
-    # NOTE: Periodic boundary conditions are enforced via periodic feature encoding
-    # (n_harmonics in _periodic_features method of PINN class), NOT via loss term.
-    # This is a hard constraint approach where the network architecture guarantees periodicity.
-    
-    def compute_total_loss(self, nets, subdomain_collocs, interface_collocs, 
-                          subdomain_ic_collocs, ic_functions, interfaces, 
-                          exterior_boundaries, cached_ic_values=None):
-        """
-        Compute total XPINN loss aggregating all components.
-        
-        Args:
-            nets: List of neural networks (one per subdomain)
-            subdomain_collocs: List of subdomain collocation points
-            interface_collocs: Dict mapping interface tuple to collocation points
-            subdomain_ic_collocs: List of IC collocation points per subdomain
-            ic_functions: Initial condition functions
-            interfaces: List of interface tuples (subdomain_i, subdomain_j, type, pos)
-            exterior_boundaries: Dict mapping subdomain_idx to boundary info
-            cached_ic_values: Precomputed IC values (list of dicts per subdomain, optional)
-        
-        Returns:
-            Tuple (total_loss, loss_dict) where loss_dict contains component losses
-        """
-        if cached_ic_values is None:
-            cached_ic_values = [None] * len(nets)
-            
-        # Initialize loss dict on device 0 (or appropriate device for single GPU)
-        device = 'cuda:0' if len(nets) > 1 else next(nets[0].parameters()).device
-        loss_dict = {
-            'pde': torch.tensor(0.0, device=device),
-            'ic': torch.tensor(0.0, device=device),
-            'interface_solution': torch.tensor(0.0, device=device),
-            'interface_residual': torch.tensor(0.0, device=device)
-        }
-        
-        # PDE and IC losses for each subdomain
-        for i, (net, colloc, colloc_ic) in enumerate(zip(nets, subdomain_collocs, subdomain_ic_collocs)):
-            # Compute losses on the device where the network lives
-            pde_loss = self.compute_pde_loss(colloc, net)
-            ic_loss = self.compute_ic_loss(colloc_ic, net, ic_functions, cached_ic_values[i])
-            
-            # Move losses to device 0 for aggregation (or keep on same device if single GPU)
-            if len(nets) > 1:  # Multi-GPU case
-                pde_loss = pde_loss.to(device)
-                ic_loss = ic_loss.to(device)
-            
-            loss_dict['pde'] += pde_loss
-            loss_dict['ic'] += ic_loss
-        
-        # Interface losses
-        for interface in interfaces:
-            subdomain_i, subdomain_j, _, _ = interface
-            interface_key = (subdomain_i, subdomain_j)
-            
-            if interface_key in interface_collocs:
-                colloc_interface = interface_collocs[interface_key]
-                net1 = nets[subdomain_i]
-                net2 = nets[subdomain_j]
-                
-                # Compute interface losses
-                sol_loss = self.compute_interface_solution_loss(colloc_interface, net1, net2)
-                res_loss = self.compute_interface_residual_loss(colloc_interface, net1, net2)
-                
-                # Move losses to device 0 for aggregation (or keep on same device if single GPU)
-                if len(nets) > 1:  # Multi-GPU case
-                    sol_loss = sol_loss.to(device)
-                    res_loss = res_loss.to(device)
-                
-                loss_dict['interface_solution'] += sol_loss
-                loss_dict['interface_residual'] += res_loss
-        
-        # NOTE: Periodic BC NOT included here - enforced via periodic feature encoding (harmonics)
-        # in the PINN architecture, which is a hard constraint approach.
-        
-        # Total loss
-        total_loss = sum(loss_dict.values())
-        
-        return total_loss, loss_dict
-_register_module('core.losses', ['ASTPN', 'XPINN_Loss', 'pde_residue', 'pde_residue_standard'])
-
-# ==== Module: core.model_architecture (core/model_architecture.py) ====
-import numpy as np
-
-import torch
-import torch.nn as nn
-#from torch.autograd import Variable
-from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, STARTUP_DT
-
-class Sin(nn.Module):
-    def forward(self, input):
-        return torch.sin(input)
-
-
-def get_activation(activation_type):
-    """
-    Factory function to create activation function instances.
-    
-    Args:
-        activation_type: String identifier ('sin', 'tanh', 'relu', 'elu')
-    
-    Returns:
-        nn.Module activation function
-    """
-    activation_type = activation_type.lower()
-    if activation_type == 'sin':
-        return Sin()
-    elif activation_type == 'tanh':
-        return nn.Tanh()
-    elif activation_type == 'relu':
-        return nn.ReLU()
-    elif activation_type == 'elu':
-        return nn.ELU()
-    else:
-        raise ValueError(f"Unknown activation type: {activation_type}. Choose from 'sin', 'tanh', 'relu', 'elu'.")
-
-class PINN(nn.Module):
-    def __init__(self, num_neurons=num_neurons, num_layers=num_layers, n_harmonics=1, activation_type=DEFAULT_ACTIVATION):
-        super(PINN, self).__init__()
-        self.num_neurons = num_neurons
-        self.n_harmonics = n_harmonics
-        self.num_layers = max(2, int(num_layers))  # total Linear layers including output
-        self.activation_type = activation_type
-        
-        # Domain extents for periodic embeddings (set via set_domain)
-        self.xmin = None
-        self.xmax = None
-        self.ymin = None
-        self.ymax = None
-        self.zmin = None
-        self.zmax = None
-    
-    # Helper to build a branch with dynamic depth
-        def _make_branch(in_dim, out_dim):
-            layers = []
-            # First layer
-            layers.append(nn.Linear(in_dim, self.num_neurons))
-            # Hidden layers: total linear layers = self.num_layers; we already added 1; 
-            # add (self.num_layers - 2) hidden Linear blocks with activations after each
-            for _ in range(self.num_layers - 2):
-                layers.append(get_activation(self.activation_type))
-                layers.append(nn.Linear(self.num_neurons, self.num_neurons))
-            # Activation before output if there is at least one hidden block
-            if self.num_layers > 2:
-                layers.append(get_activation(self.activation_type))
-            # Output layer
-            layers.append(nn.Linear(self.num_neurons, out_dim))
-            return nn.Sequential(*layers)
-
-    # 1D branch (periodic x features + t)
-        in_dim_1d = 2*self.n_harmonics + 1
-        self.branch_1d = _make_branch(in_dim_1d, 3)
-        
-    # 2D branch (periodic x,y features + t)
-        in_dim_2d = 4*self.n_harmonics + 1
-        self.branch_2d = _make_branch(in_dim_2d, 4)
-        
-    # 3D branch (periodic x,y,z features + t)
-        in_dim_3d = 6*self.n_harmonics + 1
-        self.branch_3d = _make_branch(in_dim_3d, 5)
-        
-        # Output layers per branch
-        #self.output_layer_1d = nn.Linear(3, 1)
-        #self.output_layer_2d = nn.Linear(4, 1)
-        #self.output_layer_3d = nn.Linear(5, 1)
-
-
-    def set_domain(self, rmin, rmax, dimension):
-        # rmin/rmax exclude time; follow ASTPN usage
-        if dimension >= 1:
-            self.xmin, self.xmax = float(rmin[0]), float(rmax[0])
-        if dimension >= 2:
-            self.ymin, self.ymax = float(rmin[1]), float(rmax[1])
-        if dimension >= 3:
-            self.zmin, self.zmax = float(rmin[2]), float(rmax[2])
-
-    def _periodic_features(self, u, umin, umax):
-        # u is [N,1]
-        L = umax - umin
-        theta = 2*np.pi*(u - umin)/L
-        features = []
-
-        for k in range(1, self.n_harmonics+1):
-            
-            scale = 1.0 / np.sqrt(k)
-
-            features.append(scale * torch.sin(k*theta))
-            features.append(scale * torch.cos(k*theta))
-
-        return torch.cat(features, dim=1) if len(features) > 0 else u
-
-    def _prepare_coordinate_features(self, X):
-        """
-        Prepare periodic features for all spatial coordinates.
-        
-        Args:
-            X: List of coordinates [x, ...spatial..., t]
-        
-        Returns:
-            Tuple (features, t_tensor, dimension)
-        """
-        x, t = X[0], X[-1]
-        x = x.unsqueeze(-1) if x.dim() == 1 else x
-        t = t.unsqueeze(-1) if t.dim() == 1 else t
-        dimension = len(X)
-        
-        if dimension == 2:
-            if self.xmin is None or self.xmax is None:
-                raise RuntimeError("Domain not set: call net.set_domain for dimension=1")
-            x_feat = self._periodic_features(x, self.xmin, self.xmax)
-            features = torch.cat([x_feat, t], dim=1)
-        
-        elif dimension == 3:
-            if self.xmin is None or self.xmax is None or self.ymin is None or self.ymax is None:
-                raise RuntimeError("Domain not set: call net.set_domain for dimension=2")
-            y = X[1].unsqueeze(-1) if X[1].dim() == 1 else X[1]
-            x_feat = self._periodic_features(x, self.xmin, self.xmax)
-            y_feat = self._periodic_features(y, self.ymin, self.ymax)
-            features = torch.cat([x_feat, y_feat, t], dim=1)
-        
-        elif dimension == 4:
-            if (self.xmin is None or self.xmax is None or
-                self.ymin is None or self.ymax is None or
-                self.zmin is None or self.zmax is None):
-                raise RuntimeError("Domain not set: call net.set_domain for dimension=3")
-            y = X[1].unsqueeze(-1) if X[1].dim() == 1 else X[1]
-            z = X[2].unsqueeze(-1) if X[2].dim() == 1 else X[2]
-            x_feat = self._periodic_features(x, self.xmin, self.xmax)
-            y_feat = self._periodic_features(y, self.ymin, self.ymax)
-            z_feat = self._periodic_features(z, self.zmin, self.zmax)
-            features = torch.cat([x_feat, y_feat, z_feat, t], dim=1)
-        
-        else:
-            raise ValueError(f"Expected len(X) in [2, 3, 4] but got {dimension}")
-        
-        return features, t, dimension
-    
-    def _apply_density_constraint(self, outputs, t):
-        """
-        Apply hard density constraint with causality enforcement for power spectrum perturbations.
-        
-        For power spectrum (non-sinusoidal):
-        - For t < STARTUP_DT: Density is frozen at ρ₀ (causality - information hasn't propagated)
-        - For t >= STARTUP_DT: Density evolves via ρ = ρ₀ + (t - STARTUP_DT) × ρ̂
-        
-        This enforces that density remains at initial conditions until information has had time
-        to propagate across the domain (finite signal speed).
-        
-        For sinusoidal: No constraint (returns as-is).
-        
-        Args:
-            outputs: Raw network outputs
-            t: Time tensor
-        
-        Returns:
-            Modified outputs with density constraint applied
-        """
-        if str(PERTURBATION_TYPE).lower() == "sinusoidal":
-            return outputs
-        
-        # Causality constraint for power spectrum:
-        # Density frozen at ρ₀ for t < STARTUP_DT (information propagation delay)
-        # Density evolves after t >= STARTUP_DT
-        rho_hat = outputs[:, 0:1]
-        other = outputs[:, 1:]
-        
-        # Effective time: zero for t < STARTUP_DT, (t - STARTUP_DT) for t >= STARTUP_DT
-        # This ensures continuity at t = STARTUP_DT: ρ(STARTUP_DT) = ρ₀
-        t_effective = torch.clamp(t - STARTUP_DT, min=0.0)
-        
-        # Density evolution: ρ = ρ₀ + t_effective × ρ̂
-        # For t < STARTUP_DT: t_effective = 0, so ρ = ρ₀ (frozen)
-        # For t >= STARTUP_DT: t_effective = t - STARTUP_DT, so ρ evolves
-        rho = rho_o + t_effective * rho_hat
-        
-        return torch.cat([rho, other], dim=1)
-    
-    def forward(self, X):
-        """
-        Forward pass of PINN.
-        
-        Args:
-            X: List of coordinates [x, ...spatial..., t]
-        
-        Returns:
-            Network predictions [rho, vx, vy?, vz?, phi]
-        """
-        features, t, dimension = self._prepare_coordinate_features(X)
-        
-        # Select appropriate branch based on dimension
-        if dimension == 2:
-            outputs = self.branch_1d(features)
-        elif dimension == 3:
-            outputs = self.branch_2d(features)
-        elif dimension == 4:
-            outputs = self.branch_3d(features)
-        else:
-            raise ValueError(f"Unexpected dimension: {dimension}")
-        
-        return self._apply_density_constraint(outputs, t)
-        
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight)
-        m.bias.data.fill_(0.01)
-_register_module('core.model_architecture', ['PINN', 'Sin', 'get_activation', 'init_weights'])
-
-# ==== Module: methods.causal_training (methods/causal_training.py) ====
-"""
-Causal Training Module for Physics-Informed Neural Networks
-
-This module provides infrastructure for causal training with temporal curriculum
-and adaptive/static weighting schemes. Similar to xpinn_decomposition.py structure.
-
-Key Components:
-- ResidualTracker: Tracks residuals across time bins for adaptive weighting
-- CausalTrainer: Orchestrates the complete causal training workflow
-- Helper functions for window scheduling, weight computation, etc.
-"""
-
-import numpy as np
-import torch
-
-
-class ResidualTracker:
-    """
-    Tracks cumulative residuals across time bins for adaptive causal weighting.
-    Implements w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k, θ))
-    """
-    def __init__(self, t_min, t_max, num_bins, epsilon, device='cuda'):
-        """
-        Args:
-            t_min: Minimum time value
-            t_max: Maximum time value
-            num_bins: Number of time bins for tracking residuals
-            epsilon: Causality parameter (controls weight suppression strength)
-            device: PyTorch device
-        """
-        self.t_min = t_min
-        self.t_max = t_max
-        self.num_bins = num_bins
-        self.epsilon = epsilon
-        self.device = device
-        
-        # Bin edges for time discretization
-        self.bin_edges = torch.linspace(t_min, t_max, num_bins + 1, device=device)
-        self.bin_width = (t_max - t_min) / num_bins
-        
-        # Cumulative residuals per bin (initialized to zero)
-        self.cumulative_residuals = torch.zeros(num_bins, device=device)
-        
-        # Counter for number of updates per bin (for averaging)
-        self.update_counts = torch.zeros(num_bins, device=device)
-    
-    def get_bin_indices(self, t_values):
-        """Get bin indices for given time values."""
-        t_flat = t_values.flatten()
-        bin_idx = ((t_flat - self.t_min) / self.bin_width).long()
-        return torch.clamp(bin_idx, 0, self.num_bins - 1)
-    
-    def update_residuals(self, t_values, residuals):
-        """
-        Update cumulative residuals for time bins based on current batch.
-        
-        Args:
-            t_values: Time values [N, 1]
-            residuals: PDE residuals [N, 1] or list of residuals
-        """
-        # Convert residuals to single scalar per point if it's a list
-        if isinstance(residuals, (list, tuple)):
-            total_residual = sum(r.flatten() ** 2 for r in residuals)
-            residual_values = torch.sqrt(total_residual)
-        else:
-            residual_values = residuals.flatten().abs()
-        
-        bin_idx = self.get_bin_indices(t_values)
-        
-        # Vectorized accumulation using bincount
-        bin_sums = torch.bincount(bin_idx, weights=residual_values, minlength=self.num_bins)
-        bin_counts = torch.bincount(bin_idx, minlength=self.num_bins).to(bin_sums.dtype)
-        
-        self.cumulative_residuals += bin_sums.detach()
-        self.update_counts += bin_counts.detach()
-    
-    def get_adaptive_weights(self, t_values):
-        """
-        Compute adaptive causal weights based on cumulative past residuals.
-        w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k))
-        
-        Args:
-            t_values: Time values [N, 1]
-        
-        Returns:
-            Weights [N, 1]
-        """
-        eps = 1e-12
-        bin_idx = self.get_bin_indices(t_values)
-        
-        # Compute average residual per bin (point-averaged)
-        avg_residuals = self.cumulative_residuals / (self.update_counts + eps)
-        
-        # Normalize by early-time scale (bin 0) to keep magnitude stable
-        ref_scale = avg_residuals[0].clamp_min(eps)
-        avg_residuals_norm = avg_residuals / ref_scale
-        
-        # Compute cumulative sum of normalized average residuals
-        cumsum_avg = torch.cumsum(avg_residuals_norm, dim=0)
-        
-        # For bin i, we want sum from bins 0 to i-1, so shift cumsum by 1
-        cumsum_shifted = torch.cat([torch.zeros(1, device=self.device), cumsum_avg[:-1]], dim=0)
-        
-        # Gather the appropriate cumulative sum for each point based on its bin
-        bin_idx_flat = bin_idx.clamp(min=0, max=self.num_bins-1)
-        past_residual_sum = cumsum_shifted[bin_idx_flat]
-        
-        # Apply exponential suppression with floor to prevent starving later times
-        weights = torch.exp(-self.epsilon * past_residual_sum).clamp_min(0.02)
-        
-        return weights.unsqueeze(-1) if weights.dim() == 1 else weights
-    
-    def reset(self):
-        """Reset cumulative residuals and counts."""
-        self.cumulative_residuals.zero_()
-        self.update_counts.zero_()
-    
-    def get_stats(self):
-        """Get current statistics for logging."""
-        avg_residuals = torch.where(
-            self.update_counts > 0,
-            self.cumulative_residuals / self.update_counts,
-            torch.zeros_like(self.cumulative_residuals)
-        )
-        return {
-            'cumulative': self.cumulative_residuals.cpu().numpy(),
-            'counts': self.update_counts.cpu().numpy(),
-            'average': avg_residuals.cpu().numpy()
-        }
-
-
-def compute_causal_weights_static(t_values, gamma):
-    """
-    Compute static causal weights: w(t) = exp(-gamma * t)
-    
-    Args:
-        t_values: Time values tensor [N, 1]
-        gamma: Exponential decay parameter
-    
-    Returns:
-        Weights [N, 1]
-    """
-    if gamma == 0.0:
-        return torch.ones_like(t_values)
-    return torch.exp(-gamma * t_values)
-
-
-def generate_temporal_windows(schedule, num_windows, tmin, tmax, startup_dt, custom_windows=None):
-    """
-    Generate temporal window boundaries for curriculum training.
-    
-    Args:
-        schedule: 'linear' or 'custom'
-        num_windows: Number of windows (ignored if schedule='custom')
-        tmin: Minimum time
-        tmax: Maximum time  
-        startup_dt: Startup time offset
-        custom_windows: List of [t_min, t_max] pairs for custom schedule
-    
-    Returns:
-        List of (t_min, t_max) tuples
-    """
-    if schedule == "custom":
-        if custom_windows is None:
-            raise ValueError("custom_windows required for custom schedule")
-        return [(float(w[0]), float(w[1])) for w in custom_windows]
-    elif schedule == "linear":
-        # Linear progression from startup_dt to tmax
-        t_start = max(tmin, startup_dt)
-        window_times = np.linspace(t_start, tmax, num_windows + 1)
-        return [(float(window_times[i]), float(window_times[i+1])) for i in range(num_windows)]
-    else:
-        raise ValueError(f"Unknown schedule: {schedule}")
-
-
-def compute_epsilon_for_window(window_idx, num_windows, epsilon_min, epsilon_max, 
-                                epsilon_base, epsilon_floor, use_annealing):
-    """
-    Compute epsilon value for current window in adaptive mode.
-    
-    Args:
-        window_idx: Current window index (0-based)
-        num_windows: Total number of windows
-        epsilon_min: Minimum epsilon (for annealing)
-        epsilon_max: Maximum epsilon (for annealing)
-        epsilon_base: Base epsilon value (for linear decay)
-        epsilon_floor: Floor epsilon value (for linear decay)
-        use_annealing: Whether to use automatic annealing
-    
-    Returns:
-        epsilon value for this window
-    """
-    if use_annealing:
-        # Automatic interpolation between MIN and MAX (ensures monotonic increase)
-        progress = window_idx / max(1, num_windows - 1)
-        return epsilon_min + (epsilon_max - epsilon_min) * progress
-    else:
-        # Linear decay (original method): strong early → moderate late
-        return epsilon_floor + (epsilon_base - epsilon_floor) * (1.0 - window_idx / max(1, num_windows - 1))
-
-
-def compute_gamma_for_window(window_idx, num_windows, gamma_max, gamma_min):
-    """
-    Compute gamma value for current window in static mode.
-    
-    Args:
-        window_idx: Current window index (0-based)
-        num_windows: Total number of windows
-        gamma_max: Maximum gamma value (early windows)
-        gamma_min: Minimum gamma value (final window)
-    
-    Returns:
-        gamma value for this window
-    """
-    # Linear decay from gamma_max to gamma_min
-    progress = window_idx / max(1, num_windows - 1)
-    return gamma_max * (1.0 - progress) + gamma_min * progress
-
-
-class CausalTrainer:
-    """
-    Orchestrates causal training with temporal curriculum and adaptive/static weighting.
-    """
-    
-    def __init__(self, model, net, optimizer, optimizerL, mse_cost_function,
-                 train_func, config, device):
-        """
-        Args:
-            model: ASTPN model for collocation generation
-            net: Neural network
-            optimizer: Adam optimizer
-            optimizerL: LBFGS optimizer
-            mse_cost_function: Loss function
-            train_func: Training function (from solver.py)
-            config: Dictionary with all causal config parameters
-            device: PyTorch device
-        """
-        self.model = model
-        self.net = net
-        self.optimizer = optimizer
-        self.optimizerL = optimizerL
-        self.mse_cost_function = mse_cost_function
-        self.train_func = train_func
-        self.config = config
-        self.device = device
-        
-        # Initialize residual tracker for adaptive mode
-        self.residual_tracker = None
-        if config['weighting_mode'] == 'adaptive':
-            t_start = max(config['tmin'], config['startup_dt'])
-            self.residual_tracker = ResidualTracker(
-                t_min=t_start,
-                t_max=config['tmax'],
-                num_bins=config['num_time_bins'],
-                epsilon=config['epsilon'],
-                device=device
-            )
-    
-    def train_with_curriculum(self, collocation_IC, **train_kwargs):
-        """
-        Train with temporal curriculum (progressive time windows).
-        
-        Args:
-            collocation_IC: Initial condition collocation points
-            **train_kwargs: Additional kwargs for train function (rho_1, lam, etc.)
-        
-        Returns:
-            Trained network
-        """
-        cfg = self.config
-        use_restarts = cfg['use_restarts']
-        
-        # Generate temporal windows
-        windows = generate_temporal_windows(
-            schedule=cfg['window_schedule'],
-            num_windows=cfg['num_windows'],
-            tmin=cfg['tmin'],
-            tmax=cfg['tmax'],
-            startup_dt=cfg['startup_dt'],
-            custom_windows=cfg['custom_windows']
-        )
-        
-        # Compute iterations per window
-        adam_per_window = cfg['adam_per_window'] or (cfg['iteration_adam'] // cfg['num_windows'])
-        lbfgs_per_window = cfg['lbfgs_per_window'] or (cfg['iteration_lbfgs'] // cfg['num_windows'])
-        
-        print(f"Training schedule: {len(windows)} windows, {adam_per_window} Adam + {lbfgs_per_window} LBFGS per window")
-        
-        # Train on each window
-        for window_idx, (t_window_min, t_window_max) in enumerate(windows):
-            print(f"\n{'='*60}")
-            print(f"Window {window_idx + 1}/{len(windows)}: t in [{t_window_min:.3f}, {t_window_max:.3f}]")
-            print(f"{'='*60}")
-            
-            # Compute causal parameters for this window
-            if cfg['weighting_mode'] == 'static':
-                causal_gamma = compute_gamma_for_window(
-                    window_idx, len(windows), cfg['gamma_max'], cfg['gamma_min']
-                )
-                print(f"  Static weighting: gamma = {causal_gamma:.4f}")
-                causal_mode = 'static'
-            else:  # adaptive
-                causal_gamma = 0.0
-                causal_mode = 'adaptive'
-                
-                # Update epsilon for this window
-                if self.residual_tracker is not None:
-                    eps_k = compute_epsilon_for_window(
-                        window_idx, len(windows),
-                        cfg['epsilon_min'], cfg['epsilon_max'],
-                        cfg['epsilon'], cfg['epsilon_floor'],
-                        cfg['use_epsilon_annealing']
-                    )
-                    self.residual_tracker.epsilon = eps_k
-                    if cfg['use_epsilon_annealing']:
-                        print(f"  Adaptive weighting: epsilon = {eps_k:.3f} (annealed)")
-                    else:
-                        print(f"  Adaptive weighting: epsilon = {eps_k:.3f} (linear decay)")
-            
-            # Update model's temporal bounds for this window
-            if use_restarts and window_idx > 0:
-                # Restart marching: train only in current window [t_k, t_{k+1}]
-                t_start = t_window_min
-            else:
-                # Expanding windows: train from t=0 to current t_max
-                t_start = max(cfg['tmin'], cfg['startup_dt'])
-            
-            # Build rmin/rmax based on spatial dimension (2D or 3D)
-            dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
-            if dimension == 3:
-                self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], t_start]
-                self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], t_window_max]
-            else:  # 2D or 1D
-                self.model.rmin = [cfg['xmin'], cfg['ymin'], t_start]
-                self.model.rmax = [cfg['xmax'], cfg['ymax'], t_window_max]
-            
-            # Regenerate domain collocation for this window
-            collocation_domain_window = self.model.geo_time_coord(option="Domain")
-            
-            # Train on this window
-            self.train_func(
-                net=self.net,
-                model=self.model,
-                collocation_domain=collocation_domain_window,
-                collocation_IC=collocation_IC,
-                optimizer=self.optimizer,
-                optimizerL=self.optimizerL,
-                closure=None,
-                mse_cost_function=self.mse_cost_function,
-                iteration_adam=adam_per_window,
-                iterationL=lbfgs_per_window,
-                device=self.device,
-                causal_gamma=causal_gamma,
-                causal_mode=causal_mode,
-                residual_tracker=self.residual_tracker,
-                window_idx=window_idx,
-                **train_kwargs
-            )
-        
-        # Restore full time/space range for final evaluation/plotting
-        dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
-        if dimension == 3:
-            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], cfg['tmin']]
-            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], cfg['tmax']]
-        else:  # 2D or 1D
-            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['tmin']]
-            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['tmax']]
-        
-        if use_restarts:
-            print(f"\nCausal training completed (restart marching). Final time range: [{cfg['tmin']}, {cfg['tmax']}]")
-        else:
-            print(f"\nCausal training completed (expanding windows). Final time range: [{cfg['tmin']}, {cfg['tmax']}]")
-        
-        return self.net
-    
-    def train_without_curriculum(self, collocation_IC, **train_kwargs):
-        """
-        Train on full domain with adaptive weighting (no temporal windows).
-        
-        Args:
-            collocation_IC: Initial condition collocation points
-            **train_kwargs: Additional kwargs for train function
-        
-        Returns:
-            Trained network
-        """
-        cfg = self.config
-        
-        print("Training on full temporal domain with adaptive weighting...")
-        
-        # Generate full domain collocation
-        collocation_domain = self.model.geo_time_coord(option="Domain")
-        
-        # Train with adaptive weighting
-        self.train_func(
-            net=self.net,
-            model=self.model,
-            collocation_domain=collocation_domain,
-            collocation_IC=collocation_IC,
-            optimizer=self.optimizer,
-            optimizerL=self.optimizerL,
-            closure=None,
-            mse_cost_function=self.mse_cost_function,
-            iteration_adam=cfg['iteration_adam'],
-            iterationL=cfg['iteration_lbfgs'],
-            device=self.device,
-            causal_gamma=0.0,  # Not used in adaptive mode
-            causal_mode=cfg['weighting_mode'],
-            residual_tracker=self.residual_tracker,
-            window_idx=None,
-            **train_kwargs
-        )
-        
-        print(f"\nCausal training completed (full domain)")
-        
-        return self.net
-_register_module('methods.causal_training', ['CausalTrainer', 'ResidualTracker', 'compute_causal_weights_static', 'compute_epsilon_for_window', 'compute_gamma_for_window', 'generate_temporal_windows'])
-
-# ==== Module: methods.xpinn_decomposition (methods/xpinn_decomposition.py) ====
-"""
-XPINN Domain Decomposition Utilities
-
-Provides functions for subdomain boundary calculation, interface identification,
-and collocation point generation for XPINN-style domain decomposition.
-"""
-
-import numpy as np
-import torch
-
-
-def get_num_subdomains(nx_sub, ny_sub):
-    """
-    Calculate total number of subdomains.
-    
-    Args:
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-    
-    Returns:
-        Total number of subdomains
-    """
-    return nx_sub * ny_sub
-
-
-def subdomain_idx_to_grid(idx, nx_sub, ny_sub):
-    """
-    Convert linear subdomain index to (i, j) grid position.
-    
-    Args:
-        idx: Linear subdomain index (0 to nx_sub*ny_sub-1)
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-    
-    Returns:
-        Tuple (i, j) representing grid position where:
-        - i is x-direction index (0 to nx_sub-1)
-        - j is y-direction index (0 to ny_sub-1)
-    """
-    i = idx // ny_sub
-    j = idx % ny_sub
-    return (i, j)
-
-
-def get_subdomain_bounds(subdomain_idx, xmin, xmax, ymin, ymax, nx_sub, ny_sub):
-    """
-    Compute spatial boundaries for a given subdomain.
-    
-    Args:
-        subdomain_idx: Linear subdomain index
-        xmin, xmax: Global domain x-bounds
-        ymin, ymax: Global domain y-bounds
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-    
-    Returns:
-        Tuple (x_min, x_max, y_min, y_max) for the subdomain
-    """
-    i, j = subdomain_idx_to_grid(subdomain_idx, nx_sub, ny_sub)
-    
-    # Calculate subdomain width and height
-    dx = (xmax - xmin) / nx_sub
-    dy = (ymax - ymin) / ny_sub
-    
-    # Calculate subdomain boundaries (non-overlapping)
-    x_min = xmin + i * dx
-    x_max = xmin + (i + 1) * dx
-    y_min = ymin + j * dy
-    y_max = ymin + (j + 1) * dy
-    
-    return (x_min, x_max, y_min, y_max)
-
-
-def get_interfaces(nx_sub, ny_sub):
-    """
-    Identify all interfaces between adjacent subdomains.
-    
-    Args:
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-    
-    Returns:
-        List of tuples (subdomain_i, subdomain_j, interface_type, position_idx)
-        where:
-        - subdomain_i, subdomain_j: indices of adjacent subdomains
-        - interface_type: 'vertical', 'horizontal', 'periodic_vertical', or 'periodic_horizontal'
-        - position_idx: which vertical/horizontal line (for position calculation)
-    """
-    interfaces = []
-    
-    # Vertical interfaces (constant x, between subdomains in x-direction)
-    for i in range(nx_sub - 1):  # Between x-slices i and i+1
-        for j in range(ny_sub):  # For each y-slice
-            subdomain_left = i * ny_sub + j
-            subdomain_right = (i + 1) * ny_sub + j
-            interfaces.append((subdomain_left, subdomain_right, 'vertical', i + 1))
-    
-    # Horizontal interfaces (constant y, between subdomains in y-direction)
-    for i in range(nx_sub):  # For each x-slice
-        for j in range(ny_sub - 1):  # Between y-slices j and j+1
-            subdomain_bottom = i * ny_sub + j
-            subdomain_top = i * ny_sub + (j + 1)
-            interfaces.append((subdomain_bottom, subdomain_top, 'horizontal', j + 1))
-    
-    # Periodic wrap-around interfaces (enforce periodic BC across domain boundaries)
-    # Vertical wrap-around: right edge ↔ left edge (at x=xmax ↔ x=xmin)
-    for j in range(ny_sub):  # For each y-slice
-        subdomain_left = 0 * ny_sub + j              # Leftmost column (i=0)
-        subdomain_right = (nx_sub - 1) * ny_sub + j  # Rightmost column (i=nx_sub-1)
-        interfaces.append((subdomain_right, subdomain_left, 'periodic_vertical', nx_sub))
-    
-    # Horizontal wrap-around: top edge ↔ bottom edge (at y=ymax ↔ y=ymin)
-    for i in range(nx_sub):  # For each x-slice
-        subdomain_bottom = i * ny_sub + 0              # Bottom row (j=0)
-        subdomain_top = i * ny_sub + (ny_sub - 1)      # Top row (j=ny_sub-1)
-        interfaces.append((subdomain_top, subdomain_bottom, 'periodic_horizontal', ny_sub))
-    
-    return interfaces
-
-
-def generate_interface_points(interface_info, xmin, xmax, ymin, ymax, 
-                               tmin, tmax, n_points, device='cpu'):
-    """
-    Generate collocation points along an interface.
-    
-    Args:
-        interface_info: Tuple (subdomain_i, subdomain_j, interface_type, position_idx)
-        xmin, xmax: Global domain x-bounds
-        ymin, ymax: Global domain y-bounds
-        tmin, tmax: Time bounds
-        n_points: Number of collocation points to generate
-        device: PyTorch device
-    
-    Returns:
-        List [x, y, t] of torch tensors with gradients enabled
-    """
-    subdomain_i, subdomain_j, interface_type, position_idx = interface_info
-    
-    # Generate points uniformly distributed along the interface and in time
-    # Split n_points between spatial and temporal sampling
-    n_spatial = max(int(np.sqrt(n_points)), 1)
-    n_temporal = max(n_points // n_spatial, 1)
-    
-    if interface_type in ('vertical', 'periodic_vertical'):
-        # Constant x interface
-        from config import NUM_SUBDOMAINS_X
-        dx = (xmax - xmin) / NUM_SUBDOMAINS_X
-        
-        if interface_type == 'periodic_vertical':
-            # Periodic wrap-around: sample at x=xmax (which is equivalent to x=xmin due to periodic BC)
-            x_interface = xmax
-        else:
-            # Interior vertical interface
-            x_interface = xmin + position_idx * dx
-        
-        # Sample along y and t
-        y_vals = torch.empty(n_spatial, 1, device=device, dtype=torch.float32).uniform_(ymin, ymax).requires_grad_()
-        t_vals = torch.empty(n_temporal, 1, device=device, dtype=torch.float32).uniform_(tmin, tmax).requires_grad_()
-        
-        # Create meshgrid-like structure
-        y_grid = y_vals.repeat(n_temporal, 1)
-        t_grid = t_vals.repeat_interleave(n_spatial, dim=0)
-        x_grid = torch.full_like(y_grid, x_interface).requires_grad_()
-        
-    else:  # 'horizontal' or 'periodic_horizontal'
-        # Constant y interface
-        from config import NUM_SUBDOMAINS_Y
-        dy = (ymax - ymin) / NUM_SUBDOMAINS_Y
-        
-        if interface_type == 'periodic_horizontal':
-            # Periodic wrap-around: sample at y=ymax (which is equivalent to y=ymin due to periodic BC)
-            y_interface = ymax
-        else:
-            # Interior horizontal interface
-            y_interface = ymin + position_idx * dy
-        
-        # Sample along x and t
-        x_vals = torch.empty(n_spatial, 1, device=device, dtype=torch.float32).uniform_(xmin, xmax).requires_grad_()
-        t_vals = torch.empty(n_temporal, 1, device=device, dtype=torch.float32).uniform_(tmin, tmax).requires_grad_()
-        
-        # Create meshgrid-like structure
-        x_grid = x_vals.repeat(n_temporal, 1)
-        t_grid = t_vals.repeat_interleave(n_spatial, dim=0)
-        y_grid = torch.full_like(x_grid, y_interface).requires_grad_()
-    
-    # Ensure all have gradients enabled
-    if not x_grid.requires_grad:
-        x_grid = x_grid.requires_grad_()
-    if not y_grid.requires_grad:
-        y_grid = y_grid.requires_grad_()
-    if not t_grid.requires_grad:
-        t_grid = t_grid.requires_grad_()
-    
-    return [x_grid, y_grid, t_grid]
-
-
-def generate_subdomain_collocation(subdomain_bounds, n_residual, n_ic, 
-                                    tmin, tmax, startup_dt, device='cpu'):
-    """
-    Generate residual and IC collocation points within a subdomain.
-    
-    Args:
-        subdomain_bounds: Tuple (x_min, x_max, y_min, y_max)
-        n_residual: Number of residual collocation points
-        n_ic: Number of initial condition points
-        tmin, tmax: Time bounds
-        startup_dt: Time offset for PDE enforcement
-        device: PyTorch device
-    
-    Returns:
-        Tuple (colloc_domain, colloc_ic) where each is a list [x, y, t]
-    """
-    x_min, x_max, y_min, y_max = subdomain_bounds
-    
-    # Generate residual/domain collocation points
-    x_domain = torch.empty(n_residual, 1, device=device, dtype=torch.float32).uniform_(x_min, x_max).requires_grad_()
-    y_domain = torch.empty(n_residual, 1, device=device, dtype=torch.float32).uniform_(y_min, y_max).requires_grad_()
-    # Shift PDE enforcement to start at t = startup_dt (like original implementation)
-    t_domain = torch.empty(n_residual, 1, device=device, dtype=torch.float32).uniform_(max(tmin, startup_dt), tmax).requires_grad_()
-    colloc_domain = [x_domain, y_domain, t_domain]
-    
-    # Generate initial condition collocation points (at t=0)
-    x_ic = torch.empty(n_ic, 1, device=device, dtype=torch.float32).uniform_(x_min, x_max).requires_grad_()
-    y_ic = torch.empty(n_ic, 1, device=device, dtype=torch.float32).uniform_(y_min, y_max).requires_grad_()
-    t_ic = torch.empty(n_ic, 1, device=device, dtype=torch.float32).fill_(tmin).requires_grad_()
-    colloc_ic = [x_ic, y_ic, t_ic]
-    
-    return (colloc_domain, colloc_ic)
-
-
-def point_in_subdomain(x, y, subdomain_bounds):
-    """
-    Check if point(s) belong to a subdomain.
-    
-    Args:
-        x, y: Coordinates (can be scalars, arrays, or tensors)
-        subdomain_bounds: Tuple (x_min, x_max, y_min, y_max)
-    
-    Returns:
-        Boolean or boolean array indicating if points are in subdomain
-    """
-    x_min, x_max, y_min, y_max = subdomain_bounds
-    
-    # Handle both numpy arrays and torch tensors
-    if isinstance(x, torch.Tensor):
-        in_x = (x >= x_min) & (x <= x_max)
-        in_y = (y >= y_min) & (y <= y_max)
-    else:
-        in_x = (x >= x_min) & (x <= x_max)
-        in_y = (y >= y_min) & (y <= y_max)
-    
-    return in_x & in_y
-
-
-def get_exterior_boundary_info(subdomain_idx, nx_sub, ny_sub, xmin, xmax, ymin, ymax):
-    """
-    Determine which boundaries of a subdomain are exterior boundaries.
-    
-    Args:
-        subdomain_idx: Linear subdomain index
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-        xmin, xmax: Global domain x-bounds
-        ymin, ymax: Global domain y-bounds
-    
-    Returns:
-        Dict with keys 'left', 'right', 'bottom', 'top' indicating if boundary is exterior
-        and corresponding coordinate values
-    """
-    i, j = subdomain_idx_to_grid(subdomain_idx, nx_sub, ny_sub)
-    x_min, x_max, y_min, y_max = get_subdomain_bounds(subdomain_idx, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
-    
-    boundary_info = {
-        'left': (i == 0, x_min),           # Left edge of domain
-        'right': (i == nx_sub - 1, x_max), # Right edge of domain
-        'bottom': (j == 0, y_min),         # Bottom edge of domain
-        'top': (j == ny_sub - 1, y_max)    # Top edge of domain
-    }
-    
-    return boundary_info
-
-
-# ==================== XPINN Setup and Initialization ====================
-
-def setup_xpinn_devices(num_subdomains, device, use_multi_gpu=False):
-    """
-    Setup device assignment for XPINN subdomains.
-    
-    Args:
-        num_subdomains: Total number of subdomains
-        device: Default device
-        use_multi_gpu: Whether to use multi-GPU setup
-    
-    Returns:
-        Tuple (subdomain_devices, num_gpus)
-    """
-    if use_multi_gpu and torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        print(f"Multi-GPU enabled: {num_gpus} GPUs available")
-        devices = [f"cuda:{i}" for i in range(num_gpus)]
-        subdomain_devices = [devices[i % len(devices)] for i in range(num_subdomains)]
-    else:
-        num_gpus = 1
-        subdomain_devices = [device] * num_subdomains
-    
-    return subdomain_devices, num_gpus
-
-
-def setup_xpinn_networks(num_subdomains, subdomain_devices, xmin, xmax, ymin, ymax, 
-                         dimension, num_neurons, num_layers, harmonics, 
-                         default_activation, nx_sub, ny_sub):
-    """
-    Initialize XPINN subdomain networks.
-    
-    Args:
-        num_subdomains: Total number of subdomains
-        subdomain_devices: List of device assignments per subdomain
-        xmin, xmax, ymin, ymax: Global domain bounds
-        dimension: Spatial dimension
-        num_neurons: Default number of neurons per layer
-        num_layers: Default number of hidden layers
-        harmonics: Default number of Fourier harmonics
-        default_activation: Default activation function type
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-    
-    Returns:
-        List of initialized neural networks
-    """
-    from config import SUBDOMAIN_CONFIGS
-    from core.model_architecture import PINN
-    
-    # Validate subdomain configs
-    subdomain_configs = None
-    if SUBDOMAIN_CONFIGS and len(SUBDOMAIN_CONFIGS) != num_subdomains:
-        print(f"WARNING: SUBDOMAIN_CONFIGS has {len(SUBDOMAIN_CONFIGS)} entries but {num_subdomains} subdomains expected.")
-        print(f"         Using global defaults for all subdomains.")
-    elif SUBDOMAIN_CONFIGS:
-        subdomain_configs = SUBDOMAIN_CONFIGS
-    
-    nets = []
-    for i in range(num_subdomains):
-        # Get subdomain-specific configuration or use defaults
-        if subdomain_configs and i < len(subdomain_configs):
-            config = subdomain_configs[i]
-            sub_neurons = config.get('num_neurons', num_neurons)
-            sub_layers = config.get('num_layers', num_layers)
-            sub_harmonics = config.get('n_harmonics', harmonics)
-            sub_activation = config.get('activation', default_activation)
-        else:
-            sub_neurons = num_neurons
-            sub_layers = num_layers
-            sub_harmonics = harmonics
-            sub_activation = default_activation
-        
-        # Create network
-        net = PINN(num_neurons=sub_neurons, num_layers=sub_layers, 
-                  n_harmonics=sub_harmonics, activation_type=sub_activation)
-        
-        # Use GLOBAL domain for periodic embeddings
-        net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=dimension)
-        net = net.to(subdomain_devices[i])
-        nets.append(net)
-        
-        # Print configuration
-        subdomain_bounds = get_subdomain_bounds(i, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
-        print(f"  Subdomain {i}: bounds={subdomain_bounds}")
-        print(f"    Architecture: neurons={sub_neurons}, layers={sub_layers}, harmonics={sub_harmonics}, activation={sub_activation}, device={subdomain_devices[i]}")
-    
-    return nets
-
-
-def setup_xpinn_collocation(num_subdomains, subdomain_devices, xmin, xmax, ymin, ymax, 
-                            tmin, tmax, n_r, n_0, startup_dt, nx_sub, ny_sub):
-    """
-    Generate collocation points for XPINN subdomains.
-    
-    Args:
-        num_subdomains: Total number of subdomains
-        subdomain_devices: Device assignment per subdomain
-        xmin, xmax, ymin, ymax: Domain bounds
-        tmin, tmax: Time bounds
-        n_r: Total residual collocation points
-        n_0: Total IC collocation points
-        startup_dt: Time offset for PDE enforcement
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-    
-    Returns:
-        Tuple (subdomain_collocs, subdomain_ic_collocs)
-    """
-    from core.data_generator import distribute_collocation_points
-    
-    # Distribute points
-    n_r_per_subdomain = distribute_collocation_points(n_r, num_subdomains)
-    n_0_per_subdomain = distribute_collocation_points(n_0, num_subdomains)
-    
-    subdomain_collocs = []
-    subdomain_ic_collocs = []
-    
-    for i in range(num_subdomains):
-        subdomain_bounds = get_subdomain_bounds(i, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
-        colloc_domain, colloc_ic = generate_subdomain_collocation(
-            subdomain_bounds, n_r_per_subdomain[i], n_0_per_subdomain[i],
-            tmin, tmax, startup_dt, device=subdomain_devices[i]
-        )
-        subdomain_collocs.append(colloc_domain)
-        subdomain_ic_collocs.append(colloc_ic)
-    
-    return subdomain_collocs, subdomain_ic_collocs
-
-
-def setup_xpinn_interfaces(subdomain_devices, xmin, xmax, ymin, ymax, tmin, tmax, 
-                           n_interface, nx_sub, ny_sub):
-    """
-    Generate interface collocation points for XPINN.
-    
-    Args:
-        subdomain_devices: Device assignment per subdomain
-        xmin, xmax, ymin, ymax: Domain bounds
-        tmin, tmax: Time bounds
-        n_interface: Number of interface collocation points
-        nx_sub: Number of subdomain splits in x-direction
-        ny_sub: Number of subdomain splits in y-direction
-    
-    Returns:
-        Tuple (interfaces, interface_collocs)
-    """
-    interfaces = get_interfaces(nx_sub, ny_sub)
-    
-    interface_collocs = {}
-    for interface in interfaces:
-        subdomain_i, subdomain_j, _, _ = interface
-        interface_device = subdomain_devices[subdomain_i]
-        interface_points = generate_interface_points(
-            interface, xmin, xmax, ymin, ymax, tmin, tmax, n_interface, device=interface_device
-        )
-        interface_collocs[(subdomain_i, subdomain_j)] = interface_points
-    
-    return interfaces, interface_collocs
-
-
-def cache_xpinn_initial_conditions(num_subdomains, subdomain_ic_collocs, ic_functions):
-    """
-    Pre-compute and cache initial condition values for all subdomains.
-    
-    Args:
-        num_subdomains: Total number of subdomains
-        subdomain_ic_collocs: IC collocation points per subdomain
-        ic_functions: Dictionary of IC functions
-    
-    Returns:
-        List of cached IC dictionaries per subdomain
-    """
-    print("Caching IC values for all subdomains...")
-    cached_ic_values = []
-    
-    for i in range(num_subdomains):
-        colloc_ic = subdomain_ic_collocs[i]
-        ic_cache = {
-            'rho': ic_functions['rho'](colloc_ic),
-            'vx': ic_functions['vx'](colloc_ic),
-            'vy': ic_functions['vy'](colloc_ic),
-            'phi': ic_functions['phi'](colloc_ic)
-        }
-        cached_ic_values.append(ic_cache)
-    
-    print("IC values cached successfully!")
-    return cached_ic_values
-_register_module('methods.xpinn_decomposition', ['cache_xpinn_initial_conditions', 'generate_interface_points', 'generate_subdomain_collocation', 'get_exterior_boundary_info', 'get_interfaces', 'get_num_subdomains', 'get_subdomain_bounds', 'point_in_subdomain', 'setup_xpinn_collocation', 'setup_xpinn_devices', 'setup_xpinn_interfaces', 'setup_xpinn_networks', 'subdomain_idx_to_grid'])
-
 # ==== Module: numerical_solvers.LAX (numerical_solvers/LAX.py) ====
 import numpy as np
 import os
-
-# Import TensorFlow and NumPy
-# import tensorflow as tf
-import numpy as np
-
 import matplotlib.pyplot as plt
 import scipy
-
 
 ## For the FFT solver
 
 from numpy.fft import fft, ifft, fft2, ifft2, fftn, ifftn
-from scipy import signal
 
 from config import RANDOM_SEED
 
@@ -2467,7 +469,7 @@ try:
     from config import KX, KY, KZ, cs, rho_o, const, G
 except ImportError:
     # Fallback if config not available
-    KX = 2*np.pi/5.0  # Default wavelength
+    KX = 2*np.pi/7.0  # Default wavelength
     KY = 0.0
     KZ = 0.0
     cs = 1.0
@@ -2546,7 +548,8 @@ def generate_shared_velocity_field(nx, ny, Lx, Ly, power_index=-4.0, amplitude=0
     
     return vx_np, vy_np, vx_interp, vy_interp
 
-def lax_solution_with_shared_velocity(time, N, nu, lam, num_of_waves, rho_1, vx0_shared, vy0_shared, gravity=False, isplot=None, comparison=None, animation=None):
+def lax_solution_with_shared_velocity(time, N, nu, lam, num_of_waves, rho_1, vx0_shared, vy0_shared, 
+                                      gravity=False, isplot=None, comparison=None, animation=None):
     """
     Modified LAX solver that uses pre-generated shared velocity fields for consistent initial conditions.
     This ensures PINN and FD use identical velocity fields at t=0.
@@ -2560,7 +563,7 @@ def lax_solution_with_shared_velocity(time, N, nu, lam, num_of_waves, rho_1, vx0
     
     return result
 
-def fft_solver(rho,Lx,nx,Ly,ny,dim = None):
+def fft_solver(rho, Lx, nx, Ly, ny, dim = None):
     
     '''
     A FFT solver that uses discrete Fast Fourier Transform to
@@ -3949,6 +1952,1981 @@ def lax_solution_warm_start_torch(rho_ic, vx_ic, vy_ic, x_grid, y_grid,
     return snapshots
 _register_module('numerical_solvers.LAX_torch', ['device', 'dtype', 'fft_solver_torch', 'fft_solver_torch_3d', 'generate_velocity_field_power_spectrum_torch', 'has_gpu', 'lax_solution_3d_sinusoidal_torch', 'lax_solution_torch', 'lax_solution_warm_start_torch'])
 
+# ==== Module: core.initial_conditions (core/initial_conditions.py) ====
+"""
+Initial Conditions Module
+
+This module contains all initial condition functions and power spectrum generation
+for PINNs training. Extracted from solver.py for better code organization.
+
+Functions:
+- initialize_shared_velocity_fields: Setup shared velocity fields for PINN/FD consistency
+- generate_power_spectrum_field: Generate vx component using power spectrum
+- generate_power_spectrum_field_vy: Generate vy component using power spectrum
+- fun_rho_0: Initial density condition
+- fun_vx_0: Initial x-velocity condition
+- fun_vy_0: Initial y-velocity condition
+- func: Placeholder function for phi initial condition
+"""
+
+import numpy as np
+import torch
+from config import (cs, rho_o, N_GRID, POWER_EXPONENT, 
+                    PERTURBATION_TYPE, KX, KY, KZ, RANDOM_SEED)
+from numerical_solvers.LAX import generate_shared_velocity_field
+
+# Global shared velocity fields for consistent initial conditions
+_shared_vx_interp = None
+_shared_vy_interp = None
+
+def _ensure_column_tensor(tensor):
+    return tensor if tensor.dim() > 1 else tensor.unsqueeze(-1)
+
+def _extract_spatial_coords(coords):
+    return coords[:-1] if len(coords) > 1 else coords
+
+
+def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None):
+    """
+    Initialize shared velocity fields for consistent PINN/FD initial conditions.
+    This should be called once at the beginning of training.
+    
+    IMPORTANT: The parameters used here (POWER_EXPONENT, v_1=a*cs, seed) MUST match
+    the parameters used in FD plotting functions to ensure identical initial conditions.
+    All FD visualization functions should use the same defaults.
+    
+    Args:
+        lam: Wavelength
+        num_of_waves: Number of waves in domain
+        v_1: Velocity amplitude
+        seed: Random seed for reproducibility
+    
+    Returns:
+        Tuple (vx_np, vy_np): Velocity field arrays
+    """
+    global _shared_vx_interp, _shared_vy_interp
+    
+    if seed is None:
+        seed = RANDOM_SEED
+    
+    # Calculate domain size to match FD solver
+    Lx = lam * num_of_waves
+    Ly = lam * num_of_waves
+    
+    # Generate shared velocity fields
+    vx_np, vy_np, vx_interp, vy_interp = generate_shared_velocity_field(
+        N_GRID, N_GRID, Lx, Ly, 
+        power_index=POWER_EXPONENT, 
+        amplitude=v_1, 
+        random_seed=seed
+    )
+    
+    # Store interpolation functions globally
+    _shared_vx_interp = vx_interp
+    _shared_vy_interp = vy_interp
+    
+    return vx_np, vy_np
+
+
+def _interpolate_shared_field(x, field_interp):
+    """
+    Helper function to interpolate shared velocity field to collocation points.
+    
+    Args:
+        x: Collocation coordinates [x, y, ...]
+        field_interp: Interpolation function from shared fields
+    
+    Returns:
+        Interpolated field values as torch tensor
+    """
+    # Convert tensor coordinates to numpy for interpolation
+    x_np = x[0].detach().cpu().numpy()
+    y_np = x[1].detach().cpu().numpy()
+    
+    # Create coordinate pairs for interpolation
+    coords = np.stack([x_np.flatten(), y_np.flatten()], axis=1)
+    
+    # Interpolate shared velocity field
+    field_interp_values = field_interp(coords)
+    
+    # Convert back to tensor and reshape
+    field_tensor = torch.from_numpy(field_interp_values).float().to(x[0].device)
+    
+    # Ensure correct shape [N, 1]
+    if field_tensor.dim() == 1:
+        return field_tensor.unsqueeze(-1)
+    else:
+        return field_tensor
+
+
+def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
+    """
+    Fallback power spectrum generation when shared fields are not available.
+    
+    Args:
+        lam: Wavelength (unused for domain sizing in fallback)
+        v_1: Velocity amplitude
+        x: Collocation coordinates
+        seed: Random seed
+    
+    Returns:
+        Generated power spectrum field
+    """
+    if seed is None:
+        seed = RANDOM_SEED
+    
+    # Infer domain extents directly from the collocation coordinates to support arbitrary num_of_waves
+    # Use conservative defaults if tensors are degenerate (e.g., single point during a unit test)
+    x_coords = x[0].detach()
+    y_coords = x[1].detach() if len(x) > 1 else x[0].detach()
+
+    xmin_val = torch.min(x_coords).item() if x_coords.numel() > 0 else 0.0
+    xmax_val = torch.max(x_coords).item() if x_coords.numel() > 0 else float(lam * 2.0)
+    ymin_val = torch.min(y_coords).item() if y_coords.numel() > 0 else 0.0
+    ymax_val = torch.max(y_coords).item() if y_coords.numel() > 0 else float(lam * 2.0)
+
+    # Ensure positive lengths; fall back to 2*lam if bounds collapse
+    Lx = float(max(xmax_val - xmin_val, 1e-6))
+    Ly = float(max(ymax_val - ymin_val, 1e-6))
+    if not torch.isfinite(torch.tensor(Lx)) or Lx < 1e-6:
+        Lx = float(lam * 2.0)
+    if not torch.isfinite(torch.tensor(Ly)) or Ly < 1e-6:
+        Ly = float(lam * 2.0)
+
+    dx = Lx / N_GRID
+    dy = Ly / N_GRID
+    
+    # Calculate wave numbers
+    kx = 2 * np.pi * torch.fft.fftfreq(N_GRID, dx, device=x[0].device)
+    ky = 2 * np.pi * torch.fft.fftfreq(N_GRID, dy, device=x[0].device)
+    KX_grid, KY_grid = torch.meshgrid(kx, ky, indexing='ij')
+    
+    # Calculate magnitude of wave number
+    K = torch.sqrt(KX_grid**2 + KY_grid**2)
+    
+    # Power spectrum: P(k) ~ k^expon
+    K_safe = torch.where(K == 0, torch.tensor(1e-10, device=x[0].device), K)
+    power_spectrum = K_safe**POWER_EXPONENT
+    
+    # Remove DC (uniform) mode to avoid bulk drift
+    power_spectrum[K == 0] = 0.0
+    
+    # Safety check: limit extreme values
+    power_spectrum = torch.clamp(power_spectrum, 0, 1e6)
+    
+    # Generate random phases
+    torch.manual_seed(seed)
+    random_phases = torch.randn(N_GRID, N_GRID, device=x[0].device) + 1j * torch.randn(N_GRID, N_GRID, device=x[0].device)
+    
+    # Create complex field in Fourier space and transform to real space
+    field_fourier = torch.sqrt(power_spectrum) * random_phases
+    field_real = torch.real(torch.fft.ifft2(field_fourier))
+    
+    # Remove any residual mean (bulk flow) and normalize rms to v_1
+    field_real = field_real - torch.mean(field_real)
+    field_real = field_real / torch.std(field_real) * v_1
+    
+    # Interpolate to the actual collocation points
+    x_norm = torch.clamp(((x[0] - xmin_val) / Lx) * (N_GRID - 1), 0, N_GRID - 1)
+    if len(x) > 1:
+        y_norm = torch.clamp(((x[1] - ymin_val) / Ly) * (N_GRID - 1), 0, N_GRID - 1)
+    else:
+        # 1D fallback: mirror x for y to preserve shape
+        y_norm = x_norm.clone()
+    
+    x_idx = torch.round(x_norm).long()
+    y_idx = torch.round(y_norm).long()
+    
+    # Ensure correct tensor shape [N, 1]
+    result = field_real[x_idx, y_idx]
+    if result.dim() == 1:
+        return result.unsqueeze(-1)
+    else:
+        return result
+
+
+def generate_power_spectrum_field(lam, v_1, x, seed=None):
+    """
+    Generate 2D Gaussian random field with power spectrum using shared fields if available.
+    
+    Args:
+        lam: Wavelength
+        v_1: Velocity amplitude
+        x: Collocation coordinates [x, y, ...]
+        seed: Random seed for reproducibility
+    
+    Returns:
+        vx component of velocity field
+    """
+    if seed is None:
+        seed = RANDOM_SEED
+    
+    # Use shared velocity fields if available
+    if _shared_vx_interp is not None:
+        return _interpolate_shared_field(x, _shared_vx_interp)
+    
+    # Fallback to original method if shared fields not available
+    return _generate_power_spectrum_fallback(lam, v_1, x, seed)
+
+
+def generate_power_spectrum_field_vy(lam, v_1, x, seed=None):
+    """
+    Generate vy component using shared fields if available.
+    
+    Args:
+        lam: Wavelength
+        v_1: Velocity amplitude
+        x: Collocation coordinates [x, y, ...]
+        seed: Random seed for reproducibility
+    
+    Returns:
+        vy component of velocity field
+    """
+    if seed is None:
+        seed = RANDOM_SEED
+    
+    # Use shared velocity fields if available
+    if _shared_vy_interp is not None:
+        return _interpolate_shared_field(x, _shared_vy_interp)
+    
+    # Fallback to original method if shared fields not available
+    return _generate_power_spectrum_fallback(lam, v_1, x, seed)
+
+
+def _compute_wave_phase(spatial_coords, lam):
+    """
+    Compute wave phase and wave-vector components for sinusoidal perturbations.
+    """
+    if not spatial_coords:
+        raise ValueError("Spatial coordinates are required to compute wave phase.")
+    
+    x_coord = _ensure_column_tensor(spatial_coords[0])
+    zeros = torch.zeros_like(x_coord)
+    y_coord = _ensure_column_tensor(spatial_coords[1]) if len(spatial_coords) >= 2 else zeros
+    z_coord = _ensure_column_tensor(spatial_coords[2]) if len(spatial_coords) >= 3 else zeros
+    
+    device = x_coord.device
+    dtype = x_coord.dtype
+    kx = torch.as_tensor(float(KX), device=device, dtype=dtype)
+    ky = torch.as_tensor(float(KY), device=device, dtype=dtype)
+    kz = torch.as_tensor(float(KZ), device=device, dtype=dtype)
+    
+    phase = kx * x_coord + ky * y_coord + kz * z_coord
+    
+    # Fallback to fundamental wavelength if wave-vector is zero (e.g., user-specified)
+    if torch.allclose(kx.abs() + ky.abs() + kz.abs(), torch.tensor(0.0, device=device, dtype=dtype)):
+        fundamental = torch.as_tensor(2 * np.pi / lam, device=device, dtype=dtype)
+        phase = fundamental * x_coord
+        kx, ky, kz = fundamental, torch.zeros_like(fundamental), torch.zeros_like(fundamental)
+    
+    return phase, kx, ky, kz, x_coord, y_coord, z_coord
+
+
+def _coupled_velocity_components(coords, lam, jeans, v_1):
+    """
+    Generate coupled velocity components from the same wave pattern (supports 1D/2D/3D).
+    """
+    spatial_coords = _extract_spatial_coords(coords)
+    phase, kx, ky, kz, _, _, _ = _compute_wave_phase(spatial_coords, lam)
+    dtype = phase.dtype
+    device = phase.device
+    v_scale = torch.as_tensor(float(v_1), device=device, dtype=dtype)
+    
+    if lam > jeans:
+        wave_field = -v_scale * torch.sin(phase)
+    else:
+        wave_field = v_scale * torch.cos(phase)
+    
+    k_mag = torch.sqrt(kx**2 + ky**2 + kz**2)
+    if k_mag <= torch.tensor(1e-12, device=device, dtype=dtype):
+        vx = wave_field
+        vy = torch.zeros_like(wave_field)
+        vz = torch.zeros_like(wave_field)
+    else:
+        inv_mag = 1.0 / k_mag
+        vx = wave_field * (kx * inv_mag)
+        vy = wave_field * (ky * inv_mag)
+        vz = wave_field * (kz * inv_mag)
+    
+    return vx, vy, vz
+
+
+def fun_rho_0(rho_1, lam, x):
+    """
+    Define initial condition for density.
+    
+    Args:
+        rho_1: Perturbation amplitude
+        lam: Wavelength
+        x: Spatial coordinates [x, y, t] or [x, t]
+    
+    Returns:
+        rho_0: Initial density field
+    """
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        spatial_coords = _extract_spatial_coords(x)
+        phase, *_ = _compute_wave_phase(spatial_coords, lam)
+        rho_0 = rho_o + rho_1 * torch.cos(phase)
+    else:
+        # Power spectrum: uniform initial density
+        rho_0 = torch.full_like(x[0], rho_o)
+        # Ensure correct shape [N, 1]
+        if rho_0.dim() == 1:
+            rho_0 = rho_0.unsqueeze(-1)
+    
+    return rho_0
+
+
+def fun_vx_0(lam, jeans, v_1, x):
+    """
+    Initial condition for x-velocity.
+    
+    Args:
+        lam: Wavelength
+        jeans: Jeans length
+        v_1: Velocity amplitude
+        x: Spatial coordinates
+    
+    Returns:
+        vx_0: Initial x-velocity field
+    """
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        vx, _, _ = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vx
+    else:
+        # Power spectrum case
+        return generate_power_spectrum_field(lam, v_1, x, seed=RANDOM_SEED)
+
+
+def fun_vy_0(lam, jeans, v_1, x):
+    """
+    Initial condition for y-velocity.
+    
+    Args:
+        lam: Wavelength
+        jeans: Jeans length
+        v_1: Velocity amplitude
+        x: Spatial coordinates
+    
+    Returns:
+        vy_0: Initial y-velocity field
+    """
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        _, vy, _ = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vy
+    else:
+        # Power spectrum case
+        return generate_power_spectrum_field_vy(lam, v_1, x, seed=RANDOM_SEED)
+
+
+def fun_vz_0(lam, jeans, v_1, x):
+    """
+    Initial condition for z-velocity (used in 3D sinusoidal runs).
+    """
+    if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+        _, _, vz = _coupled_velocity_components(x, lam, jeans, v_1)
+        return vz
+    else:
+        # Power spectrum setup is currently 2D; default to zero
+        return func(x)
+
+
+def func(x):
+    """
+    Placeholder function for phi initial condition (zero potential).
+    
+    Args:
+        x: Spatial coordinates
+    
+    Returns:
+        Zero tensor matching the shape of x[0]
+    """
+    return x[0] * 0
+_register_module('core.initial_conditions', ['_compute_wave_phase', '_coupled_velocity_components', '_ensure_column_tensor', '_extract_spatial_coords', '_generate_power_spectrum_fallback', '_interpolate_shared_field', '_shared_vx_interp', '_shared_vy_interp', 'fun_rho_0', 'fun_vx_0', 'fun_vy_0', 'fun_vz_0', 'func', 'generate_power_spectrum_field', 'generate_power_spectrum_field_vy', 'initialize_shared_velocity_fields'])
+
+# ==== Module: core.losses (core/losses.py) ====
+from core.data_generator import col_gen
+from core.data_generator import diff
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+from config import cs, const, G, rho_o
+
+class ASTPN(col_gen):
+    
+    def __init__(self, rmin=[0,0,0,0], rmax=[1,1,1,1], N_0 = 1000, N_b=1000, N_r=3000, dimension=1):
+        super().__init__(rmin,rmax, N_0,0,N_r, dimension)  # N_b set to 0 due to hard constraints
+        
+       
+        self.coord_Lx, self.coord_Rx = self.geo_time_coord(option="BC",coordinate=1)
+        
+        if dimension == 2:
+            self.coord_Ly, self.coord_Ry = self.geo_time_coord(option="BC",coordinate=2)
+
+        if dimension == 3:
+            self.coord_Ly, self.coord_Ry = self.geo_time_coord(option="BC",coordinate=2)
+            self.coord_Lz, self.coord_Rz = self.geo_time_coord(option="BC",coordinate=3)
+
+
+def pde_residue(colloc, net, dimension = 1):
+    
+    '''
+    This is the main function that returns all the PDE residue
+    
+    Args:
+        colloc: Collocation points
+        net: Neural network
+        dimension: Spatial dimension (1, 2, or 3)
+    '''
+    
+    return pde_residue_standard(colloc, net, dimension)
+
+
+def pde_residue_standard(colloc, net, dimension = 1):
+    
+    '''
+    Standard PDE residues (network predicts rho directly)
+    '''
+    net_outputs = net(colloc)
+    
+    x = colloc[0]
+    
+    if dimension == 1:
+        t = colloc[1]
+
+    elif dimension == 2:
+        y = colloc[1]
+        t = colloc[2]
+
+    elif dimension == 3:
+        y = colloc[1]
+        z = colloc[2]
+        t = colloc[3]
+    
+    rho, vx = net_outputs[:,0:1], net_outputs[:,1:2]
+
+    if dimension == 1:
+
+        phi = net_outputs[:,2:3]
+
+        rho_t = diff(rho,t,order=1)  
+        rho_x = diff(rho,x,order=1)
+
+        vx_t = diff(vx, t,order=1)
+        vx_x = diff(vx, x,order=1)
+        
+        phi_x = diff(phi,x,order=1)
+        phi_x_x = diff(phi,x,order=2)
+
+    elif dimension == 2:
+
+        vy = net_outputs[:,2:3]
+        phi = net_outputs[:,3:4]
+
+        rho_t = diff(rho,t,order=1)  
+        rho_x = diff(rho,x,order=1)
+        rho_y = diff(rho,y,order=1)
+
+        vx_t = diff(vx, t,order=1)
+        vy_t = diff(vy, t,order=1)
+
+        vx_x = diff(vx, x,order=1)
+        vx_y = diff(vx, y,order=1)
+        vy_x = diff(vy, x,order=1)
+        vy_y = diff(vy, y,order=1)
+        
+        phi_x = diff(phi,x,order=1)
+        phi_x_x = diff(phi,x,order=2)
+
+        phi_y = diff(phi,y,order=1)
+        phi_y_y = diff(phi,y,order=2)
+
+    elif dimension == 3:
+        vy = net_outputs[:,2:3]
+        vz = net_outputs[:,3:4]
+        phi = net_outputs[:,4:5]
+
+        rho_t = diff(rho,t,order=1)  
+        rho_x = diff(rho,x,order=1)
+        rho_y = diff(rho,y,order=1)
+        rho_z = diff(rho,z,order=1)
+
+        vx_t = diff(vx, t,order=1)
+        vy_t = diff(vy, t,order=1)
+        vz_t = diff(vz, t,order=1)
+
+        vx_x = diff(vx, x,order=1)
+        vy_x = diff(vy, x,order=1)
+        vz_x = diff(vz, x,order=1)
+
+        vx_y = diff(vx, y,order=1)
+        vy_y = diff(vy, y,order=1)
+        vz_y = diff(vz, y,order=1)
+        
+        vx_z = diff(vx, z,order=1)
+        vy_z = diff(vy, z,order=1)
+        vz_z = diff(vz, z,order=1)
+        
+        phi_x = diff(phi,x,order=1)
+        phi_x_x = diff(phi,x,order=2)
+
+        phi_y = diff(phi,y,order=1)
+        phi_y_y = diff(phi,y,order=2)
+    
+        phi_z = diff(phi,z,order=1)
+        phi_z_z = diff(phi,z,order=2)
+
+    
+    ## The residues from the equations
+
+    if dimension == 1:
+        rho_r = rho_t + vx * rho_x + rho * vx_x
+        vx_r = rho*vx_t + rho*(vx*vx_x) + cs*cs*rho_x +rho*phi_x
+        phi_r = phi_x_x - const*(rho - rho_o)
+
+        return rho_r, vx_r, phi_r
+
+    elif dimension == 2:
+        rho_r = rho_t + vx * rho_x + vy * rho_y + rho * vx_x + rho * vy_y
+        vx_r = rho*vx_t + rho*(vx*vx_x + vy*vx_y) + cs*cs*rho_x + rho*phi_x
+        vy_r = rho*vy_t + rho*(vy*vy_y + vx*vy_x) + cs*cs*rho_y + rho*phi_y
+        phi_r = phi_x_x + phi_y_y - const*(rho - rho_o)
+
+        return rho_r, vx_r, vy_r, phi_r
+    
+    elif dimension == 3:
+        rho_r = rho_t + vx * rho_x + rho * vx_x + vy *rho_y + rho * vy_y + vz *rho_z +rho * vz_z
+        vx_r = rho*vx_t + rho*(vx*vx_x + vy*vx_y+vz*vx_z) + cs*cs*rho_x + rho*phi_x
+        vy_r = rho*vy_t + rho*(vy*vy_y + vx*vy_x+vz*vy_z) + cs*cs*rho_y + rho*phi_y
+        vz_r = rho*vz_t + rho*(vz*vz_z + vx*vz_x+vy*vz_y) + cs*cs*rho_z + rho*phi_z
+        phi_r = phi_x_x + phi_y_y +phi_z_z - const*(rho - rho_o)
+        
+        return rho_r,vx_r,vy_r,vz_r,phi_r
+
+
+class XPINN_Loss:
+    """
+    XPINN Loss computation for domain decomposition.
+    
+    Computes:
+    - PDE residual loss per subdomain
+    - Initial condition loss per subdomain
+    - Periodic BC loss (only exterior boundaries)
+    - Interface continuity losses (solution + residual)
+    """
+    
+    def __init__(self, rmin, rmax, dimension=2):
+        """
+        Initialize XPINN loss computer.
+        
+        Args:
+            rmin: List of minimum values [xmin, ymin, tmin] (for 2D)
+            rmax: List of maximum values [xmax, ymax, tmax] (for 2D)
+            dimension: Spatial dimension (default 2)
+        """
+        self.rmin = rmin
+        self.rmax = rmax
+        self.dimension = dimension
+        
+        # Import config values
+        from config import (INTERFACE_SOLUTION_WEIGHT, INTERFACE_RESIDUAL_WEIGHT,
+                           INTERFACE_SOLUTION_COMPONENTS)
+        self.interface_solution_weight = INTERFACE_SOLUTION_WEIGHT
+        self.interface_residual_weight = INTERFACE_RESIDUAL_WEIGHT
+        self.interface_components = INTERFACE_SOLUTION_COMPONENTS
+        
+        # Component name to index mapping
+        self.component_map = {'rho': 0, 'vx': 1, 'vy': 2, 'phi': 3}
+    
+    def compute_pde_loss(self, colloc, net):
+        """
+        Compute PDE residual loss for a subdomain.
+        
+        Args:
+            colloc: Collocation points [x, y, t]
+            net: Neural network for this subdomain
+        
+        Returns:
+            PDE residual loss (scalar)
+        """
+        residuals = pde_residue(colloc, net, dimension=self.dimension)
+        
+        # Sum squared residuals
+        loss = sum(torch.mean(r**2) for r in residuals)
+        return loss
+    
+    def compute_ic_loss(self, colloc_ic, net, ic_functions, cached_ic=None):
+        """
+        Compute initial condition loss for a subdomain.
+        
+        Args:
+            colloc_ic: Initial condition collocation points [x, y, t=0]
+            net: Neural network for this subdomain
+            ic_functions: Dictionary of initial condition functions
+                          {'rho': func, 'vx': func, 'vy': func, 'phi': func}
+            cached_ic: Precomputed IC values (optional)
+        
+        Returns:
+            IC loss (scalar)
+        """
+        # Get network predictions at t=0
+        u_pred = net(colloc_ic)
+        
+        # Use cached IC values if available, otherwise compute them
+        if cached_ic is not None:
+            ic_rho = cached_ic['rho']
+            ic_vx = cached_ic['vx']
+            ic_vy = cached_ic['vy']
+            ic_phi = cached_ic['phi']
+        else:
+            # Compute initial conditions
+            ic_rho = ic_functions['rho'](colloc_ic)
+            ic_vx = ic_functions['vx'](colloc_ic)
+            ic_vy = ic_functions['vy'](colloc_ic)
+            ic_phi = ic_functions['phi'](colloc_ic)
+        
+        # Compute MSE for each component
+        loss_rho = torch.mean((u_pred[:, 0:1] - ic_rho)**2)
+        loss_vx = torch.mean((u_pred[:, 1:2] - ic_vx)**2)
+        loss_vy = torch.mean((u_pred[:, 2:3] - ic_vy)**2)
+        loss_phi = torch.mean((u_pred[:, 3:4] - ic_phi)**2)
+        
+        total_ic_loss = loss_rho + loss_vx + loss_vy + loss_phi
+        return total_ic_loss
+    
+    def compute_interface_solution_loss(self, colloc_interface, net1, net2, grad_to='both'):
+        """
+        Compute solution continuity loss at interface.
+        
+        Enforces: u_avg = (u1 + u2)/2 for both networks.
+        Minimizes: |u1 - u_avg|^2 + |u2 - u_avg|^2
+        
+        Args:
+            colloc_interface: Interface collocation points [x, y, t]
+            net1, net2: Neural networks for adjacent subdomains
+            grad_to: 'both' (default), 'net1', or 'net2' - controls which network receives gradients
+        
+        Returns:
+            Solution continuity loss (scalar)
+        """
+        # Move interface points to each network's device
+        device1 = next(net1.parameters()).device
+        device2 = next(net2.parameters()).device
+        
+        colloc_interface_1 = [t.to(device1) for t in colloc_interface]
+        colloc_interface_2 = [t.to(device2) for t in colloc_interface]
+        
+        # Get predictions from both networks at interface
+        u1 = net1(colloc_interface_1)
+        u2 = net2(colloc_interface_2)
+        
+        # Detach neighbor network BEFORE any device transfers to avoid graph sharing
+        if grad_to == 'net1':
+            u2 = u2.detach()
+        elif grad_to == 'net2':
+            u1 = u1.detach()
+        
+        # Compute loss on the device of the network we're training
+        if grad_to == 'net2':
+            # Backprop only to net2; compute on device2
+            # u1 is already detached, so moving it won't create gradients
+            u1_on_device2 = u1.to(device2)
+            u_avg = (u1_on_device2 + u2) / 2.0
+            loss = 0.0
+            for comp_name in self.interface_components:
+                if comp_name in self.component_map:
+                    idx = self.component_map[comp_name]
+                    if idx < u2.shape[1]:
+                        u2_comp = u2[:, idx:idx+1]
+                        u_avg_comp = u_avg[:, idx:idx+1]
+                        loss += torch.mean((u2_comp - u_avg_comp)**2)
+        else:
+            # Backprop to net1 (or both); compute on device1
+            # u2 is already detached, so moving it won't create gradients
+            u2_on_device1 = u2.to(device1)
+            u_avg = (u1 + u2_on_device1) / 2.0
+            loss = 0.0
+            for comp_name in self.interface_components:
+                if comp_name in self.component_map:
+                    idx = self.component_map[comp_name]
+                    if idx < u1.shape[1]:
+                        u1_comp = u1[:, idx:idx+1]
+                        u_avg_comp = u_avg[:, idx:idx+1]
+                        loss += torch.mean((u1_comp - u_avg_comp)**2)
+                        if grad_to == 'both':
+                            u2_comp = u2_on_device1[:, idx:idx+1]
+                            loss += torch.mean((u2_comp - u_avg_comp)**2)
+        
+        return self.interface_solution_weight * loss
+    
+    def compute_interface_residual_loss(self, colloc_interface, net1, net2, grad_to='both'):
+        """
+        Compute residual continuity loss at interface.
+        
+        Enforces: R1(interface) = R2(interface)
+        
+        Args:
+            colloc_interface: Interface collocation points [x, y, t]
+            net1, net2: Neural networks for adjacent subdomains
+            grad_to: 'both' (default), 'net1', or 'net2' - controls which network receives gradients
+        
+        Returns:
+            Residual continuity loss (scalar)
+        """
+        # Move interface points to each network's device
+        device1 = next(net1.parameters()).device
+        device2 = next(net2.parameters()).device
+        
+        colloc_interface_1 = [t.to(device1) for t in colloc_interface]
+        colloc_interface_2 = [t.to(device2) for t in colloc_interface]
+        
+        # Compute PDE residuals from both networks at interface
+        residuals1 = pde_residue(colloc_interface_1, net1, dimension=self.dimension)
+        residuals2 = pde_residue(colloc_interface_2, net2, dimension=self.dimension)
+        
+        # Enforce residual matching for all PDE components
+        loss = 0.0
+        if grad_to == 'net2':
+            # Backprop only to net2; compute on device2
+            for r1, r2 in zip(residuals1, residuals2):
+                r1_detached = r1.detach().to(device2)
+                loss += torch.mean((r2 - r1_detached)**2)
+        elif grad_to == 'net1':
+            # Backprop only to net1; compute on device1
+            for r1, r2 in zip(residuals1, residuals2):
+                r2_detached = r2.detach().to(device1)
+                loss += torch.mean((r1 - r2_detached)**2)
+        else:
+            # Backprop to both (original behavior); compute on device1
+            for r1, r2 in zip(residuals1, residuals2):
+                r2_on_device1 = r2.to(device1)
+                loss += torch.mean((r1 - r2_on_device1)**2)
+        
+        return self.interface_residual_weight * loss
+    
+    # NOTE: Periodic boundary conditions are enforced via periodic feature encoding
+    # (n_harmonics in _periodic_features method of PINN class), NOT via loss term.
+    # This is a hard constraint approach where the network architecture guarantees periodicity.
+    
+    def compute_total_loss(self, nets, subdomain_collocs, interface_collocs, 
+                          subdomain_ic_collocs, ic_functions, interfaces, 
+                          exterior_boundaries, cached_ic_values=None):
+        """
+        Compute total XPINN loss aggregating all components.
+        
+        Args:
+            nets: List of neural networks (one per subdomain)
+            subdomain_collocs: List of subdomain collocation points
+            interface_collocs: Dict mapping interface tuple to collocation points
+            subdomain_ic_collocs: List of IC collocation points per subdomain
+            ic_functions: Initial condition functions
+            interfaces: List of interface tuples (subdomain_i, subdomain_j, type, pos)
+            exterior_boundaries: Dict mapping subdomain_idx to boundary info
+            cached_ic_values: Precomputed IC values (list of dicts per subdomain, optional)
+        
+        Returns:
+            Tuple (total_loss, loss_dict) where loss_dict contains component losses
+        """
+        if cached_ic_values is None:
+            cached_ic_values = [None] * len(nets)
+            
+        # Initialize loss dict on device 0 (or appropriate device for single GPU)
+        device = 'cuda:0' if len(nets) > 1 else next(nets[0].parameters()).device
+        loss_dict = {
+            'pde': torch.tensor(0.0, device=device),
+            'ic': torch.tensor(0.0, device=device),
+            'interface_solution': torch.tensor(0.0, device=device),
+            'interface_residual': torch.tensor(0.0, device=device)
+        }
+        
+        # PDE and IC losses for each subdomain
+        for i, (net, colloc, colloc_ic) in enumerate(zip(nets, subdomain_collocs, subdomain_ic_collocs)):
+            # Compute losses on the device where the network lives
+            pde_loss = self.compute_pde_loss(colloc, net)
+            ic_loss = self.compute_ic_loss(colloc_ic, net, ic_functions, cached_ic_values[i])
+            
+            # Move losses to device 0 for aggregation (or keep on same device if single GPU)
+            if len(nets) > 1:  # Multi-GPU case
+                pde_loss = pde_loss.to(device)
+                ic_loss = ic_loss.to(device)
+            
+            loss_dict['pde'] += pde_loss
+            loss_dict['ic'] += ic_loss
+        
+        # Interface losses
+        for interface in interfaces:
+            subdomain_i, subdomain_j, _, _ = interface
+            interface_key = (subdomain_i, subdomain_j)
+            
+            if interface_key in interface_collocs:
+                colloc_interface = interface_collocs[interface_key]
+                net1 = nets[subdomain_i]
+                net2 = nets[subdomain_j]
+                
+                # Compute interface losses
+                sol_loss = self.compute_interface_solution_loss(colloc_interface, net1, net2)
+                res_loss = self.compute_interface_residual_loss(colloc_interface, net1, net2)
+                
+                # Move losses to device 0 for aggregation (or keep on same device if single GPU)
+                if len(nets) > 1:  # Multi-GPU case
+                    sol_loss = sol_loss.to(device)
+                    res_loss = res_loss.to(device)
+                
+                loss_dict['interface_solution'] += sol_loss
+                loss_dict['interface_residual'] += res_loss
+        
+        # NOTE: Periodic BC NOT included here - enforced via periodic feature encoding (harmonics)
+        # in the PINN architecture, which is a hard constraint approach.
+        
+        # Total loss
+        total_loss = sum(loss_dict.values())
+        
+        return total_loss, loss_dict
+_register_module('core.losses', ['ASTPN', 'XPINN_Loss', 'pde_residue', 'pde_residue_standard'])
+
+# ==== Module: core.model_architecture (core/model_architecture.py) ====
+import numpy as np
+
+import torch
+import torch.nn as nn
+#from torch.autograd import Variable
+from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, STARTUP_DT, USE_PARAMETERIZATION
+
+class Sin(nn.Module):
+    def forward(self, input):
+        return torch.sin(input)
+
+
+def get_activation(activation_type):
+    """
+    Factory function to create activation function instances.
+    
+    Args:
+        activation_type: String identifier ('sin', 'tanh', 'relu', 'elu')
+    
+    Returns:
+        nn.Module activation function
+    """
+    activation_type = activation_type.lower()
+    if activation_type == 'sin':
+        return Sin()
+    elif activation_type == 'tanh':
+        return nn.Tanh()
+    elif activation_type == 'relu':
+        return nn.ReLU()
+    elif activation_type == 'elu':
+        return nn.ELU()
+    else:
+        raise ValueError(f"Unknown activation type: {activation_type}. Choose from 'sin', 'tanh', 'relu', 'elu'.")
+
+class PINN(nn.Module):
+    def __init__(self, num_neurons=num_neurons, num_layers=num_layers, n_harmonics=1, activation_type=DEFAULT_ACTIVATION):
+        super(PINN, self).__init__()
+        self.num_neurons = num_neurons
+        self.n_harmonics = n_harmonics
+        self.num_layers = max(2, int(num_layers))  # total Linear layers including output
+        self.activation_type = activation_type
+        
+        # Domain extents for periodic embeddings (set via set_domain)
+        self.xmin = None
+        self.xmax = None
+        self.ymin = None
+        self.ymax = None
+        self.zmin = None
+        self.zmax = None
+    
+    # Helper to build a branch with dynamic depth
+        def _make_branch(in_dim, out_dim):
+            layers = []
+            # First layer
+            layers.append(nn.Linear(in_dim, self.num_neurons))
+            # Hidden layers: total linear layers = self.num_layers; we already added 1; 
+            # add (self.num_layers - 2) hidden Linear blocks with activations after each
+            for _ in range(self.num_layers - 2):
+                layers.append(get_activation(self.activation_type))
+                layers.append(nn.Linear(self.num_neurons, self.num_neurons))
+            # Activation before output if there is at least one hidden block
+            if self.num_layers > 2:
+                layers.append(get_activation(self.activation_type))
+            # Output layer
+            layers.append(nn.Linear(self.num_neurons, out_dim))
+            return nn.Sequential(*layers)
+
+    # 1D branch (periodic x features + t)
+        in_dim_1d = 2*self.n_harmonics + 1
+        self.branch_1d = _make_branch(in_dim_1d, 3)
+        
+    # 2D branch (periodic x,y features + t)
+        in_dim_2d = 4*self.n_harmonics + 1
+        self.branch_2d = _make_branch(in_dim_2d, 4)
+        
+    # 3D branch (periodic x,y,z features + t)
+        in_dim_3d = 6*self.n_harmonics + 1
+        self.branch_3d = _make_branch(in_dim_3d, 5)
+
+
+    def set_domain(self, rmin, rmax, dimension):
+        # rmin/rmax exclude time; follow ASTPN usage
+        if dimension >= 1:
+            self.xmin, self.xmax = float(rmin[0]), float(rmax[0])
+        if dimension >= 2:
+            self.ymin, self.ymax = float(rmin[1]), float(rmax[1])
+        if dimension >= 3:
+            self.zmin, self.zmax = float(rmin[2]), float(rmax[2])
+
+    def _periodic_features(self, u, umin, umax):
+        # u is [N,1]
+        L = umax - umin
+        theta = 2*np.pi*(u - umin)/L
+        features = []
+
+        for k in range(1, self.n_harmonics+1):
+            
+            scale = 1.0 / np.sqrt(k)
+
+            features.append(scale * torch.sin(k*theta))
+            features.append(scale * torch.cos(k*theta))
+
+        return torch.cat(features, dim=1) if len(features) > 0 else u
+
+    def _prepare_coordinate_features(self, X):
+        """
+        Prepare periodic features for all spatial coordinates.
+        
+        Args:
+            X: List of coordinates [x, ...spatial..., t]
+        
+        Returns:
+            Tuple (features, t_tensor, dimension)
+        """
+        x, t = X[0], X[-1]
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+        t = t.unsqueeze(-1) if t.dim() == 1 else t
+        dimension = len(X)
+        
+        if dimension == 2:
+            if self.xmin is None or self.xmax is None:
+                raise RuntimeError("Domain not set: call net.set_domain for dimension=1")
+            x_feat = self._periodic_features(x, self.xmin, self.xmax)
+            features = torch.cat([x_feat, t], dim=1)
+        
+        elif dimension == 3:
+            if self.xmin is None or self.xmax is None or self.ymin is None or self.ymax is None:
+                raise RuntimeError("Domain not set: call net.set_domain for dimension=2")
+            y = X[1].unsqueeze(-1) if X[1].dim() == 1 else X[1]
+            x_feat = self._periodic_features(x, self.xmin, self.xmax)
+            y_feat = self._periodic_features(y, self.ymin, self.ymax)
+            features = torch.cat([x_feat, y_feat, t], dim=1)
+        
+        elif dimension == 4:
+            if (self.xmin is None or self.xmax is None or
+                self.ymin is None or self.ymax is None or
+                self.zmin is None or self.zmax is None):
+                raise RuntimeError("Domain not set: call net.set_domain for dimension=3")
+            y = X[1].unsqueeze(-1) if X[1].dim() == 1 else X[1]
+            z = X[2].unsqueeze(-1) if X[2].dim() == 1 else X[2]
+            x_feat = self._periodic_features(x, self.xmin, self.xmax)
+            y_feat = self._periodic_features(y, self.ymin, self.ymax)
+            z_feat = self._periodic_features(z, self.zmin, self.zmax)
+            features = torch.cat([x_feat, y_feat, z_feat, t], dim=1)
+        
+        else:
+            raise ValueError(f"Expected len(X) in [2, 3, 4] but got {dimension}")
+        
+        return features, t, dimension
+    
+    def _apply_density_constraint(self, outputs, t):
+        """
+        Apply hard density constraint with causality enforcement for power spectrum perturbations.
+        
+        For power spectrum (non-sinusoidal):
+        - For t < STARTUP_DT: Density is frozen at ρ₀ (causality - information hasn't propagated)
+        - For t >= STARTUP_DT: Density evolves based on USE_PARAMETERIZATION:
+          * "exponential": ρ = ρ₀ × exp(clamp((t - STARTUP_DT) × ρ̂, -10, 10))
+            (ensures strictly positive density)
+          * "linear": ρ = ρ₀ + (t - STARTUP_DT) × ρ̂
+            (linear growth from initial condition)
+          * "none": ρ = ρ̂
+            (direct network prediction, no transformation)
+        
+        The causality constraint (STARTUP_DT) is enforced for all parameterizations.
+        This ensures density remains at initial conditions until information has had time
+        to propagate across the domain (finite signal speed).
+        
+        For sinusoidal: No constraint (returns as-is).
+        
+        Args:
+            outputs: Raw network outputs [ρ̂, vx, vy?, vz?, phi]
+            t: Time tensor
+        
+        Returns:
+            Modified outputs with density constraint applied [ρ, vx, vy?, vz?, phi]
+        """
+        if str(PERTURBATION_TYPE).lower() == "sinusoidal":
+            return outputs
+        
+        # Causality constraint for power spectrum:
+        # Density frozen at ρ₀ for t < STARTUP_DT (information propagation delay)
+        rho_hat = outputs[:, 0:1]
+        other = outputs[:, 1:]
+        
+        # Create mask for causality: 1.0 where t >= STARTUP_DT, 0.0 where t < STARTUP_DT
+        causal_mask = (t >= STARTUP_DT).float()
+        
+        # Effective time: zero for t < STARTUP_DT, (t - STARTUP_DT) for t >= STARTUP_DT
+        t_effective = torch.clamp(t - STARTUP_DT, min=0.0)
+        
+        # Apply parameterization based on config
+        parameterization = str(USE_PARAMETERIZATION).lower()
+        
+        if parameterization == "exponential":
+            # Exponential parameterization: ρ = ρ₀ * exp(t_eff * ρ̂)
+            # For t < STARTUP_DT: t_eff = 0, so exp(0) = 1, thus ρ = ρ₀
+            # For t >= STARTUP_DT: ρ evolves exponentially
+            rho = rho_o * torch.exp(torch.clamp(t_effective * rho_hat, min=-10, max=10))
+            
+        elif parameterization == "linear":
+            # Linear parameterization: ρ = ρ₀ + t_eff * ρ̂
+            # For t < STARTUP_DT: t_eff = 0, so ρ = ρ₀
+            # For t >= STARTUP_DT: ρ grows linearly
+            rho = rho_o + t_effective * rho_hat
+            
+        elif parameterization == "none":
+            # No parameterization: direct prediction with causality enforcement
+            # For t < STARTUP_DT: ρ = ρ₀ (frozen at initial condition)
+            # For t >= STARTUP_DT: ρ = ρ̂ (network output directly)
+            rho = causal_mask * rho_hat + (1 - causal_mask) * rho_o
+            
+        else:
+            raise ValueError(f"Invalid USE_PARAMETERIZATION: '{USE_PARAMETERIZATION}'. "
+                           f"Choose from: 'exponential', 'linear', 'none'")
+        
+        return torch.cat([rho, other], dim=1)
+    
+    def forward(self, X):
+        """
+        Forward pass of PINN.
+        
+        Args:
+            X: List of coordinates [x, ...spatial..., t]
+        
+        Returns:
+            Network predictions [rho, vx, vy?, vz?, phi]
+        """
+        features, t, dimension = self._prepare_coordinate_features(X)
+        
+        # Select appropriate branch based on dimension
+        if dimension == 2:
+            outputs = self.branch_1d(features)
+        elif dimension == 3:
+            outputs = self.branch_2d(features)
+        elif dimension == 4:
+            outputs = self.branch_3d(features)
+        else:
+            raise ValueError(f"Unexpected dimension: {dimension}")
+        
+        return self._apply_density_constraint(outputs, t)
+        
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        m.bias.data.fill_(0.01)
+_register_module('core.model_architecture', ['PINN', 'Sin', 'get_activation', 'init_weights'])
+
+# ==== Module: methods.causal_training (methods/causal_training.py) ====
+"""
+Causal Training Module for Physics-Informed Neural Networks
+
+This module provides infrastructure for causal training with temporal curriculum
+and adaptive/static weighting schemes. Similar to xpinn_decomposition.py structure.
+
+Key Components:
+- ResidualTracker: Tracks residuals across time bins for adaptive weighting
+- CausalTrainer: Orchestrates the complete causal training workflow
+- Helper functions for window scheduling, weight computation, etc.
+"""
+
+import numpy as np
+import torch
+
+
+class ResidualTracker:
+    """
+    Tracks cumulative residuals across time bins for adaptive causal weighting.
+    Implements w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k, θ))
+    """
+    def __init__(self, t_min, t_max, num_bins, epsilon, device='cuda'):
+        """
+        Args:
+            t_min: Minimum time value
+            t_max: Maximum time value
+            num_bins: Number of time bins for tracking residuals
+            epsilon: Causality parameter (controls weight suppression strength)
+            device: PyTorch device
+        """
+        self.t_min = t_min
+        self.t_max = t_max
+        self.num_bins = num_bins
+        self.epsilon = epsilon
+        self.device = device
+        
+        # Bin edges for time discretization
+        self.bin_edges = torch.linspace(t_min, t_max, num_bins + 1, device=device)
+        self.bin_width = (t_max - t_min) / num_bins
+        
+        # Cumulative residuals per bin (initialized to zero)
+        self.cumulative_residuals = torch.zeros(num_bins, device=device)
+        
+        # Counter for number of updates per bin (for averaging)
+        self.update_counts = torch.zeros(num_bins, device=device)
+    
+    def get_bin_indices(self, t_values):
+        """Get bin indices for given time values."""
+        t_flat = t_values.flatten()
+        bin_idx = ((t_flat - self.t_min) / self.bin_width).long()
+        return torch.clamp(bin_idx, 0, self.num_bins - 1)
+    
+    def update_residuals(self, t_values, residuals):
+        """
+        Update cumulative residuals for time bins based on current batch.
+        
+        Args:
+            t_values: Time values [N, 1]
+            residuals: PDE residuals [N, 1] or list of residuals
+        """
+        # Convert residuals to single scalar per point if it's a list
+        if isinstance(residuals, (list, tuple)):
+            total_residual = sum(r.flatten() ** 2 for r in residuals)
+            residual_values = torch.sqrt(total_residual)
+        else:
+            residual_values = residuals.flatten().abs()
+        
+        bin_idx = self.get_bin_indices(t_values)
+        
+        # Vectorized accumulation using bincount
+        bin_sums = torch.bincount(bin_idx, weights=residual_values, minlength=self.num_bins)
+        bin_counts = torch.bincount(bin_idx, minlength=self.num_bins).to(bin_sums.dtype)
+        
+        self.cumulative_residuals += bin_sums.detach()
+        self.update_counts += bin_counts.detach()
+    
+    def get_adaptive_weights(self, t_values):
+        """
+        Compute adaptive causal weights based on cumulative past residuals.
+        w_i = exp(-epsilon * Σ_{k=1}^{i-1} L_r(t_k))
+        
+        Args:
+            t_values: Time values [N, 1]
+        
+        Returns:
+            Weights [N, 1]
+        """
+        eps = 1e-12
+        bin_idx = self.get_bin_indices(t_values)
+        
+        # Compute average residual per bin (point-averaged)
+        avg_residuals = self.cumulative_residuals / (self.update_counts + eps)
+        
+        # Normalize by early-time scale (bin 0) to keep magnitude stable
+        ref_scale = avg_residuals[0].clamp_min(eps)
+        avg_residuals_norm = avg_residuals / ref_scale
+        
+        # Compute cumulative sum of normalized average residuals
+        cumsum_avg = torch.cumsum(avg_residuals_norm, dim=0)
+        
+        # For bin i, we want sum from bins 0 to i-1, so shift cumsum by 1
+        cumsum_shifted = torch.cat([torch.zeros(1, device=self.device), cumsum_avg[:-1]], dim=0)
+        
+        # Gather the appropriate cumulative sum for each point based on its bin
+        bin_idx_flat = bin_idx.clamp(min=0, max=self.num_bins-1)
+        past_residual_sum = cumsum_shifted[bin_idx_flat]
+        
+        # Apply exponential suppression with floor to prevent starving later times
+        weights = torch.exp(-self.epsilon * past_residual_sum).clamp_min(0.02)
+        
+        return weights.unsqueeze(-1) if weights.dim() == 1 else weights
+    
+    def reset(self):
+        """Reset cumulative residuals and counts."""
+        self.cumulative_residuals.zero_()
+        self.update_counts.zero_()
+    
+    def get_stats(self):
+        """Get current statistics for logging."""
+        avg_residuals = torch.where(
+            self.update_counts > 0,
+            self.cumulative_residuals / self.update_counts,
+            torch.zeros_like(self.cumulative_residuals)
+        )
+        return {
+            'cumulative': self.cumulative_residuals.cpu().numpy(),
+            'counts': self.update_counts.cpu().numpy(),
+            'average': avg_residuals.cpu().numpy()
+        }
+
+
+def compute_causal_weights_static(t_values, gamma):
+    """
+    Compute static causal weights: w(t) = exp(-gamma * t)
+    
+    Args:
+        t_values: Time values tensor [N, 1]
+        gamma: Exponential decay parameter
+    
+    Returns:
+        Weights [N, 1]
+    """
+    if gamma == 0.0:
+        return torch.ones_like(t_values)
+    return torch.exp(-gamma * t_values)
+
+
+def generate_temporal_windows(schedule, num_windows, tmin, tmax, startup_dt, custom_windows=None):
+    """
+    Generate temporal window boundaries for curriculum training.
+    
+    Args:
+        schedule: 'linear' or 'custom'
+        num_windows: Number of windows (ignored if schedule='custom')
+        tmin: Minimum time
+        tmax: Maximum time  
+        startup_dt: Startup time offset
+        custom_windows: List of [t_min, t_max] pairs for custom schedule
+    
+    Returns:
+        List of (t_min, t_max) tuples
+    """
+    if schedule == "custom":
+        if custom_windows is None:
+            raise ValueError("custom_windows required for custom schedule")
+        return [(float(w[0]), float(w[1])) for w in custom_windows]
+    elif schedule == "linear":
+        # Linear progression from startup_dt to tmax
+        t_start = max(tmin, startup_dt)
+        window_times = np.linspace(t_start, tmax, num_windows + 1)
+        return [(float(window_times[i]), float(window_times[i+1])) for i in range(num_windows)]
+    else:
+        raise ValueError(f"Unknown schedule: {schedule}")
+
+
+def compute_epsilon_for_window(window_idx, num_windows, epsilon_min, epsilon_max, 
+                                epsilon_base, epsilon_floor, use_annealing):
+    """
+    Compute epsilon value for current window in adaptive mode.
+    
+    Args:
+        window_idx: Current window index (0-based)
+        num_windows: Total number of windows
+        epsilon_min: Minimum epsilon (for annealing)
+        epsilon_max: Maximum epsilon (for annealing)
+        epsilon_base: Base epsilon value (for linear decay)
+        epsilon_floor: Floor epsilon value (for linear decay)
+        use_annealing: Whether to use automatic annealing
+    
+    Returns:
+        epsilon value for this window
+    """
+    if use_annealing:
+        # Automatic interpolation between MIN and MAX (ensures monotonic increase)
+        progress = window_idx / max(1, num_windows - 1)
+        return epsilon_min + (epsilon_max - epsilon_min) * progress
+    else:
+        # Linear decay (original method): strong early → moderate late
+        return epsilon_floor + (epsilon_base - epsilon_floor) * (1.0 - window_idx / max(1, num_windows - 1))
+
+
+def compute_gamma_for_window(window_idx, num_windows, gamma_max, gamma_min):
+    """
+    Compute gamma value for current window in static mode.
+    
+    Args:
+        window_idx: Current window index (0-based)
+        num_windows: Total number of windows
+        gamma_max: Maximum gamma value (early windows)
+        gamma_min: Minimum gamma value (final window)
+    
+    Returns:
+        gamma value for this window
+    """
+    # Linear decay from gamma_max to gamma_min
+    progress = window_idx / max(1, num_windows - 1)
+    return gamma_max * (1.0 - progress) + gamma_min * progress
+
+
+class CausalTrainer:
+    """
+    Orchestrates causal training with temporal curriculum and adaptive/static weighting.
+    """
+    
+    def __init__(self, model, net, optimizer, optimizerL, mse_cost_function,
+                 train_func, config, device):
+        """
+        Args:
+            model: ASTPN model for collocation generation
+            net: Neural network
+            optimizer: Adam optimizer
+            optimizerL: LBFGS optimizer
+            mse_cost_function: Loss function
+            train_func: Training function (from solver.py)
+            config: Dictionary with all causal config parameters
+            device: PyTorch device
+        """
+        self.model = model
+        self.net = net
+        self.optimizer = optimizer
+        self.optimizerL = optimizerL
+        self.mse_cost_function = mse_cost_function
+        self.train_func = train_func
+        self.config = config
+        self.device = device
+        
+        # Initialize residual tracker for adaptive mode
+        self.residual_tracker = None
+        if config['weighting_mode'] == 'adaptive':
+            t_start = max(config['tmin'], config['startup_dt'])
+            self.residual_tracker = ResidualTracker(
+                t_min=t_start,
+                t_max=config['tmax'],
+                num_bins=config['num_time_bins'],
+                epsilon=config['epsilon'],
+                device=device
+            )
+    
+    def train_with_curriculum(self, collocation_IC, **train_kwargs):
+        """
+        Train with temporal curriculum (progressive time windows).
+        
+        Args:
+            collocation_IC: Initial condition collocation points
+            **train_kwargs: Additional kwargs for train function (rho_1, lam, etc.)
+        
+        Returns:
+            Trained network
+        """
+        cfg = self.config
+        use_restarts = cfg['use_restarts']
+        
+        # Generate temporal windows
+        windows = generate_temporal_windows(
+            schedule=cfg['window_schedule'],
+            num_windows=cfg['num_windows'],
+            tmin=cfg['tmin'],
+            tmax=cfg['tmax'],
+            startup_dt=cfg['startup_dt'],
+            custom_windows=cfg['custom_windows']
+        )
+        
+        # Compute iterations per window
+        adam_per_window = cfg['adam_per_window'] or (cfg['iteration_adam'] // cfg['num_windows'])
+        lbfgs_per_window = cfg['lbfgs_per_window'] or (cfg['iteration_lbfgs'] // cfg['num_windows'])
+        
+        print(f"Training schedule: {len(windows)} windows, {adam_per_window} Adam + {lbfgs_per_window} LBFGS per window")
+        
+        # Train on each window
+        for window_idx, (t_window_min, t_window_max) in enumerate(windows):
+            print(f"\n{'='*60}")
+            print(f"Window {window_idx + 1}/{len(windows)}: t in [{t_window_min:.3f}, {t_window_max:.3f}]")
+            print(f"{'='*60}")
+            
+            # Compute causal parameters for this window
+            if cfg['weighting_mode'] == 'static':
+                causal_gamma = compute_gamma_for_window(
+                    window_idx, len(windows), cfg['gamma_max'], cfg['gamma_min']
+                )
+                print(f"  Static weighting: gamma = {causal_gamma:.4f}")
+                causal_mode = 'static'
+            else:  # adaptive
+                causal_gamma = 0.0
+                causal_mode = 'adaptive'
+                
+                # Update epsilon for this window
+                if self.residual_tracker is not None:
+                    eps_k = compute_epsilon_for_window(
+                        window_idx, len(windows),
+                        cfg['epsilon_min'], cfg['epsilon_max'],
+                        cfg['epsilon'], cfg['epsilon_floor'],
+                        cfg['use_epsilon_annealing']
+                    )
+                    self.residual_tracker.epsilon = eps_k
+                    if cfg['use_epsilon_annealing']:
+                        print(f"  Adaptive weighting: epsilon = {eps_k:.3f} (annealed)")
+                    else:
+                        print(f"  Adaptive weighting: epsilon = {eps_k:.3f} (linear decay)")
+            
+            # Update model's temporal bounds for this window
+            if use_restarts and window_idx > 0:
+                # Restart marching: train only in current window [t_k, t_{k+1}]
+                t_start = t_window_min
+            else:
+                # Expanding windows: train from t=0 to current t_max
+                t_start = max(cfg['tmin'], cfg['startup_dt'])
+            
+            # Build rmin/rmax based on spatial dimension (2D or 3D)
+            dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
+            if dimension == 3:
+                self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], t_start]
+                self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], t_window_max]
+            else:  # 2D or 1D
+                self.model.rmin = [cfg['xmin'], cfg['ymin'], t_start]
+                self.model.rmax = [cfg['xmax'], cfg['ymax'], t_window_max]
+            
+            # Regenerate domain collocation for this window
+            collocation_domain_window = self.model.geo_time_coord(option="Domain")
+            
+            # Train on this window
+            self.train_func(
+                net=self.net,
+                model=self.model,
+                collocation_domain=collocation_domain_window,
+                collocation_IC=collocation_IC,
+                optimizer=self.optimizer,
+                optimizerL=self.optimizerL,
+                closure=None,
+                mse_cost_function=self.mse_cost_function,
+                iteration_adam=adam_per_window,
+                iterationL=lbfgs_per_window,
+                device=self.device,
+                causal_gamma=causal_gamma,
+                causal_mode=causal_mode,
+                residual_tracker=self.residual_tracker,
+                window_idx=window_idx,
+                **train_kwargs
+            )
+        
+        # Restore full time/space range for final evaluation/plotting
+        dimension = cfg.get('dimension', 2)  # Default to 2D for backward compatibility
+        if dimension == 3:
+            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['zmin'], cfg['tmin']]
+            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['zmax'], cfg['tmax']]
+        else:  # 2D or 1D
+            self.model.rmin = [cfg['xmin'], cfg['ymin'], cfg['tmin']]
+            self.model.rmax = [cfg['xmax'], cfg['ymax'], cfg['tmax']]
+        
+        if use_restarts:
+            print(f"\nCausal training completed (restart marching). Final time range: [{cfg['tmin']}, {cfg['tmax']}]")
+        else:
+            print(f"\nCausal training completed (expanding windows). Final time range: [{cfg['tmin']}, {cfg['tmax']}]")
+        
+        return self.net
+    
+    def train_without_curriculum(self, collocation_IC, **train_kwargs):
+        """
+        Train on full domain with adaptive weighting (no temporal windows).
+        
+        Args:
+            collocation_IC: Initial condition collocation points
+            **train_kwargs: Additional kwargs for train function
+        
+        Returns:
+            Trained network
+        """
+        cfg = self.config
+        
+        print("Training on full temporal domain with adaptive weighting...")
+        
+        # Generate full domain collocation
+        collocation_domain = self.model.geo_time_coord(option="Domain")
+        
+        # Train with adaptive weighting
+        self.train_func(
+            net=self.net,
+            model=self.model,
+            collocation_domain=collocation_domain,
+            collocation_IC=collocation_IC,
+            optimizer=self.optimizer,
+            optimizerL=self.optimizerL,
+            closure=None,
+            mse_cost_function=self.mse_cost_function,
+            iteration_adam=cfg['iteration_adam'],
+            iterationL=cfg['iteration_lbfgs'],
+            device=self.device,
+            causal_gamma=0.0,  # Not used in adaptive mode
+            causal_mode=cfg['weighting_mode'],
+            residual_tracker=self.residual_tracker,
+            window_idx=None,
+            **train_kwargs
+        )
+        
+        print(f"\nCausal training completed (full domain)")
+        
+        return self.net
+_register_module('methods.causal_training', ['CausalTrainer', 'ResidualTracker', 'compute_causal_weights_static', 'compute_epsilon_for_window', 'compute_gamma_for_window', 'generate_temporal_windows'])
+
+# ==== Module: methods.xpinn_decomposition (methods/xpinn_decomposition.py) ====
+"""
+XPINN Domain Decomposition Utilities
+
+Provides functions for subdomain boundary calculation, interface identification,
+and collocation point generation for XPINN-style domain decomposition.
+"""
+
+import numpy as np
+import torch
+
+
+def get_num_subdomains(nx_sub, ny_sub):
+    """
+    Calculate total number of subdomains.
+    
+    Args:
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        Total number of subdomains
+    """
+    return nx_sub * ny_sub
+
+
+def subdomain_idx_to_grid(idx, nx_sub, ny_sub):
+    """
+    Convert linear subdomain index to (i, j) grid position.
+    
+    Args:
+        idx: Linear subdomain index (0 to nx_sub*ny_sub-1)
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        Tuple (i, j) representing grid position where:
+        - i is x-direction index (0 to nx_sub-1)
+        - j is y-direction index (0 to ny_sub-1)
+    """
+    i = idx // ny_sub
+    j = idx % ny_sub
+    return (i, j)
+
+
+def get_subdomain_bounds(subdomain_idx, xmin, xmax, ymin, ymax, nx_sub, ny_sub):
+    """
+    Compute spatial boundaries for a given subdomain.
+    
+    Args:
+        subdomain_idx: Linear subdomain index
+        xmin, xmax: Global domain x-bounds
+        ymin, ymax: Global domain y-bounds
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        Tuple (x_min, x_max, y_min, y_max) for the subdomain
+    """
+    i, j = subdomain_idx_to_grid(subdomain_idx, nx_sub, ny_sub)
+    
+    # Calculate subdomain width and height
+    dx = (xmax - xmin) / nx_sub
+    dy = (ymax - ymin) / ny_sub
+    
+    # Calculate subdomain boundaries (non-overlapping)
+    x_min = xmin + i * dx
+    x_max = xmin + (i + 1) * dx
+    y_min = ymin + j * dy
+    y_max = ymin + (j + 1) * dy
+    
+    return (x_min, x_max, y_min, y_max)
+
+
+def get_interfaces(nx_sub, ny_sub):
+    """
+    Identify all interfaces between adjacent subdomains.
+    
+    Args:
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        List of tuples (subdomain_i, subdomain_j, interface_type, position_idx)
+        where:
+        - subdomain_i, subdomain_j: indices of adjacent subdomains
+        - interface_type: 'vertical', 'horizontal', 'periodic_vertical', or 'periodic_horizontal'
+        - position_idx: which vertical/horizontal line (for position calculation)
+    """
+    interfaces = []
+    
+    # Vertical interfaces (constant x, between subdomains in x-direction)
+    for i in range(nx_sub - 1):  # Between x-slices i and i+1
+        for j in range(ny_sub):  # For each y-slice
+            subdomain_left = i * ny_sub + j
+            subdomain_right = (i + 1) * ny_sub + j
+            interfaces.append((subdomain_left, subdomain_right, 'vertical', i + 1))
+    
+    # Horizontal interfaces (constant y, between subdomains in y-direction)
+    for i in range(nx_sub):  # For each x-slice
+        for j in range(ny_sub - 1):  # Between y-slices j and j+1
+            subdomain_bottom = i * ny_sub + j
+            subdomain_top = i * ny_sub + (j + 1)
+            interfaces.append((subdomain_bottom, subdomain_top, 'horizontal', j + 1))
+    
+    # Periodic wrap-around interfaces (enforce periodic BC across domain boundaries)
+    # Vertical wrap-around: right edge ↔ left edge (at x=xmax ↔ x=xmin)
+    for j in range(ny_sub):  # For each y-slice
+        subdomain_left = 0 * ny_sub + j              # Leftmost column (i=0)
+        subdomain_right = (nx_sub - 1) * ny_sub + j  # Rightmost column (i=nx_sub-1)
+        interfaces.append((subdomain_right, subdomain_left, 'periodic_vertical', nx_sub))
+    
+    # Horizontal wrap-around: top edge ↔ bottom edge (at y=ymax ↔ y=ymin)
+    for i in range(nx_sub):  # For each x-slice
+        subdomain_bottom = i * ny_sub + 0              # Bottom row (j=0)
+        subdomain_top = i * ny_sub + (ny_sub - 1)      # Top row (j=ny_sub-1)
+        interfaces.append((subdomain_top, subdomain_bottom, 'periodic_horizontal', ny_sub))
+    
+    return interfaces
+
+
+def generate_interface_points(interface_info, xmin, xmax, ymin, ymax, 
+                               tmin, tmax, n_points, device='cpu'):
+    """
+    Generate collocation points along an interface.
+    
+    Args:
+        interface_info: Tuple (subdomain_i, subdomain_j, interface_type, position_idx)
+        xmin, xmax: Global domain x-bounds
+        ymin, ymax: Global domain y-bounds
+        tmin, tmax: Time bounds
+        n_points: Number of collocation points to generate
+        device: PyTorch device
+    
+    Returns:
+        List [x, y, t] of torch tensors with gradients enabled
+    """
+    subdomain_i, subdomain_j, interface_type, position_idx = interface_info
+    
+    # Generate points uniformly distributed along the interface and in time
+    # Split n_points between spatial and temporal sampling
+    n_spatial = max(int(np.sqrt(n_points)), 1)
+    n_temporal = max(n_points // n_spatial, 1)
+    
+    if interface_type in ('vertical', 'periodic_vertical'):
+        # Constant x interface
+        from config import NUM_SUBDOMAINS_X
+        dx = (xmax - xmin) / NUM_SUBDOMAINS_X
+        
+        if interface_type == 'periodic_vertical':
+            # Periodic wrap-around: sample at x=xmax (which is equivalent to x=xmin due to periodic BC)
+            x_interface = xmax
+        else:
+            # Interior vertical interface
+            x_interface = xmin + position_idx * dx
+        
+        # Sample along y and t
+        y_vals = torch.empty(n_spatial, 1, device=device, dtype=torch.float32).uniform_(ymin, ymax).requires_grad_()
+        t_vals = torch.empty(n_temporal, 1, device=device, dtype=torch.float32).uniform_(tmin, tmax).requires_grad_()
+        
+        # Create meshgrid-like structure
+        y_grid = y_vals.repeat(n_temporal, 1)
+        t_grid = t_vals.repeat_interleave(n_spatial, dim=0)
+        x_grid = torch.full_like(y_grid, x_interface).requires_grad_()
+        
+    else:  # 'horizontal' or 'periodic_horizontal'
+        # Constant y interface
+        from config import NUM_SUBDOMAINS_Y
+        dy = (ymax - ymin) / NUM_SUBDOMAINS_Y
+        
+        if interface_type == 'periodic_horizontal':
+            # Periodic wrap-around: sample at y=ymax (which is equivalent to y=ymin due to periodic BC)
+            y_interface = ymax
+        else:
+            # Interior horizontal interface
+            y_interface = ymin + position_idx * dy
+        
+        # Sample along x and t
+        x_vals = torch.empty(n_spatial, 1, device=device, dtype=torch.float32).uniform_(xmin, xmax).requires_grad_()
+        t_vals = torch.empty(n_temporal, 1, device=device, dtype=torch.float32).uniform_(tmin, tmax).requires_grad_()
+        
+        # Create meshgrid-like structure
+        x_grid = x_vals.repeat(n_temporal, 1)
+        t_grid = t_vals.repeat_interleave(n_spatial, dim=0)
+        y_grid = torch.full_like(x_grid, y_interface).requires_grad_()
+    
+    # Ensure all have gradients enabled
+    if not x_grid.requires_grad:
+        x_grid = x_grid.requires_grad_()
+    if not y_grid.requires_grad:
+        y_grid = y_grid.requires_grad_()
+    if not t_grid.requires_grad:
+        t_grid = t_grid.requires_grad_()
+    
+    return [x_grid, y_grid, t_grid]
+
+
+def generate_subdomain_collocation(subdomain_bounds, n_residual, n_ic, 
+                                    tmin, tmax, startup_dt, device='cpu'):
+    """
+    Generate residual and IC collocation points within a subdomain.
+    
+    Args:
+        subdomain_bounds: Tuple (x_min, x_max, y_min, y_max)
+        n_residual: Number of residual collocation points
+        n_ic: Number of initial condition points
+        tmin, tmax: Time bounds
+        startup_dt: Time offset for PDE enforcement
+        device: PyTorch device
+    
+    Returns:
+        Tuple (colloc_domain, colloc_ic) where each is a list [x, y, t]
+    """
+    x_min, x_max, y_min, y_max = subdomain_bounds
+    
+    # Generate residual/domain collocation points
+    x_domain = torch.empty(n_residual, 1, device=device, dtype=torch.float32).uniform_(x_min, x_max).requires_grad_()
+    y_domain = torch.empty(n_residual, 1, device=device, dtype=torch.float32).uniform_(y_min, y_max).requires_grad_()
+    # Shift PDE enforcement to start at t = startup_dt (like original implementation)
+    t_domain = torch.empty(n_residual, 1, device=device, dtype=torch.float32).uniform_(max(tmin, startup_dt), tmax).requires_grad_()
+    colloc_domain = [x_domain, y_domain, t_domain]
+    
+    # Generate initial condition collocation points (at t=0)
+    x_ic = torch.empty(n_ic, 1, device=device, dtype=torch.float32).uniform_(x_min, x_max).requires_grad_()
+    y_ic = torch.empty(n_ic, 1, device=device, dtype=torch.float32).uniform_(y_min, y_max).requires_grad_()
+    t_ic = torch.empty(n_ic, 1, device=device, dtype=torch.float32).fill_(tmin).requires_grad_()
+    colloc_ic = [x_ic, y_ic, t_ic]
+    
+    return (colloc_domain, colloc_ic)
+
+
+def point_in_subdomain(x, y, subdomain_bounds):
+    """
+    Check if point(s) belong to a subdomain.
+    
+    Args:
+        x, y: Coordinates (can be scalars, arrays, or tensors)
+        subdomain_bounds: Tuple (x_min, x_max, y_min, y_max)
+    
+    Returns:
+        Boolean or boolean array indicating if points are in subdomain
+    """
+    x_min, x_max, y_min, y_max = subdomain_bounds
+    
+    # Handle both numpy arrays and torch tensors
+    if isinstance(x, torch.Tensor):
+        in_x = (x >= x_min) & (x <= x_max)
+        in_y = (y >= y_min) & (y <= y_max)
+    else:
+        in_x = (x >= x_min) & (x <= x_max)
+        in_y = (y >= y_min) & (y <= y_max)
+    
+    return in_x & in_y
+
+
+def get_exterior_boundary_info(subdomain_idx, nx_sub, ny_sub, xmin, xmax, ymin, ymax):
+    """
+    Determine which boundaries of a subdomain are exterior boundaries.
+    
+    Args:
+        subdomain_idx: Linear subdomain index
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+        xmin, xmax: Global domain x-bounds
+        ymin, ymax: Global domain y-bounds
+    
+    Returns:
+        Dict with keys 'left', 'right', 'bottom', 'top' indicating if boundary is exterior
+        and corresponding coordinate values
+    """
+    i, j = subdomain_idx_to_grid(subdomain_idx, nx_sub, ny_sub)
+    x_min, x_max, y_min, y_max = get_subdomain_bounds(subdomain_idx, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
+    
+    boundary_info = {
+        'left': (i == 0, x_min),           # Left edge of domain
+        'right': (i == nx_sub - 1, x_max), # Right edge of domain
+        'bottom': (j == 0, y_min),         # Bottom edge of domain
+        'top': (j == ny_sub - 1, y_max)    # Top edge of domain
+    }
+    
+    return boundary_info
+
+
+# ==================== XPINN Setup and Initialization ====================
+
+def setup_xpinn_devices(num_subdomains, device, use_multi_gpu=False):
+    """
+    Setup device assignment for XPINN subdomains.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        device: Default device
+        use_multi_gpu: Whether to use multi-GPU setup
+    
+    Returns:
+        Tuple (subdomain_devices, num_gpus)
+    """
+    if use_multi_gpu and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"Multi-GPU enabled: {num_gpus} GPUs available")
+        devices = [f"cuda:{i}" for i in range(num_gpus)]
+        subdomain_devices = [devices[i % len(devices)] for i in range(num_subdomains)]
+    else:
+        num_gpus = 1
+        subdomain_devices = [device] * num_subdomains
+    
+    return subdomain_devices, num_gpus
+
+
+def setup_xpinn_networks(num_subdomains, subdomain_devices, xmin, xmax, ymin, ymax, 
+                         dimension, num_neurons, num_layers, harmonics, 
+                         default_activation, nx_sub, ny_sub):
+    """
+    Initialize XPINN subdomain networks.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        subdomain_devices: List of device assignments per subdomain
+        xmin, xmax, ymin, ymax: Global domain bounds
+        dimension: Spatial dimension
+        num_neurons: Default number of neurons per layer
+        num_layers: Default number of hidden layers
+        harmonics: Default number of Fourier harmonics
+        default_activation: Default activation function type
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        List of initialized neural networks
+    """
+    from config import SUBDOMAIN_CONFIGS
+    from core.model_architecture import PINN
+    
+    # Validate subdomain configs
+    subdomain_configs = None
+    if SUBDOMAIN_CONFIGS and len(SUBDOMAIN_CONFIGS) != num_subdomains:
+        print(f"WARNING: SUBDOMAIN_CONFIGS has {len(SUBDOMAIN_CONFIGS)} entries but {num_subdomains} subdomains expected.")
+        print(f"         Using global defaults for all subdomains.")
+    elif SUBDOMAIN_CONFIGS:
+        subdomain_configs = SUBDOMAIN_CONFIGS
+    
+    nets = []
+    for i in range(num_subdomains):
+        # Get subdomain-specific configuration or use defaults
+        if subdomain_configs and i < len(subdomain_configs):
+            config = subdomain_configs[i]
+            sub_neurons = config.get('num_neurons', num_neurons)
+            sub_layers = config.get('num_layers', num_layers)
+            sub_harmonics = config.get('n_harmonics', harmonics)
+            sub_activation = config.get('activation', default_activation)
+        else:
+            sub_neurons = num_neurons
+            sub_layers = num_layers
+            sub_harmonics = harmonics
+            sub_activation = default_activation
+        
+        # Create network
+        net = PINN(num_neurons=sub_neurons, num_layers=sub_layers, 
+                  n_harmonics=sub_harmonics, activation_type=sub_activation)
+        
+        # Use GLOBAL domain for periodic embeddings
+        net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=dimension)
+        net = net.to(subdomain_devices[i])
+        nets.append(net)
+        
+        # Print configuration
+        subdomain_bounds = get_subdomain_bounds(i, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
+        print(f"  Subdomain {i}: bounds={subdomain_bounds}")
+        print(f"    Architecture: neurons={sub_neurons}, layers={sub_layers}, harmonics={sub_harmonics}, activation={sub_activation}, device={subdomain_devices[i]}")
+    
+    return nets
+
+
+def setup_xpinn_collocation(num_subdomains, subdomain_devices, xmin, xmax, ymin, ymax, 
+                            tmin, tmax, n_r, n_0, startup_dt, nx_sub, ny_sub):
+    """
+    Generate collocation points for XPINN subdomains.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        subdomain_devices: Device assignment per subdomain
+        xmin, xmax, ymin, ymax: Domain bounds
+        tmin, tmax: Time bounds
+        n_r: Total residual collocation points
+        n_0: Total IC collocation points
+        startup_dt: Time offset for PDE enforcement
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        Tuple (subdomain_collocs, subdomain_ic_collocs)
+    """
+    from core.data_generator import distribute_collocation_points
+    
+    # Distribute points
+    n_r_per_subdomain = distribute_collocation_points(n_r, num_subdomains)
+    n_0_per_subdomain = distribute_collocation_points(n_0, num_subdomains)
+    
+    subdomain_collocs = []
+    subdomain_ic_collocs = []
+    
+    for i in range(num_subdomains):
+        subdomain_bounds = get_subdomain_bounds(i, xmin, xmax, ymin, ymax, nx_sub, ny_sub)
+        colloc_domain, colloc_ic = generate_subdomain_collocation(
+            subdomain_bounds, n_r_per_subdomain[i], n_0_per_subdomain[i],
+            tmin, tmax, startup_dt, device=subdomain_devices[i]
+        )
+        subdomain_collocs.append(colloc_domain)
+        subdomain_ic_collocs.append(colloc_ic)
+    
+    return subdomain_collocs, subdomain_ic_collocs
+
+
+def setup_xpinn_interfaces(subdomain_devices, xmin, xmax, ymin, ymax, tmin, tmax, 
+                           n_interface, nx_sub, ny_sub):
+    """
+    Generate interface collocation points for XPINN.
+    
+    Args:
+        subdomain_devices: Device assignment per subdomain
+        xmin, xmax, ymin, ymax: Domain bounds
+        tmin, tmax: Time bounds
+        n_interface: Number of interface collocation points
+        nx_sub: Number of subdomain splits in x-direction
+        ny_sub: Number of subdomain splits in y-direction
+    
+    Returns:
+        Tuple (interfaces, interface_collocs)
+    """
+    interfaces = get_interfaces(nx_sub, ny_sub)
+    
+    interface_collocs = {}
+    for interface in interfaces:
+        subdomain_i, subdomain_j, _, _ = interface
+        interface_device = subdomain_devices[subdomain_i]
+        interface_points = generate_interface_points(
+            interface, xmin, xmax, ymin, ymax, tmin, tmax, n_interface, device=interface_device
+        )
+        interface_collocs[(subdomain_i, subdomain_j)] = interface_points
+    
+    return interfaces, interface_collocs
+
+
+def cache_xpinn_initial_conditions(num_subdomains, subdomain_ic_collocs, ic_functions):
+    """
+    Pre-compute and cache initial condition values for all subdomains.
+    
+    Args:
+        num_subdomains: Total number of subdomains
+        subdomain_ic_collocs: IC collocation points per subdomain
+        ic_functions: Dictionary of IC functions
+    
+    Returns:
+        List of cached IC dictionaries per subdomain
+    """
+    print("Caching IC values for all subdomains...")
+    cached_ic_values = []
+    
+    for i in range(num_subdomains):
+        colloc_ic = subdomain_ic_collocs[i]
+        ic_cache = {
+            'rho': ic_functions['rho'](colloc_ic),
+            'vx': ic_functions['vx'](colloc_ic),
+            'vy': ic_functions['vy'](colloc_ic),
+            'phi': ic_functions['phi'](colloc_ic)
+        }
+        cached_ic_values.append(ic_cache)
+    
+    print("IC values cached successfully!")
+    return cached_ic_values
+_register_module('methods.xpinn_decomposition', ['cache_xpinn_initial_conditions', 'generate_interface_points', 'generate_subdomain_collocation', 'get_exterior_boundary_info', 'get_interfaces', 'get_num_subdomains', 'get_subdomain_bounds', 'point_in_subdomain', 'setup_xpinn_collocation', 'setup_xpinn_devices', 'setup_xpinn_interfaces', 'setup_xpinn_networks', 'subdomain_idx_to_grid'])
+
 # ==== Module: utilities.training_diagnostics (utilities/training_diagnostics.py) ====
 import os
 import numpy as np
@@ -4123,13 +4101,13 @@ from core.model_architecture import PINN
 from methods.causal_training import compute_causal_weights_static
 from core.initial_conditions import (initialize_shared_velocity_fields, generate_power_spectrum_field, 
                                      generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0, func)
-from config import cs, const, G, rho_o, CONTINUITY_IC_WEIGHT, STARTUP_DT, DECAY_PORTION, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
+from config import cs, const, G, rho_o, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
 from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
 
 
 # ==================== Physics Calculations and Loss Functions ====================
 
-def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, fd_data=None, fd_weight=0.0, fd_batch_size=None, data_terms=None):
+def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, data_terms=None):
 
     ############## Loss based on initial conditions ###############
     rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
@@ -4175,69 +4153,6 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
         mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
         mse_vz_ic  =  mse_cost_function(vz_ic_out, vz_0)
 
-    ############## Continuity at t=0 to seed early-time evolution ###############
-    # Enforce rho_t(0) = -rho0 * div v0 at IC points
-    x_ic = collocation_IC[0]
-    if model.dimension == 1:
-        t_ic = collocation_IC[1]
-    elif model.dimension == 2:
-        y_ic = collocation_IC[1]
-        t_ic = collocation_IC[2]
-    elif model.dimension == 3:
-        y_ic = collocation_IC[1]
-        z_ic = collocation_IC[2]
-        t_ic = collocation_IC[3]
-
-    # For sinusoidal testing, do not apply continuity seeding at t=0
-    t_ic = t_ic.clone().detach().requires_grad_(not is_sin)
-    ic_inputs = [x_ic]
-    if model.dimension >= 2:
-        ic_inputs.append(y_ic)
-    if model.dimension == 3:
-        ic_inputs.append(z_ic)
-    ic_inputs.append(t_ic)
-    ic_outputs = net(ic_inputs)
-    rho_ic = ic_outputs[:,0:1]
-    if model.dimension == 1:
-        vx_ic = ic_outputs[:,1:2]
-        if is_sin:
-            continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
-        else:
-            rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-            vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
-            div_v0 = diff(vx0, x_ic, order=1)
-            # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-    elif model.dimension == 2:
-        if is_sin:
-            continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
-        else:
-            rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-            vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
-            vy0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
-            dvx_dx = diff(vx0, x_ic, order=1)
-            dvy_dy = diff(vy0, y_ic, order=1)
-            div_v0 = dvx_dx + dvy_dy
-            # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-    else: # dimension == 3
-        if is_sin:
-            continuity_ic_loss = torch.tensor(0.0, device= rho_ic.device, dtype=rho_ic.dtype)
-        else:
-            rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-            vx0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
-            vy0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
-            vz0 = fun_vz_0(lam, jeans, v_1, collocation_IC)
-            dvx_dx = diff(vx0, x_ic, order=1)
-            dvy_dy = diff(vy0, y_ic, order=1)
-            dvz_dz = diff(vz0, z_ic, order=1)
-            div_v0 = dvx_dx + dvy_dy + dvz_dz
-            # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-            rho0_field = rho_o * torch.ones_like(div_v0)
-            continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-
     ############## Loss based on PDE ###################################
     
     # Apply startup time offset to PDE collocation time only (IC remains at t=0)
@@ -4279,15 +4194,15 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
 
     ################### Combining the loss functions ####################
     if model.dimension == 1:
-        base = ic_weight * mse_vx_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_phi
+        base = ic_weight * mse_vx_ic + mse_rho + mse_velx + mse_phi
         loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
     elif model.dimension == 2:
-        base = ic_weight * (mse_vx_ic + mse_vy_ic) + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_phi
+        base = ic_weight * (mse_vx_ic + mse_vy_ic) + mse_rho + mse_velx + mse_vely + mse_phi
         loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
     elif model.dimension == 3:
-        base = ic_weight * (mse_vx_ic + mse_vy_ic + mse_vz_ic) + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
+        base = ic_weight * (mse_vx_ic + mse_vy_ic + mse_vz_ic) + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
         loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
     
@@ -4314,10 +4229,6 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     
     loss_breakdown['IC'] = ic_loss
     
-    # Continuity loss
-    if continuity_weight > 0 and continuity_ic_loss.item() > 0:
-        loss_breakdown['Continuity'] = (continuity_weight * continuity_ic_loss).item()
-    
     # PDE losses (grouped together)
     pde_loss = mse_rho.item() + mse_velx.item()
     
@@ -4330,18 +4241,7 @@ def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, o
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
 
-    data_terms_full = []
-    if fd_data is not None and fd_weight > 0:
-        data_terms_full.append({
-            'dataset': fd_data,
-            'weight': fd_weight,
-            'batch_size': fd_batch_size,
-            'label': 'FD_DATA'
-        })
-    if data_terms:
-        data_terms_full.extend(data_terms)
-
-    data_loss_tensor, data_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms_full)
+    data_loss_tensor, data_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms if data_terms else [])
     if data_loss_tensor is not None:
         loss = loss + data_loss_tensor
         for label, value in data_breakdown.items():
@@ -4449,7 +4349,7 @@ def _evaluate_data_terms(net, mse_cost_function, data_terms):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, continuity_weight, startup_dt, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, fd_data=None, fd_weight=0.0, fd_batch_size=None, use_fft_poisson=None, data_terms=None):
+                    rho_1, lam, jeans, v_1, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None, data_terms=None):
     """
     Batched closure function for training with optional causal weighting.
     
@@ -4469,17 +4369,6 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         device = collocation_domain.device
     
     ic_n = collocation_IC[0].size(0)
-
-    data_terms_full = []
-    if fd_data is not None and fd_weight > 0:
-        data_terms_full.append({
-            'dataset': fd_data,
-            'weight': fd_weight,
-            'batch_size': fd_batch_size if fd_batch_size is not None else batch_size,
-            'label': 'FD_DATA'
-        })
-    if data_terms:
-        data_terms_full.extend(data_terms)
 
     last_data_breakdown = {}
 
@@ -4531,66 +4420,6 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         elif model.dimension == 3:
             mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
             mse_vz_ic = mse_cost_function(vz_ic_out, vz_0)
-
-        # Continuity seeding at t=0 on IC points
-        x_ic = batch_ic[0]
-        if model.dimension == 1:
-            t_ic = batch_ic[1]
-        elif model.dimension == 2:
-            y_ic = batch_ic[1]
-            t_ic = batch_ic[2]
-        elif model.dimension == 3:
-            y_ic = batch_ic[1]
-            z_ic = batch_ic[2]
-            t_ic = batch_ic[3]
-
-        t_ic = t_ic.clone().detach().requires_grad_(not is_sin)
-        ic_inputs = [x_ic]
-        if model.dimension >= 2:
-            ic_inputs.append(y_ic)
-        if model.dimension == 3:
-            ic_inputs.append(z_ic)
-        ic_inputs.append(t_ic)
-        ic_outputs = net(ic_inputs)
-        rho_ic = ic_outputs[:,0:1]
-        if model.dimension == 1:
-            if is_sin:
-                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
-            else:
-                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
-                div_v0 = diff(vx0, x_ic, order=1)
-                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-        elif model.dimension == 2:
-            if is_sin:
-                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
-            else:
-                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
-                vy0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-                dvx_dx = diff(vx0, x_ic, order=1)
-                dvy_dy = diff(vy0, y_ic, order=1)
-                div_v0 = dvx_dx + dvy_dy
-                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
-        else:
-            if is_sin:
-                continuity_ic_loss = torch.tensor(0.0, device=rho_ic.device, dtype=rho_ic.dtype)
-            else:
-                rho_t_ic = torch.autograd.grad(rho_ic, t_ic, grad_outputs=torch.ones_like(rho_ic), create_graph=True)[0]
-                vx0 = fun_vx_0(lam, jeans, v_1, batch_ic)
-                vy0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-                vz0 = fun_vz_0(lam, jeans, v_1, batch_ic)
-                dvx_dx = diff(vx0, x_ic, order=1)
-                dvy_dy = diff(vy0, y_ic, order=1)
-                dvz_dz = diff(vz0, z_ic, order=1)
-                div_v0 = dvx_dx + dvy_dy + dvz_dz
-                # For standard density: rho_t ≈ -rho_o * ∇·v at t=0
-                rho0_field = rho_o * torch.ones_like(div_v0)
-                continuity_ic_loss = mse_cost_function(rho_t_ic, -rho0_field * div_v0)
 
         # PDE residuals on batched domain with startup shift
         if isinstance(batch_dom, (list, tuple)):
@@ -4647,13 +4476,13 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
             mse_phi  = torch.mean(phi_r ** 2)
 
         if model.dimension == 1:
-            base = mse_vx_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_phi
+            base = mse_vx_ic + mse_rho + mse_velx + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
         elif model.dimension == 2:
-            base = mse_vx_ic + mse_vy_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_phi
+            base = mse_vx_ic + mse_vy_ic + mse_rho + mse_velx + mse_vely + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
         else:
-            base = mse_vx_ic + mse_vy_ic + mse_vz_ic + continuity_weight * continuity_ic_loss + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
+            base = mse_vx_ic + mse_vy_ic + mse_vz_ic + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
             loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
 
         # Update residual tracker AFTER computing loss (only during Adam)
@@ -4667,8 +4496,8 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
                 else:
                     residual_tracker.update_residuals(t_dom, [rho_r, vx_r, vy_r, vz_r, phi_r])
 
-        if data_terms_full:
-            data_loss_batch, batch_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms_full)
+        if data_terms:
+            data_loss_batch, batch_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms)
             if data_loss_batch is not None:
                 loss = loss + data_loss_batch
                 last_data_breakdown = batch_breakdown
@@ -4701,10 +4530,6 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         ic_loss += mse_vz_ic.item()
     
     loss_breakdown['IC'] = ic_loss
-    
-    # Continuity loss
-    if continuity_weight > 0 and continuity_ic_loss.item() > 0:
-        loss_breakdown['Continuity'] = (continuity_weight * continuity_ic_loss).item()
     
     # PDE losses (grouped together)
     pde_loss = mse_rho.item() + mse_velx.item()
@@ -4878,11 +4703,11 @@ single PINN and XPINN decomposition training.
 import numpy as np
 import torch
 from utilities.training_diagnostics import TrainingDiagnostics
-from config import DECAY_PORTION, BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGNOSTICS
+from config import BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGNOSTICS
 from training.physics import closure_batched
 
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, fd_data=None, fd_weight=0.0, fd_batch_size=None, data_terms=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, data_terms=None):
     """
     Standard training loop for single PINN.
     
@@ -4911,17 +4736,6 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         window_idx: Current curriculum window index
         data_terms: Optional list of additional supervised datasets with weights
     """
-    # Batched training is the default
-    total_steps = iteration_adam + iterationL
-    total_for_decay = max(1, int(total_steps * DECAY_PORTION))
-
-    def cosine_schedule(step, total, start_value, end_value):
-        if total_for_decay <= 1:
-            return end_value
-        s = min(step, total_for_decay - 1)
-        cos_term = (1 + np.cos(np.pi * s / (total_for_decay - 1))) / 2.0
-        return end_value + (start_value - end_value) * cos_term
-
     bs = int(BATCH_SIZE)
     nb = int(NUM_BATCHES)
 
@@ -4929,12 +4743,8 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
 
     for i in range(iteration_adam):
         optimizer.zero_grad()
-        global_step = i
-        from config import CONTINUITY_IC_WEIGHT, STARTUP_DT
-        continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
-        startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=True, data_terms=data_terms))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True, data_terms=data_terms))
 
         with torch.autograd.no_grad():
             # Diagnostics logging every 50 iterations
@@ -4964,16 +4774,13 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
     for i in range(iterationL):
         optimizer.zero_grad()
         global_step = iteration_adam + i
-        from config import CONTINUITY_IC_WEIGHT, STARTUP_DT
-        continuity_weight = cosine_schedule(global_step, total_steps, CONTINUITY_IC_WEIGHT, 0.0)
-        startup_dt = cosine_schedule(global_step, total_steps, STARTUP_DT, 0.0)
 
         # L-BFGS expects a closure that returns only scalar loss
         # Store loss_breakdown in a list so we can access it after the step
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, continuity_weight, startup_dt, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, fd_data=fd_data, fd_weight=fd_weight, fd_batch_size=fd_batch_size, use_fft_poisson=False, data_terms=data_terms)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False, data_terms=data_terms)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
@@ -5378,7 +5185,7 @@ def _timed_call(label, fn, *args, **kwargs):
     return result
 
 from config import (SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, 
-                    TIMES_1D, a, KX, KY, KZ, FD_N_1D, FD_N_2D, FD_N_3D, POWER_EXPONENT, FILTER_SCALE, 
+                    TIMES_1D, a, KX, KY, KZ, FD_N_1D, FD_N_2D, FD_N_3D, POWER_EXPONENT, 
                     N_GRID, DIMENSION, SLICE_Y, SLICE_Z)
 from config import USE_XPINN, NUM_SUBDOMAINS_X, NUM_SUBDOMAINS_Y, SHOW_INTERFACE_LINES, INTERFACE_AVERAGING, RANDOM_SEED, SHOW_LINEAR_THEORY
 
@@ -7636,11 +7443,10 @@ _register_module('visualization.Plotting_2D', ['Two_D_surface_plots', 'Two_D_sur
 # ==== Module: train (train.py) ====
 import os
 import sys
-import json
 import shutil
 import numpy as np
 import time
-from typing import Tuple, Optional, Dict
+from typing import Tuple
 import torch
 import torch.nn as nn
 
@@ -7675,7 +7481,6 @@ from config import CAUSAL_GAMMA_MAX, CAUSAL_GAMMA_MIN
 from config import CAUSAL_EPSILON, CAUSAL_EPSILON_FLOOR, CAUSAL_NUM_TIME_BINS
 from config import USE_EPSILON_ANNEALING, CAUSAL_EPSILON_MIN, CAUSAL_EPSILON_MAX
 from config import CAUSAL_ADAM_PER_WINDOW, CAUSAL_LBFGS_PER_WINDOW
-from config import USE_FD_DATA, FD_DATA_PATH, FD_DATA_WEIGHT, FD_DATA_BATCH_SIZE
 from core.losses import ASTPN, XPINN_Loss
 from core.model_architecture import PINN
 from visualization.Plotting_2D import create_2d_animation
@@ -7706,39 +7511,6 @@ def _save_trained_models(nets, use_xpinn):
             print(f"Saved {len(nets)} subdomain models to {model_dir}")
     except Exception as e:
         print(f"Warning: failed to save model: {e}")
-
-
-def load_fd_anchor_points(path: str, device: torch.device) -> Dict[str, torch.Tensor]:
-    """Load FD anchor points generated in Phase 1 as tensors on the target device."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"FD anchor file not found: {path}")
-
-    with open(path, "r") as f:
-        raw_data = json.load(f)
-
-    if not raw_data:
-        raise ValueError(f"FD anchor file {path} is empty.")
-
-    device_obj = torch.device(device)
-
-    def tensor_from_key(key: str) -> torch.Tensor:
-        return torch.tensor(
-            [float(entry[key]) for entry in raw_data],
-            dtype=torch.float32,
-            device=device_obj,
-        ).unsqueeze(-1)
-
-    dataset: Dict[str, Optional[torch.Tensor]] = {
-        "x": tensor_from_key("x"),
-        "y": tensor_from_key("y"),
-        "t": tensor_from_key("t"),
-        "rho": tensor_from_key("rho"),
-        "vx": tensor_from_key("vx") if "vx" in raw_data[0] else None,
-        "vy": tensor_from_key("vy") if "vy" in raw_data[0] else None,
-    }
-
-    dataset["count"] = dataset["x"].size(0)
-    return dataset
 
 
 def clean_pycache(root_dir: str) -> Tuple[int, int]:
@@ -7815,21 +7587,6 @@ if str(PERTURBATION_TYPE).lower() == "power_spectrum":
     from visualization.Plotting_2D import set_shared_velocity_fields
     set_shared_velocity_fields(vx_np, vy_np)
 
-# Load FD anchor dataset if enabled
-fd_dataset: Optional[Dict[str, Optional[torch.Tensor]]] = None
-fd_data_batch_size: Optional[int] = None
-if USE_FD_DATA:
-    try:
-        fd_dataset = load_fd_anchor_points(FD_DATA_PATH, device)
-        fd_data_batch_size = int(max(1, min(FD_DATA_BATCH_SIZE, fd_dataset["count"])))
-        print(f"Loaded FD anchor dataset with {fd_dataset['count']} points from {FD_DATA_PATH}")
-    except Exception as fd_err:
-        print(f"[WARN] Unable to load FD anchor dataset: {fd_err}")
-        fd_dataset = None
-        fd_data_batch_size = None
-
-fd_weight_active = FD_DATA_WEIGHT if (USE_FD_DATA and fd_dataset is not None) else 0.0
-
 # ==================== MODE SWITCHING: ORIGINAL PINN vs XPINN ====================
 
 if not USE_XPINN:
@@ -7893,10 +7650,7 @@ if not USE_XPINN:
             v_1=v_1,
             device=device,
             causal_gamma=0.0,
-            causal_mode="none",
-            fd_data=fd_dataset if fd_dataset is not None else None,
-            fd_weight=fd_weight_active,
-            fd_batch_size=fd_data_batch_size
+            causal_mode="none"
         )
     else:
         # Causal training using CausalTrainer module
@@ -7951,10 +7705,7 @@ if not USE_XPINN:
             'rho_1': rho_1,
             'lam': lam,
             'jeans': jeans,
-            'v_1': v_1,
-            'fd_data': fd_dataset if fd_dataset is not None else None,
-            'fd_weight': fd_weight_active,
-            'fd_batch_size': fd_data_batch_size
+            'v_1': v_1
         }
         
         if USE_CAUSAL_CURRICULUM:
@@ -8124,5 +7875,5 @@ else:
 script_root = os.path.dirname(os.path.abspath(__file__))
 print("Performing final Python cache cleanup...")
 clean_pycache(script_root)
-_register_module('train', ['_save_trained_models', 'clean_pycache', 'device', 'fd_data_batch_size', 'fd_dataset', 'fd_weight_active', 'has_gpu', 'has_mps', 'initial_params', 'load_fd_anchor_points', 'script_root', 'xmax', 'ymax', 'zmax'])
+_register_module('train', ['_save_trained_models', 'clean_pycache', 'device', 'has_gpu', 'has_mps', 'initial_params', 'script_root', 'xmax', 'ymax', 'zmax'])
 

@@ -1,10 +1,10 @@
 import numpy as np
 
 # Random seed for reproducibility across all functions
-RANDOM_SEED = 77
+RANDOM_SEED = 93
 
 # Perturbation selection: "power_spectrum" or "sinusoidal"
-PERTURBATION_TYPE = "sinusoidal"
+PERTURBATION_TYPE = "power_spectrum"
 
 xmin = 0.0
 ymin = 0.0
@@ -15,19 +15,19 @@ const = 1.0
 G = 1.0
 
 # Collocation point parameters
-N_0 = 5000  # Number of initial condition points
-N_r = 20000 # Number of residual/collocation points
-DIMENSION = 3  # Spatial dimension
+N_0 = 70000  # Number of initial condition points
+N_r = 70000 # Number of residual/collocation points
+DIMENSION = 2  # Spatial dimension
 
 # Number of collocation/IC points per mini-batch and
 # how many such mini-batches to aggregate in a single optimizer step
-BATCH_SIZE = (N_0 + N_r) if PERTURBATION_TYPE == "sinusoidal" else 70000
+BATCH_SIZE = (N_0 + N_r) if N_0 + N_r < 70000 else 70000
 NUM_BATCHES = 1
 
-a = 0.03
+a = 0.1
 
 tmin = 0.
-tmax = 8.0
+tmax = 3.0
 
 num_neurons = 64
 harmonics = 3
@@ -52,7 +52,7 @@ SNAPSHOT_DIR = "/kaggle/working/"
 ENABLE_TRAINING_DIAGNOSTICS = True  # Enable automatic training diagnostics plots and logging
 
 # Density growth comparison plot controls
-PLOT_DENSITY_GROWTH = False
+PLOT_DENSITY_GROWTH = True
 GROWTH_PLOT_TMAX = 4.0
 GROWTH_PLOT_DT = 0.1
 
@@ -70,13 +70,14 @@ SHOW_LINEAR_THEORY = False
 # Power spectrum parameters
 N_GRID = 400  # Grid resolution for power spectrum generation
 POWER_EXPONENT = -4  # Power spectrum exponent
-FILTER_SCALE = 0  # Filter scale (Rf)
 STARTUP_DT = 0.01 # Time offset after which PDE is enforced (ICs remain at t=0)
-CONTINUITY_IC_WEIGHT = 0.0 # Weight for enforcing continuity at t=0: rho_t(0) = -rho0 * div v0
-DECAY_PORTION = 0.5 # Fraction of total training steps over which to fully decay
+USE_PARAMETERIZATION = "none"  # Options: "exponential", "linear", "none"
+# - "exponential": ρ = ρ₀ * exp(t_eff * ρ̂) - strictly positive
+# - "linear": ρ = ρ₀ + t_eff * ρ̂ - can go negative
+# - "none": ρ = ρ̂ directly for t ≥ STARTUP_DT, ρ = ρ₀ for t < STARTUP_DT
 
 # ==================== Causal Training Configuration ====================
-USE_CAUSAL_TRAINING = True
+USE_CAUSAL_TRAINING = False
 
 CAUSAL_WEIGHTING_MODE = "static"  # "static" or "adaptive"
 
@@ -137,9 +138,3 @@ CACHE_IC_VALUES = True  # True = precompute and cache IC values for faster train
 # Visualization
 SHOW_INTERFACE_LINES = True  # Draw subdomain boundaries in plots
 INTERFACE_AVERAGING = 'mean'  # Combine overlapping predictions: 'mean', 'weighted', 'subdomain1', 'subdomain2'
-
-# ==================== FD Data Assisted Training Configuration ====================
-USE_FD_DATA = False
-FD_DATA_PATH = "/kaggle/input/power-test184/anchor_points.json"
-FD_DATA_WEIGHT = 0.005
-FD_DATA_BATCH_SIZE = 512
