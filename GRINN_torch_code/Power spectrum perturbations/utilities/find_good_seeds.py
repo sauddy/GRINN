@@ -29,11 +29,11 @@ from config import (
 # =============================================================================
 
 # Grid & Domain Parameters
-N = 400                    # Grid resolution (Nx = Ny)
+N = 1200                    # Grid resolution (Nx = Ny)
 nu = 0.25                   # Courant number for stability
 lam = wave                  # Wavelength (from config.py)
 # num_of_waves is imported from config.py above
-time = 4.0                 # Time to evaluate (should match time_points[0] from analyze_lax.py)
+time = 3.0                 # Time to evaluate (should match time_points[0] from analyze_lax.py)
 
 # Physical Constants (all from config.py)
 # a, cs, rho_o, xmin, ymin are imported from config.py above
@@ -46,7 +46,7 @@ gravity = True            # Whether to include self-gravity
 BOUNDARY_THRESHOLD = 0.25  # 15% of domain size from edges
 
 # Seed search range
-NUM_SEEDS_TO_TEST = 100  # Number of seeds to test (from RANDOM_SEED to RANDOM_SEED + NUM_SEEDS_TO_TEST)
+NUM_SEEDS_TO_TEST = 50  # Number of seeds to test (from RANDOM_SEED to RANDOM_SEED + NUM_SEEDS_TO_TEST)
 
 # Solver backend selection: "cpu" uses numerical_solvers.LAX (reference implementation),
 # "torch" uses numerical_solvers.LAX_torch (experimental GPU version)

@@ -10,7 +10,7 @@ from core.data_generator import diff
 from core.model_architecture import PINN
 from methods.causal_training import compute_causal_weights_static
 from core.initial_conditions import (initialize_shared_velocity_fields, generate_power_spectrum_field, 
-                                     generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0, func)
+                                     generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0)
 from config import cs, const, G, rho_o, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
 from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
 
@@ -259,7 +259,7 @@ def _evaluate_data_terms(net, mse_cost_function, data_terms):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None, data_terms=None):
+                    rho_1, lam, jeans, v_1, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None, data_terms=None, collocation_poisson_ic=None):
     """
     Batched closure function for training with optional causal weighting.
     
@@ -414,6 +414,31 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
 
         total_loss = total_loss + loss
         num_effective_batches += 1
+    
+    # Add Poisson IC loss (Option 3: Pure ML approach for initial phi)
+    # This enforces Poisson equation at t=0 with extra collocation points
+    mse_poisson_ic = 0.0
+    mse_phi_mean = 0.0
+    if collocation_poisson_ic is not None:
+        from core.losses import poisson_residue_only
+        from config import POISSON_IC_WEIGHT, PHI_MEAN_CONSTRAINT_WEIGHT
+        
+        # Only compute and add Poisson IC loss if weight is non-zero
+        if POISSON_IC_WEIGHT > 0:
+            # Enforce Poisson equation: ∇²φ = const*(ρ-ρ₀)
+            phi_r_ic = poisson_residue_only(collocation_poisson_ic, net, dimension=model.dimension)
+            mse_poisson_ic = torch.mean(phi_r_ic ** 2)
+            total_loss = total_loss + POISSON_IC_WEIGHT * mse_poisson_ic
+        
+        # Only compute and add phi mean constraint if weight is non-zero
+        if PHI_MEAN_CONSTRAINT_WEIGHT > 0:
+            # Enforce mean(φ) = 0 at t=0 to fix gauge freedom (Option A)
+            # This removes the arbitrary constant offset in φ
+            net_output_ic = net(collocation_poisson_ic)
+            phi_ic = net_output_ic[:, -1]  # Last output is phi
+            mean_phi = torch.mean(phi_ic)
+            mse_phi_mean = mean_phi ** 2
+            total_loss = total_loss + PHI_MEAN_CONSTRAINT_WEIGHT * mse_phi_mean
 
     optimizer.zero_grad()
     avg_loss = total_loss / max(1, num_effective_batches)
@@ -452,6 +477,12 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
+    
+    # Add Poisson IC loss to breakdown if it was computed
+    if isinstance(mse_poisson_ic, torch.Tensor):
+        loss_breakdown['Poisson_IC'] = mse_poisson_ic.item()
+    if isinstance(mse_phi_mean, torch.Tensor):
+        loss_breakdown['Phi_Mean'] = mse_phi_mean.item()
     
     for label, value in last_data_breakdown.items():
         loss_breakdown[label] = value

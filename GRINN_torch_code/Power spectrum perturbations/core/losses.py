@@ -160,6 +160,61 @@ def pde_residue_standard(colloc, net, dimension = 1):
         return rho_r,vx_r,vy_r,vz_r,phi_r
 
 
+def poisson_residue_only(colloc, net, dimension=1):
+    """
+    Compute only the Poisson equation residual: ∇²φ - const*(ρ - ρ₀)
+    
+    This is used for extra enforcement at t=0 (Option 3: Pure ML approach).
+    By evaluating Poisson residual on many t=0 points, we ensure φ is 
+    correctly initialized without using numerical solvers.
+    
+    Args:
+        colloc: Collocation points [x, (y), (z), t]
+        net: Neural network
+        dimension: Spatial dimension (1, 2, or 3)
+    
+    Returns:
+        phi_r: Poisson residual tensor
+    """
+    net_outputs = net(colloc)
+    
+    x = colloc[0]
+    
+    if dimension == 1:
+        t = colloc[1]
+        phi = net_outputs[:, 2:3]
+        phi_x_x = diff(phi, x, order=2)
+        
+    elif dimension == 2:
+        y = colloc[1]
+        t = colloc[2]
+        phi = net_outputs[:, 3:4]
+        phi_x_x = diff(phi, x, order=2)
+        phi_y_y = diff(phi, y, order=2)
+        
+    elif dimension == 3:
+        y = colloc[1]
+        z = colloc[2]
+        t = colloc[3]
+        phi = net_outputs[:, 4:5]
+        phi_x_x = diff(phi, x, order=2)
+        phi_y_y = diff(phi, y, order=2)
+        phi_z_z = diff(phi, z, order=2)
+    
+    # Get density
+    rho = net_outputs[:, 0:1]
+    
+    # Compute Poisson residual
+    if dimension == 1:
+        phi_r = phi_x_x - const*(rho - rho_o)
+    elif dimension == 2:
+        phi_r = phi_x_x + phi_y_y - const*(rho - rho_o)
+    elif dimension == 3:
+        phi_r = phi_x_x + phi_y_y + phi_z_z - const*(rho - rho_o)
+    
+    return phi_r
+
+
 class XPINN_Loss:
     """
     XPINN Loss computation for domain decomposition.

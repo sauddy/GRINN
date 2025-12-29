@@ -1,7 +1,7 @@
 import numpy as np
 
 # Random seed for reproducibility across all functions
-RANDOM_SEED = 93
+RANDOM_SEED = 9
 
 # Perturbation selection: "power_spectrum" or "sinusoidal"
 PERTURBATION_TYPE = "power_spectrum"
@@ -15,13 +15,13 @@ const = 1.0
 G = 1.0
 
 # Collocation point parameters
-N_0 = 70000  # Number of initial condition points
-N_r = 70000 # Number of residual/collocation points
+N_0 = 30000  # Number of initial condition points
+N_r = 30000 # Number of residual/collocation points
 DIMENSION = 2  # Spatial dimension
 
 # Number of collocation/IC points per mini-batch and
 # how many such mini-batches to aggregate in a single optimizer step
-BATCH_SIZE = (N_0 + N_r) if N_0 + N_r < 70000 else 70000
+BATCH_SIZE = 60000
 NUM_BATCHES = 1
 
 a = 0.1
@@ -31,16 +31,21 @@ tmax = 3.0
 
 num_neurons = 64
 harmonics = 3
-num_layers = 5
+num_layers = 6
 
 wave = 7.0
 k = 2 * np.pi / wave
-num_of_waves = 2.0
+num_of_waves = 6.0
 
 iteration_adam_2D = 1001
-iteration_lbgfs_2D = 201
+iteration_lbgfs_2D = 251
 
 IC_WEIGHT = 1.0
+
+# Extra collocation points at t=0 to strongly enforce Poisson equation
+N_POISSON_IC = 0  # Number of extra spatial points at t=0 for Poisson
+POISSON_IC_WEIGHT = 0.0  # Weight for Poisson residual at t=0 (higher = stronger enforcement)
+PHI_MEAN_CONSTRAINT_WEIGHT = 0.0  # Weight for mean(φ)=0 constraint at t=0 (fixes gauge freedom)
 
 # Output/snapshot controls
 SAVE_STATIC_SNAPSHOTS = False
@@ -62,19 +67,17 @@ KZ = 0
 TIMES_1D = [2.5, 5.0, 7.5] # 1D cross-section times to plot (used for sinusoidal panel plots
 FD_N_1D = 300  # Grid points for 1D LAX (when used)
 FD_N_2D = 300  # Grid points per dimension for 2D LAX
-FD_N_3D = 300   # Grid points per dimension for 3D LAX slices
+FD_N_3D = 300  # Grid points per dimension for 3D LAX slices
 SLICE_Y = 0.6  # Default y slice for visualization/cross-sections
 SLICE_Z = 0.6  # Default z slice for visualization/cross-sections
 SHOW_LINEAR_THEORY = False
 
 # Power spectrum parameters
-N_GRID = 400  # Grid resolution for power spectrum generation
+N_GRID = 1200  # Grid resolution for power spectrum generation
+N_GRID_3D = 300 #In 3D
 POWER_EXPONENT = -4  # Power spectrum exponent
 STARTUP_DT = 0.01 # Time offset after which PDE is enforced (ICs remain at t=0)
-USE_PARAMETERIZATION = "none"  # Options: "exponential", "linear", "none"
-# - "exponential": ρ = ρ₀ * exp(t_eff * ρ̂) - strictly positive
-# - "linear": ρ = ρ₀ + t_eff * ρ̂ - can go negative
-# - "none": ρ = ρ̂ directly for t ≥ STARTUP_DT, ρ = ρ₀ for t < STARTUP_DT
+USE_PARAMETERIZATION = "exponential"  # Options: "exponential", "linear", "none"
 
 # ==================== Causal Training Configuration ====================
 USE_CAUSAL_TRAINING = False

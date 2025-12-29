@@ -156,11 +156,24 @@ class FDSolutionManager:
         rho_1 = self.rho_1
 
         if backend_key == "gpu":
-            x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
-                time_val=time_value, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
-                vel_rms=a*cs, random_seed=RANDOM_SEED
-            )
+            # Use shared velocity fields if available for power spectrum perturbations
+            if use_velocity_ps and self.shared_vx is not None and self.shared_vy is not None:
+                n_shared = int(self.shared_vx.shape[0])
+                if n_shared != N:
+                    print(f"Shared velocity fields available at resolution {n_shared}. Using that instead of N={N}.")
+                    N = n_shared
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
+                    time_val=time_value, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                    gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
+                    vel_rms=a*cs, random_seed=RANDOM_SEED,
+                    vx0_shared=self.shared_vx, vy0_shared=self.shared_vy
+                )
+            else:
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = lax_solution_torch(
+                    time_val=time_value, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                    gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
+                    vel_rms=a*cs, random_seed=RANDOM_SEED
+                )
             x_fd = np.asarray(x_fd)
         else:
             if use_velocity_ps and self.shared_vx is not None and self.shared_vy is not None:
@@ -286,6 +299,8 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         show_plot: Whether to show the plot immediately (default: True). Set to False to show later.
         fd_cache: Instance of FDSolutionManager for reusing FD solutions.
     """
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+    
     xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
     num_of_waves = (xmax - xmin) / lam
     z_slice = SLICE_Z if DIMENSION >= 3 else None
@@ -308,7 +323,7 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
     print(f"Time points: {time_points}")
     
     # Create subplot grid
-    fig, axes = plt.subplots(num_times, 3, figsize=(15, 4*num_times))
+    fig, axes = plt.subplots(num_times, 3, figsize=(15, 4*num_times), constrained_layout=True)
     if num_times == 1:
         axes = axes.reshape(1, -1)
     
@@ -448,6 +463,12 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         eps = 1e-6
         epsilon_metric = 200.0 * np.abs(pinn_field - fd_field) / (pinn_field + fd_field + eps)
         
+        # Calculate percentile metrics
+        median_eps = np.median(epsilon_metric)
+        p75_eps = np.percentile(epsilon_metric, 75)
+        p90_eps = np.percentile(epsilon_metric, 90)
+        p99_eps = np.percentile(epsilon_metric, 99)
+        
         # Column 1: PINN
         ax_pinn = axes[i, 0]
         if which == "density":
@@ -503,6 +524,23 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         cbar_diff = plt.colorbar(pc_diff, ax=ax_diff, shrink=0.6)
         cbar_diff.ax.set_title("ε (%)", fontsize=14)
         
+        # NOW ADD HISTOGRAM AND ANNOTATION (after ax_diff is created)
+        axins = inset_axes(ax_diff, width="35%", height="30%", loc='upper right')
+        hist_data = epsilon_metric.flatten()
+        hist_data = hist_data[hist_data < np.percentile(hist_data, 99.5)]  # Clip outliers for viz
+        axins.hist(hist_data, bins=40, color='steelblue', alpha=0.7, edgecolor='black', linewidth=0.5)
+        axins.axvline(median_eps, color='red', linestyle='--', linewidth=2)
+        axins.set_xlabel('ε (%)', fontsize=7)
+        axins.set_ylabel('Pixels', fontsize=7)
+        axins.tick_params(labelsize=6)
+        axins.set_title(f'Med={median_eps:.1f}%, 90th={p90_eps:.1f}%', fontsize=7)
+        
+        # Add text annotation to main error plot
+        ax_diff.text(0.02, 0.02, 
+                    f'Median: {median_eps:.1f}%\n75th: {p75_eps:.1f}%\n90th: {p90_eps:.1f}%',
+                    transform=ax_diff.transAxes, fontsize=9, verticalalignment='bottom',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
         # Add axis labels
         if i == num_times - 1:
             ax_pinn.set_xlabel("x")
@@ -511,7 +549,7 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         
         ax_pinn.set_ylabel("y")
     
-    plt.tight_layout()
+    #plt.tight_layout()
     
     # Save the figure if requested
     if save_plots:

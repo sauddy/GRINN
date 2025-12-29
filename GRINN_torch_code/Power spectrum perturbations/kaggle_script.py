@@ -450,7 +450,49 @@ def distribute_collocation_points(n_total, num_subdomains):
         counts[i] += 1
     
     return counts
-_register_module('core.data_generator', ['col_gen', 'diff', 'distribute_collocation_points', 'input_taker', 'req_consts_calc'])
+
+
+def generate_poisson_ic_points(rmin, rmax, n_points, dimension=2, device='cuda'):
+    """
+    Generate extra collocation points at t=0 specifically for enforcing Poisson equation.
+    
+    This implements Option 3: Pure ML approach to fix initial phi by sampling many
+    spatial points at t=0 where Poisson equation ∇²φ = const*(ρ-ρ₀) must be satisfied.
+    
+    Args:
+        rmin: List of minimum values [xmin, ymin, (zmin), tmin]
+        rmax: List of maximum values [xmax, ymax, (zmax), tmax]
+        n_points: Number of spatial points to generate at t=0
+        dimension: Spatial dimension (1, 2, or 3)
+        device: PyTorch device ('cuda' or 'cpu')
+    
+    Returns:
+        List of tensors [x, y, (z), t] where t=0 everywhere
+    """
+    import torch
+    
+    coor = []
+    
+    if dimension == 1:
+        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
+        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
+        coor = [x_ic, t_ic]
+    
+    elif dimension == 2:
+        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
+        y_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[1], rmax[1]).requires_grad_()
+        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
+        coor = [x_ic, y_ic, t_ic]
+    
+    elif dimension == 3:
+        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
+        y_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[1], rmax[1]).requires_grad_()
+        z_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[2], rmax[2]).requires_grad_()
+        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
+        coor = [x_ic, y_ic, z_ic, t_ic]
+    
+    return coor
+_register_module('core.data_generator', ['col_gen', 'diff', 'distribute_collocation_points', 'generate_poisson_ic_points', 'input_taker', 'req_consts_calc'])
 
 # ==== Module: numerical_solvers.LAX (numerical_solvers/LAX.py) ====
 import numpy as np
@@ -590,12 +632,10 @@ def fft_solver(rho, Lx, nx, Ly, ny, dim = None):
     kx = 2 * np.pi * np.fft.fftfreq(nx, dx)
     ky = 2 * np.pi * np.fft.fftfreq(ny, dy)
 
-    # Construct the Laplacian operator in Fourier space
-    kx2, ky2 = np.meshgrid(kx**2, ky**2)
-    laplace = -(kx2 + ky2)
-
-    ## Correction for the dicrete FFT.  Need to check the calculations
-#     laplace = 2*(np.cos(kx*dx)-1)/(dx**2) +  2*(np.cos(ky*dx)-1)/(dy**2)
+    # Construct the discrete Laplacian operator in Fourier space
+    # This ensures consistency with finite-difference gradients used in LAX scheme
+    kx_mesh, ky_mesh = np.meshgrid(kx, ky)
+    laplace = 2*(np.cos(kx_mesh*dx)-1)/(dx**2) + 2*(np.cos(ky_mesh*dy)-1)/(dy**2)
 
     laplace[laplace == 0] = 1e-9
 
@@ -620,8 +660,9 @@ def fft_solver_3d(rho, Lx, nx, Ly, ny, Lz, nz):
     kx = 2 * np.pi * np.fft.fftfreq(nx, dx)
     ky = 2 * np.pi * np.fft.fftfreq(ny, dy)
     kz = 2 * np.pi * np.fft.fftfreq(nz, dz)
-    kx2, ky2, kz2 = np.meshgrid(kx**2, ky**2, kz**2, indexing='ij')
-    laplace = -(kx2 + ky2 + kz2)
+    kx_mesh, ky_mesh, kz_mesh = np.meshgrid(kx, ky, kz, indexing='ij')
+    # Use discrete Laplacian for consistency with finite-difference scheme
+    laplace = 2*(np.cos(kx_mesh*dx)-1)/(dx**2) + 2*(np.cos(ky_mesh*dy)-1)/(dy**2) + 2*(np.cos(kz_mesh*dz)-1)/(dz**2)
     laplace[laplace == 0] = 1e-9
     phihat = rhohat / laplace
     phi = np.real(ifftn(phihat))
@@ -1380,13 +1421,12 @@ def fft_solver_torch(rho, Lx, nx, Ly, ny):
     kx = 2 * np.pi * torch.fft.fftfreq(nx, d=dx).to(device)
     ky = 2 * np.pi * torch.fft.fftfreq(ny, d=dy).to(device)
     
-    # Construct the Laplacian operator in Fourier space
-    # Match NumPy exactly: default meshgrid uses 'xy' which gives (ny, nx)
-    # But we need to transpose to match FFT2 output (nx, ny)
-    kx2, ky2 = torch.meshgrid(kx**2, ky**2, indexing='xy')
-    # NumPy meshgrid('xy') creates (ny, nx), but FFT2 output is (nx, ny)
-    # So we transpose to match the FFT layout
-    laplace = -(kx2.T + ky2.T)
+    # Construct the discrete Laplacian operator in Fourier space
+    # This ensures consistency with finite-difference gradients used in LAX scheme
+    kx_mesh, ky_mesh = torch.meshgrid(kx, ky, indexing='xy')
+    # Transpose to match FFT2 output layout (nx, ny)
+    laplace = (2*(torch.cos(kx_mesh.T*dx)-1)/(dx**2) + 
+               2*(torch.cos(ky_mesh.T*dy)-1)/(dy**2))
     
     # Handle zero mode (k=0) - set to small value to avoid division by zero
     laplace = torch.where(laplace == 0, torch.tensor(1e-9, device=device, dtype=dtype), laplace)
@@ -1407,8 +1447,11 @@ def fft_solver_torch_3d(rho, Lx, nx, Ly, ny, Lz, nz):
     kx = 2 * np.pi * torch.fft.fftfreq(nx, d=dx).to(device)
     ky = 2 * np.pi * torch.fft.fftfreq(ny, d=dy).to(device)
     kz = 2 * np.pi * torch.fft.fftfreq(nz, d=dz).to(device)
-    kx2, ky2, kz2 = torch.meshgrid(kx**2, ky**2, kz**2, indexing='ij')
-    laplace = -(kx2 + ky2 + kz2)
+    kx_mesh, ky_mesh, kz_mesh = torch.meshgrid(kx, ky, kz, indexing='ij')
+    # Use discrete Laplacian for consistency with finite-difference scheme
+    laplace = (2*(torch.cos(kx_mesh*dx)-1)/(dx**2) + 
+               2*(torch.cos(ky_mesh*dy)-1)/(dy**2) + 
+               2*(torch.cos(kz_mesh*dz)-1)/(dz**2))
     laplace = torch.where(laplace == 0, torch.tensor(1e-9, device=device, dtype=dtype), laplace)
     phihat = rhohat / laplace
     phi = torch.real(torch.fft.ifftn(phihat))
@@ -2507,6 +2550,61 @@ def pde_residue_standard(colloc, net, dimension = 1):
         return rho_r,vx_r,vy_r,vz_r,phi_r
 
 
+def poisson_residue_only(colloc, net, dimension=1):
+    """
+    Compute only the Poisson equation residual: ∇²φ - const*(ρ - ρ₀)
+    
+    This is used for extra enforcement at t=0 (Option 3: Pure ML approach).
+    By evaluating Poisson residual on many t=0 points, we ensure φ is 
+    correctly initialized without using numerical solvers.
+    
+    Args:
+        colloc: Collocation points [x, (y), (z), t]
+        net: Neural network
+        dimension: Spatial dimension (1, 2, or 3)
+    
+    Returns:
+        phi_r: Poisson residual tensor
+    """
+    net_outputs = net(colloc)
+    
+    x = colloc[0]
+    
+    if dimension == 1:
+        t = colloc[1]
+        phi = net_outputs[:, 2:3]
+        phi_x_x = diff(phi, x, order=2)
+        
+    elif dimension == 2:
+        y = colloc[1]
+        t = colloc[2]
+        phi = net_outputs[:, 3:4]
+        phi_x_x = diff(phi, x, order=2)
+        phi_y_y = diff(phi, y, order=2)
+        
+    elif dimension == 3:
+        y = colloc[1]
+        z = colloc[2]
+        t = colloc[3]
+        phi = net_outputs[:, 4:5]
+        phi_x_x = diff(phi, x, order=2)
+        phi_y_y = diff(phi, y, order=2)
+        phi_z_z = diff(phi, z, order=2)
+    
+    # Get density
+    rho = net_outputs[:, 0:1]
+    
+    # Compute Poisson residual
+    if dimension == 1:
+        phi_r = phi_x_x - const*(rho - rho_o)
+    elif dimension == 2:
+        phi_r = phi_x_x + phi_y_y - const*(rho - rho_o)
+    elif dimension == 3:
+        phi_r = phi_x_x + phi_y_y + phi_z_z - const*(rho - rho_o)
+    
+    return phi_r
+
+
 class XPINN_Loss:
     """
     XPINN Loss computation for domain decomposition.
@@ -2785,7 +2883,7 @@ class XPINN_Loss:
         total_loss = sum(loss_dict.values())
         
         return total_loss, loss_dict
-_register_module('core.losses', ['ASTPN', 'XPINN_Loss', 'pde_residue', 'pde_residue_standard'])
+_register_module('core.losses', ['ASTPN', 'XPINN_Loss', 'pde_residue', 'pde_residue_standard', 'poisson_residue_only'])
 
 # ==== Module: core.model_architecture (core/model_architecture.py) ====
 import numpy as np
@@ -4100,7 +4198,7 @@ from core.data_generator import diff
 from core.model_architecture import PINN
 from methods.causal_training import compute_causal_weights_static
 from core.initial_conditions import (initialize_shared_velocity_fields, generate_power_spectrum_field, 
-                                     generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0, func)
+                                     generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0)
 from config import cs, const, G, rho_o, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
 from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
 
@@ -4349,7 +4447,7 @@ def _evaluate_data_terms(net, mse_cost_function, data_terms):
 
 
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None, data_terms=None):
+                    rho_1, lam, jeans, v_1, batch_size, num_batches, causal_gamma=0.0, causal_mode="none", residual_tracker=None, update_tracker=True, iteration=0, use_fft_poisson=None, data_terms=None, collocation_poisson_ic=None):
     """
     Batched closure function for training with optional causal weighting.
     
@@ -4504,6 +4602,31 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
 
         total_loss = total_loss + loss
         num_effective_batches += 1
+    
+    # Add Poisson IC loss (Option 3: Pure ML approach for initial phi)
+    # This enforces Poisson equation at t=0 with extra collocation points
+    mse_poisson_ic = 0.0
+    mse_phi_mean = 0.0
+    if collocation_poisson_ic is not None:
+        from core.losses import poisson_residue_only
+        from config import POISSON_IC_WEIGHT, PHI_MEAN_CONSTRAINT_WEIGHT
+        
+        # Only compute and add Poisson IC loss if weight is non-zero
+        if POISSON_IC_WEIGHT > 0:
+            # Enforce Poisson equation: ∇²φ = const*(ρ-ρ₀)
+            phi_r_ic = poisson_residue_only(collocation_poisson_ic, net, dimension=model.dimension)
+            mse_poisson_ic = torch.mean(phi_r_ic ** 2)
+            total_loss = total_loss + POISSON_IC_WEIGHT * mse_poisson_ic
+        
+        # Only compute and add phi mean constraint if weight is non-zero
+        if PHI_MEAN_CONSTRAINT_WEIGHT > 0:
+            # Enforce mean(φ) = 0 at t=0 to fix gauge freedom (Option A)
+            # This removes the arbitrary constant offset in φ
+            net_output_ic = net(collocation_poisson_ic)
+            phi_ic = net_output_ic[:, -1]  # Last output is phi
+            mean_phi = torch.mean(phi_ic)
+            mse_phi_mean = mean_phi ** 2
+            total_loss = total_loss + PHI_MEAN_CONSTRAINT_WEIGHT * mse_phi_mean
 
     optimizer.zero_grad()
     avg_loss = total_loss / max(1, num_effective_batches)
@@ -4542,6 +4665,12 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
     
     pde_loss += mse_phi.item()
     loss_breakdown['PDE'] = pde_loss
+    
+    # Add Poisson IC loss to breakdown if it was computed
+    if isinstance(mse_poisson_ic, torch.Tensor):
+        loss_breakdown['Poisson_IC'] = mse_poisson_ic.item()
+    if isinstance(mse_phi_mean, torch.Tensor):
+        loss_breakdown['Phi_Mean'] = mse_phi_mean.item()
     
     for label, value in last_data_breakdown.items():
         loss_breakdown[label] = value
@@ -4707,7 +4836,7 @@ from config import BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGNOSTICS
 from training.physics import closure_batched
 
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, data_terms=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, data_terms=None, collocation_poisson_ic=None):
     """
     Standard training loop for single PINN.
     
@@ -4744,7 +4873,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
     for i in range(iteration_adam):
         optimizer.zero_grad()
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True, data_terms=data_terms))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True, data_terms=data_terms, collocation_poisson_ic=collocation_poisson_ic))
 
         with torch.autograd.no_grad():
             # Diagnostics logging every 50 iterations
@@ -4780,7 +4909,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False, data_terms=data_terms)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False, data_terms=data_terms, collocation_poisson_ic=collocation_poisson_ic)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
@@ -7625,6 +7754,18 @@ if not USE_XPINN:
 
     # IC collocation stays at t=0 throughout
     collocation_IC = collocation_model.geo_time_coord(option="IC")
+    
+    # Generate extra collocation points at t=0 for Poisson enforcement (Option 3)
+    from core.data_generator import generate_poisson_ic_points
+    from config import N_POISSON_IC
+    collocation_poisson_ic = generate_poisson_ic_points(
+        rmin=collocation_model.rmin,
+        rmax=collocation_model.rmax,
+        n_points=N_POISSON_IC,
+        dimension=DIMENSION,
+        device=device
+    )
+    print(f"Generated {N_POISSON_IC} extra collocation points at t=0 for Poisson enforcement")
 
     start_time = time.time()
     
@@ -7638,6 +7779,7 @@ if not USE_XPINN:
             model=collocation_model,
             collocation_domain=collocation_domain,
             collocation_IC=collocation_IC,
+            collocation_poisson_ic=collocation_poisson_ic,
             optimizer=optimizer,
             optimizerL=optimizerL,
             closure=None,

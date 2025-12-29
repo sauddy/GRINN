@@ -25,6 +25,26 @@
 - `iteration_lbgfs_2D`: Number of L-BFGS optimizer iterations
 - `IC_WEIGHT`: Weight for initial condition loss (float, default 1.0)
 
+## Initial Potential (φ) Enforcement
+Pure ML approach to ensure correct initial φ field without using numerical solvers:
+- `N_POISSON_IC`: Number of extra spatial collocation points at t=0 for enforcing Poisson equation (int, default 10000)
+  - These points are sampled uniformly in the spatial domain at t=0
+  - Used to strongly enforce ∇²φ = const*(ρ-ρ₀) at the initial time
+  - Higher values → stronger spatial coverage → better φ initialization
+  
+- `POISSON_IC_WEIGHT`: Weight for Poisson residual loss at t=0 (float, default 10.0)
+  - Controls how strongly the Poisson equation is enforced at initial time
+  - Higher weight → φ learns to satisfy ∇²φ = const*(ρ-ρ₀) more accurately
+  - Typical range: 1.0 - 50.0
+  
+- `PHI_MEAN_CONSTRAINT_WEIGHT`: Weight for mean(φ)=0 constraint at t=0 (float, default 1.0)
+  - Fixes the gauge freedom (arbitrary constant offset) in the potential
+  - Ensures φ has zero mean over the domain at t=0
+  - Works for both sinusoidal and power spectrum perturbations
+  - Prevents network from learning arbitrary constant offsets like φ ≈ 1.86 or φ ≈ -1.44
+
+**Implementation Note**: These three parameters together (Option 3 + Option A) provide a pure PINN solution to the initial φ problem. The Poisson constraint determines the spatial structure of φ, while the mean constraint removes the gauge freedom.
+
 ## Wave Parameters
 - `wave`: Wavelength for sinusoidal perturbations
 - `k`: Wavenumber (2π/wave)

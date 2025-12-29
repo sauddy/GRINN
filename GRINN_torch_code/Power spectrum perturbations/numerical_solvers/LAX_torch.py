@@ -111,10 +111,14 @@ def generate_velocity_field_power_spectrum_torch(nx, ny, Lx, Ly, power_index=-3.
     return vx0, vy0
 
 def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False, use_velocity_ps=False, 
-                         ps_index=-3.0, vel_rms=0.02, random_seed=None):
+                         ps_index=-3.0, vel_rms=0.02, random_seed=None, vx0_shared=None, vy0_shared=None):
     """
     PyTorch implementation of the LAX method for solving hydrodynamic equations.
     This version is designed to run on a GPU for accelerated computation.
+    
+    Args:
+        vx0_shared: Optional pre-generated vx velocity field (numpy array) for consistent ICs
+        vy0_shared: Optional pre-generated vy velocity field (numpy array) for consistent ICs
     """
     # Verify device is still correct (in case CUDA becomes available after import)
     current_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -142,10 +146,15 @@ def lax_solution_torch(time_val, N, nu, lam, num_of_waves, rho_1, gravity=False,
     # Initial Conditions
     if use_velocity_ps:
         rho0 = rho_o * torch.ones((Nx, Ny), device=device, dtype=dtype)
-        vx0, vy0 = generate_velocity_field_power_spectrum_torch(Nx, Ny, Lx, Ly, 
-                                                              power_index=ps_index, 
-                                                              amplitude=vel_rms, 
-                                                              random_seed=random_seed)
+        if vx0_shared is not None and vy0_shared is not None:
+            # Use shared velocity fields for consistent initial conditions
+            vx0 = torch.from_numpy(vx0_shared.copy()).to(device=device, dtype=dtype)
+            vy0 = torch.from_numpy(vy0_shared.copy()).to(device=device, dtype=dtype)
+        else:
+            vx0, vy0 = generate_velocity_field_power_spectrum_torch(Nx, Ny, Lx, Ly, 
+                                                                  power_index=ps_index, 
+                                                                  amplitude=vel_rms, 
+                                                                  random_seed=random_seed)
     else:
         # Sinusoidal perturbations: Use 2D wave pattern: cos(KX*x + KY*y)
         KX_tensor = torch.tensor(KX, device=device, dtype=dtype)

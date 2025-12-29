@@ -375,3 +375,45 @@ def distribute_collocation_points(n_total, num_subdomains):
         counts[i] += 1
     
     return counts
+
+
+def generate_poisson_ic_points(rmin, rmax, n_points, dimension=2, device='cuda'):
+    """
+    Generate extra collocation points at t=0 specifically for enforcing Poisson equation.
+    
+    This implements Option 3: Pure ML approach to fix initial phi by sampling many
+    spatial points at t=0 where Poisson equation ∇²φ = const*(ρ-ρ₀) must be satisfied.
+    
+    Args:
+        rmin: List of minimum values [xmin, ymin, (zmin), tmin]
+        rmax: List of maximum values [xmax, ymax, (zmax), tmax]
+        n_points: Number of spatial points to generate at t=0
+        dimension: Spatial dimension (1, 2, or 3)
+        device: PyTorch device ('cuda' or 'cpu')
+    
+    Returns:
+        List of tensors [x, y, (z), t] where t=0 everywhere
+    """
+    import torch
+    
+    coor = []
+    
+    if dimension == 1:
+        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
+        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
+        coor = [x_ic, t_ic]
+    
+    elif dimension == 2:
+        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
+        y_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[1], rmax[1]).requires_grad_()
+        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
+        coor = [x_ic, y_ic, t_ic]
+    
+    elif dimension == 3:
+        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
+        y_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[1], rmax[1]).requires_grad_()
+        z_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[2], rmax[2]).requires_grad_()
+        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
+        coor = [x_ic, y_ic, z_ic, t_ic]
+    
+    return coor

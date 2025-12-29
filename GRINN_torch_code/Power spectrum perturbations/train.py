@@ -182,6 +182,18 @@ if not USE_XPINN:
 
     # IC collocation stays at t=0 throughout
     collocation_IC = collocation_model.geo_time_coord(option="IC")
+    
+    # Generate extra collocation points at t=0 for Poisson enforcement (Option 3)
+    from core.data_generator import generate_poisson_ic_points
+    from config import N_POISSON_IC
+    collocation_poisson_ic = generate_poisson_ic_points(
+        rmin=collocation_model.rmin,
+        rmax=collocation_model.rmax,
+        n_points=N_POISSON_IC,
+        dimension=DIMENSION,
+        device=device
+    )
+    print(f"Generated {N_POISSON_IC} extra collocation points at t=0 for Poisson enforcement")
 
     start_time = time.time()
     
@@ -195,6 +207,7 @@ if not USE_XPINN:
             model=collocation_model,
             collocation_domain=collocation_domain,
             collocation_IC=collocation_IC,
+            collocation_poisson_ic=collocation_poisson_ic,
             optimizer=optimizer,
             optimizerL=optimizerL,
             closure=None,

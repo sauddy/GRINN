@@ -29,8 +29,8 @@ from config import (
     xmin, ymin, cs, rho_o, const, G, a, wave, PERTURBATION_TYPE, KX, KY
 )
 
-N = 400                    # Grid resolution (Nx = Ny)
-nu = 0.1                   # Courant number for stability (typically 0.1-0.9)
+N = 1200                    # Grid resolution (Nx = Ny)
+nu = 0.25                   # Courant number for stability (typically 0.1-0.9)
 lam = wave                  # Wavelength (from config.py)
 num_of_waves = NUM_OF_WAVES_CONFIG  # Number of wavelengths in domain (from config.py)
 time_points = [2.0, 3.0]  # Times to plot

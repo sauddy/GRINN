@@ -11,7 +11,7 @@ from config import BATCH_SIZE, NUM_BATCHES, ENABLE_TRAINING_DIAGNOSTICS
 from training.physics import closure_batched
 
 
-def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, data_terms=None):
+def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL, iteration_adam, iterationL, mse_cost_function, closure, rho_1, lam, jeans, v_1, device, causal_gamma=0.0, causal_mode="none", residual_tracker=None, window_idx=None, data_terms=None, collocation_poisson_ic=None):
     """
     Standard training loop for single PINN.
     
@@ -48,7 +48,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
     for i in range(iteration_adam):
         optimizer.zero_grad()
 
-        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True, data_terms=data_terms))
+        loss, loss_breakdown = optimizer.step(lambda: closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=True, iteration=i, use_fft_poisson=True, data_terms=data_terms, collocation_poisson_ic=collocation_poisson_ic))
 
         with torch.autograd.no_grad():
             # Diagnostics logging every 50 iterations
@@ -84,7 +84,7 @@ def train(model, net, collocation_domain, collocation_IC, optimizer, optimizerL,
         loss_breakdown_holder = [None]
         
         def lbfgs_closure():
-            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False, data_terms=data_terms)
+            loss, loss_breakdown = closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizerL, rho_1, lam, jeans, v_1, bs, nb, causal_gamma, causal_mode, residual_tracker, update_tracker=False, iteration=global_step, use_fft_poisson=False, data_terms=data_terms, collocation_poisson_ic=collocation_poisson_ic)
             loss_breakdown_holder[0] = loss_breakdown
             return loss
         
