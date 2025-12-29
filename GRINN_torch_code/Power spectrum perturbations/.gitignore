@@ -29,7 +29,7 @@ checkpoints/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
+#*.ipynb
 
 # Training outputs
 diagnostics/
